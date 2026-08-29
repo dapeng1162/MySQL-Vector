@@ -161,6 +161,22 @@ MYSQL_VIO vio_new_win32shared_memory(HANDLE handle_file_map, HANDLE handle_map,
 
 void vio_delete(MYSQL_VIO vio);
 int vio_shutdown(MYSQL_VIO vio);
+
+/**
+  Optional hook invoked by vio_shutdown() just before the socket would
+  be closed.  Used by the coroutine-epoll connection handler, which
+  keeps the fd registered in its epoll set: closing the fd behind the
+  poller's back would silently remove it from epoll (a suspended
+  waiter would never wake up) and the fd number could be recycled by
+  a new connection while still registered.
+
+  If the hook returns true it has taken over ownership of the
+  descriptor (it wakes its waiters and closes the fd itself), and
+  vio_shutdown() skips closing the socket.  A nullptr hook (the
+  default) keeps the traditional behaviour, so non-coroutine
+  connection handlers are unaffected.
+*/
+extern bool (*vio_pre_close_hook)(Vio *vio);
 bool vio_reset(MYSQL_VIO vio, enum enum_vio_type type, my_socket sd, void *ssl,
                uint flags);
 bool vio_is_blocking(Vio *vio);

@@ -3919,7 +3919,7 @@ static Sys_var_ulong Sys_trans_prealloc_size(
     ON_UPDATE(nullptr), DEPRECATED_VAR(""));
 
 static const char *thread_handling_names[] = {
-    "one-thread-per-connection", "no-threads", "loaded-dynamically", nullptr};
+    "one-thread-per-connection", "no-threads", "coroutine-epoll", "loaded-dynamically", nullptr};
 static Sys_var_enum Sys_thread_handling(
     "thread_handling",
     "Define threads usage for handling queries, one of "

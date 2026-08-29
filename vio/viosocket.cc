@@ -92,6 +92,10 @@
 
 struct timespec;
 
+/* See violite.h.  Installed (once, at startup) by the coroutine-epoll
+   connection handler; nullptr keeps the traditional behaviour. */
+bool (*vio_pre_close_hook)(Vio *vio) = nullptr;
+
 int vio_errno(Vio *vio [[maybe_unused]]) {
 /* These transport types are not Winsock based. */
 #ifdef _WIN32
@@ -511,7 +515,19 @@ int vio_shutdown(Vio *vio) {
       vio_wait_until_woken(vio);
 #endif
 
-    if (mysql_socket_close(vio->mysql_socket)) r = -1;
+    /*
+      Give a registered poller (the coroutine-epoll connection handler)
+      a chance to take over the fd: closing it here, from an arbitrary
+      thread (e.g. KILL), would silently remove it from its epoll set
+      (a suspended waiter would never wake up) and the fd number could
+      be recycled while still registered.  When the hook claims the fd
+      it stays open until the poller's teardown closes it.
+    */
+    if (vio_pre_close_hook != nullptr && vio_pre_close_hook(vio)) {
+      /* fd ownership transferred to the poller; it closes it itself. */
+    } else if (mysql_socket_close(vio->mysql_socket)) {
+      r = -1;
+    }
 #ifdef HAVE_KQUEUE
     if (vio->kq_fd == -1 || close(vio->kq_fd)) r = -1;
     vio->kq_fd = -1;

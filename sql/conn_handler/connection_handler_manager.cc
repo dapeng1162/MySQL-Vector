@@ -42,6 +42,7 @@
 #include "mysqld_error.h"                              // ER_*
 #include "sql/conn_handler/channel_info.h"             // Channel_info
 #include "sql/conn_handler/connection_handler_impl.h"  // Per_thread_connection_handler
+#include "sql/conn_handler/coroutine_connection_handler.h"  // Coroutine_connection_handler
 #include "sql/conn_handler/plugin_connection_handler.h"  // Plugin_connection_handler
 #include "sql/current_thd.h"
 #include "sql/mysqld.h"        // max_connections
@@ -151,6 +152,7 @@ bool Connection_handler_manager::init() {
     even if One_thread_connection_handler is used instead.
   */
   Per_thread_connection_handler::init();
+  Coroutine_connection_handler::init();
 
   Connection_handler *connection_handler = nullptr;
   switch (Connection_handler_manager::thread_handling) {
@@ -159,6 +161,9 @@ bool Connection_handler_manager::init() {
       break;
     case SCHEDULER_NO_THREADS:
       connection_handler = new (std::nothrow) One_thread_connection_handler();
+      break;
+    case SCHEDULER_COROUTINE_EPOLL:
+      connection_handler = new (std::nothrow) Coroutine_connection_handler();
       break;
     default:
       assert(false);
@@ -214,6 +219,7 @@ void Connection_handler_manager::wait_till_no_connection() {
 
 void Connection_handler_manager::destroy_instance() {
   Per_thread_connection_handler::destroy();
+  Coroutine_connection_handler::destroy();
 
   if (m_instance != nullptr) {
     delete m_instance;

@@ -355,6 +355,17 @@ MYSQL_ADD_PLUGIN(innobase
   LINK_LIBRARIES sql_dd sql_gis ext::zlib ext::lz4 ${NUMA_LIBRARY}
                  extra::rapidjson library_mysys)
 
+# DB-aware sched_ext bridge: the row-lock wait injection points in
+# storage/innobase/lock/lock0{lock,wait}.cc call sched_ext::lock_wait_begin()
+# / lock_wait_end().  The THD-level wait graph half of the bridge is always
+# compiled in sql/sched_ext_bridge.cc (it drives the coroutine handler's
+# high-priority queue); the BPF map publication half additionally requires
+# HAVE_SCX_SCHEDULER.  Note that the bridge symbols live in sql_main, which
+# the plugin links against, so no explicit link dependency is needed here.
+IF(WITH_SCX_SCHEDULER)
+  TARGET_COMPILE_DEFINITIONS(innobase PRIVATE HAVE_SCX_SCHEDULER)
+ENDIF()
+
 # On linux: /usr/include/stdio.h:#define BUFSIZ 8192
 # On Solaris: /usr/include/iso/stdio_iso.h:#define    BUFSIZ  1024
 IF(SOLARIS AND MY_COMPILER_IS_GNU)

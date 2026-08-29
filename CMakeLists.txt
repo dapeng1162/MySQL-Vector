@@ -520,6 +520,30 @@ PROJECT(${MYSQL_PROJECT_NAME}
   VERSION ${MAJOR_VERSION}.${MINOR_VERSION}.${PATCH_VERSION})
 SET(CMAKE_CXX_STANDARD 23)
 
+# ---------------------------------------------------------------------------
+# Coroutine scheduling front-end: platform requirements.
+# The coroutine connection handling (--thread-handling=coroutine-epoll) uses
+# epoll + C++20 stackless coroutines and works on Linux >= 5.x.  The DB-aware
+# sched_ext BPF scheduler needs Linux >= 6.12 with CONFIG_SCHED_CLASS_EXT,
+# enforced separately in support-files/scx/CMakeLists.txt and sql/CMakeLists.txt
+# (WITH_SCX_SCHEDULER=ON).
+# ---------------------------------------------------------------------------
+IF(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  MESSAGE(FATAL_ERROR
+    "MySQL coroutine scheduling (coroutine-epoll) supports only Linux. "
+    "Configured system is '${CMAKE_SYSTEM_NAME}'.")
+ENDIF()
+IF(CMAKE_SYSTEM_VERSION MATCHES "^([0-9]+)\\.([0-9]+)")
+  SET(_CORO_KERNEL_MAJOR ${CMAKE_MATCH_1})
+  SET(_CORO_KERNEL_MINOR ${CMAKE_MATCH_2})
+  MESSAGE(STATUS "Kernel check: Linux ${_CORO_KERNEL_MAJOR}.${_CORO_KERNEL_MINOR} "
+                 "(coroutine-epoll needs Linux >= 5.0)")
+  UNSET(_CORO_KERNEL_MAJOR)
+  UNSET(_CORO_KERNEL_MINOR)
+ELSE()
+  MESSAGE(FATAL_ERROR "Could not parse kernel version '${CMAKE_SYSTEM_VERSION}'.")
+ENDIF()
+
 # Various 3rd party libraries have this option.
 # Some have it ON, other OFF, by default.
 # https://cmake.org/cmake/help/latest/variable/BUILD_SHARED_LIBS.html:
@@ -2424,6 +2448,7 @@ ADD_SUBDIRECTORY(client)
 ADD_SUBDIRECTORY(utilities)
 ADD_SUBDIRECTORY(share)
 ADD_SUBDIRECTORY(libservices)
+ADD_SUBDIRECTORY(coroutine)
 
 IF(NOT WITHOUT_SERVER)
   ADD_SUBDIRECTORY(testclients)

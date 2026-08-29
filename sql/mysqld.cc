@@ -801,6 +801,7 @@ MySQL clients support the protocol:
 #include "sql/conn_handler/connection_acceptor.h"  // Connection_acceptor
 #include "sql/conn_handler/connection_handler_impl.h"  // Per_thread_connection_handler
 #include "sql/conn_handler/connection_handler_manager.h"  // Connection_handler_manager
+#include "sql/conn_handler/coroutine_connection_handler.h"  // Coroutine_connection_handler
 #include "sql/conn_handler/socket_connection.h"  // stmt_info_new_packet
 #include "sql/current_thd.h"                     // current_thd
 #include "sql/dd/cache/dictionary_client.h"
@@ -11317,6 +11318,88 @@ static int show_num_thread_created(THD *, SHOW_VAR *var, char *buff) {
   return 0;
 }
 
+// -------------------------------------------------------------------
+// Coroutine-epoll status variable helpers
+// -------------------------------------------------------------------
+
+static int show_coroutine_connections(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) =
+      static_cast<long>(Coroutine_connection_handler::connections());
+  return 0;
+}
+
+static int show_coroutine_handoff_queue_depth(THD *, SHOW_VAR *var,
+                                               char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) =
+      static_cast<long>(Coroutine_connection_handler::handoff_queue_depth());
+  return 0;
+}
+
+static int show_coroutine_reactor_events(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->value = buff;
+  *reinterpret_cast<long long *>(buff) =
+      Coroutine_connection_handler::reactor_events();
+  return 0;
+}
+
+static int show_coroutine_executor_threads(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) =
+      static_cast<long>(Coroutine_connection_handler::executor_threads());
+  return 0;
+}
+
+static int show_coroutine_commands_completed(THD *, SHOW_VAR *var,
+                                              char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->value = buff;
+  *reinterpret_cast<long long *>(buff) =
+      Coroutine_connection_handler::commands_completed();
+  return 0;
+}
+
+static int show_coroutine_connections_closed(THD *, SHOW_VAR *var,
+                                              char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->value = buff;
+  *reinterpret_cast<long long *>(buff) =
+      Coroutine_connection_handler::connections_closed();
+  return 0;
+}
+
+static int show_coroutine_active_coroutines(THD *, SHOW_VAR *var,
+                                             char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) =
+      static_cast<long>(Coroutine_connection_handler::active_coroutines());
+  return 0;
+}
+
+static int show_coroutine_hp_jobs_submitted(THD *, SHOW_VAR *var,
+                                             char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) =
+      static_cast<long>(Coroutine_connection_handler::hp_jobs_submitted());
+  return 0;
+}
+
+static int show_coroutine_hp_jobs_executed(THD *, SHOW_VAR *var,
+                                            char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) =
+      static_cast<long>(Coroutine_connection_handler::hp_jobs_executed());
+  return 0;
+}
+
 static int show_thread_id_count(THD *, SHOW_VAR *var, char *buff) {
   var->type = SHOW_LONG;
   var->value = buff;
@@ -11739,6 +11822,29 @@ SHOW_VAR status_vars[] = {
     {"Connection_errors_select", (char *)&show_connection_errors_query_block,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Connection_errors_tcpwrap", (char *)&show_connection_errors_tcpwrap,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Coroutine_active_coroutines", (char *)&show_coroutine_active_coroutines,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Coroutine_commands_completed",
+     (char *)&show_coroutine_commands_completed, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_connections", (char *)&show_coroutine_connections, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_connections_closed",
+     (char *)&show_coroutine_connections_closed, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_executor_threads", (char *)&show_coroutine_executor_threads,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Coroutine_hp_jobs_executed",
+     (char *)&show_coroutine_hp_jobs_executed, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_hp_jobs_submitted",
+     (char *)&show_coroutine_hp_jobs_submitted, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_handoff_queue_depth",
+     (char *)&show_coroutine_handoff_queue_depth, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_reactor_events", (char *)&show_coroutine_reactor_events,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Count_hit_query_past_connection_memory_status_limit",
      (char *)&show_count_hit_query_past_conn_mem_status_limit, SHOW_FUNC,

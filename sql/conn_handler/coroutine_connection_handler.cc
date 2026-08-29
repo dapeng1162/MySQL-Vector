@@ -1,0 +1,684 @@
+/*
+   Copyright (c) 2026, Oracle and/or its affiliates.
+
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is designed to work with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have either included with
+   the program or referenced in the documentation.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License, version 2.0, for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+*/
+
+#include "sql/conn_handler/coroutine_connection_handler.h"
+
+#include "coroutine/task.h"
+#include <sys/poll.h>
+#include <unistd.h>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <thread>
+#include <unordered_map>
+
+#include "mysql/components/services/log_builtins.h"  // LogErr
+#include "my_inttypes.h"
+#include "my_macros.h"
+#include "my_thread.h"  // my_thread_init, my_thread_end
+#include "mysql/psi/mysql_socket.h"  // mysql_socket_getfd, mysql_socket_set_thread_owner
+#include "mysql_com.h"
+#include "mysqld_error.h"             // ER_*
+#include "sql/conn_handler/channel_info.h"
+#include "sql/conn_handler/connection_handler_manager.h"  // Connection_handler_manager
+#include "sql/current_thd.h"
+#include "sql/mysqld.h"               // max_connections, connection_events_loop_aborted
+#include "sql/mysqld_thd_manager.h"   // Global_THD_manager
+#include "sql/protocol_classic.h"     // get_vio
+#include "sql/sql_class.h"            // THD
+#include "sql/sql_connect.h"          // thd_prepare_connection, close_connection
+#include "sql/sql_parse.h"            // do_command
+#include "sql/sql_thd_internal_api.h" // thd_set_thread_stack
+#include "sql/sched_ext_bridge.h"     // sched_ext::init
+#include "violite.h"                  // vio_is_blocking, vio_set_blocking_flag
+
+// -------------------------------------------------------------------
+// Static members
+// -------------------------------------------------------------------
+
+coroutine::Netpoller *Coroutine_connection_handler::s_netpoller = nullptr;
+std::thread *Coroutine_connection_handler::s_reactor_thread = nullptr;
+coroutine::ExecutorPool *Coroutine_connection_handler::s_executor = nullptr;
+bool Coroutine_connection_handler::s_initialized = false;
+
+// -------------------------------------------------------------------
+// Per-connection state (lives on the reactor thread, also referenced
+// from executor pool threads)
+// -------------------------------------------------------------------
+
+namespace {
+
+struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
+  THD *thd{nullptr};
+  int client_fd{-1};
+
+  // Set once when the connection closes (avoids double-cleanup).
+  std::atomic<bool> connection_closed{false};
+
+  // Completion signalling (frontend <-> executor pool thread).
+  std::mutex cmd_mu;
+  std::coroutine_handle<> cmd_waiting{nullptr};
+  std::atomic<bool> cmd_done{false};
+
+  // Results from the executor jobs.
+  bool auth_ok{false};
+  bool cmd_result{false};
+  // Set when a THD job threw an exception on the executor thread; the
+  // frontend tears the connection down instead of continuing.
+  bool job_threw{false};
+
+  // The main connection coroutine.
+  coroutine::DetachedTask run();
+};
+
+// -------------------------------------------------------------------
+// fd ownership registry (KILL / fd-recycling fixes)
+// -------------------------------------------------------------------
+// vio_shutdown() may be called from any thread (e.g. a KILL issuing
+// THD::awake) and would close the client fd behind the reactor's back:
+// the kernel silently removes a closed fd from epoll, so a coroutine
+// suspended in wait_readable() would never wake up, and the fd number
+// could be recycled by a new connection while still registered.
+//
+// To prevent this, every fd owned by this handler is registered here.
+// The vio pre-close hook (coroutine_vio_pre_close) claims such fds:
+// vio_shutdown() then skips the close, and the fd stays open — hence
+// cannot be recycled — until teardown() closes it on the reactor
+// thread.  The hook additionally posts a token-checked cancellation so
+// a suspended waiter wakes up and tears the connection down.
+
+struct FdRegistration {
+  ConnectionState *owner;  // cancellation token
+  MYSQL_SOCKET socket;     // instrumented socket, closed by teardown()
+};
+
+std::mutex g_fd_mu;
+std::unordered_map<int, FdRegistration> g_fd_registry;
+
+/// vio pre-close hook (installed by init(), see violite.h).  Called by
+/// vio_shutdown() from any thread just before it would close the
+/// socket.  Returns true when the fd is owned by this handler: the
+/// close is then deferred to teardown() on the reactor thread.
+static bool coroutine_vio_pre_close(Vio *vio) {
+  const int fd = mysql_socket_getfd(vio->mysql_socket);
+  if (fd < 0) return false;
+  ConnectionState *owner = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_fd_mu);
+    auto it = g_fd_registry.find(fd);
+    if (it != g_fd_registry.end()) owner = it->second.owner;
+  }
+  if (owner == nullptr) return false;
+  coroutine::Netpoller *np = Coroutine_connection_handler::netpoller();
+  if (np == nullptr) return false;
+  // Wake any coroutine waiting on this fd; it will observe thd->killed
+  // and run teardown(), which performs the actual close.
+  np->cancel_fd_async(fd, owner);
+  return true;
+}
+
+/// Completion-signalling awaiter for the frontend coroutine.
+/// The frontend submits a THD job to the executor pool, then
+/// co_awaits this awaiter.  When the executor thread finishes the
+/// job it calls signal_command_done() which resumes the frontend
+/// on the reactor thread.
+class CommandDone {
+ public:
+  explicit CommandDone(ConnectionState *self)
+      : m_self(self) {}
+
+  bool await_ready() {
+    return m_self->cmd_done.load(std::memory_order_acquire);
+  }
+
+  bool await_suspend(std::coroutine_handle<> h) {
+    std::lock_guard<std::mutex> lk(m_self->cmd_mu);
+    if (m_self->cmd_done.load(std::memory_order_relaxed)) return false;
+    m_self->cmd_waiting = h;
+    return true;
+  }
+
+  void await_resume() {}
+
+ private:
+  ConnectionState *m_self;
+};
+
+// Forward declarations of helpers.
+static void signal_command_done(std::shared_ptr<ConnectionState> self);
+static void ensure_nonblocking(const std::shared_ptr<ConnectionState> &self);
+static void teardown(std::shared_ptr<ConnectionState> self);
+
+// -------------------------------------------------------------------
+// Global observability counters (read by SHOW STATUS from any thread).
+// -------------------------------------------------------------------
+
+std::atomic<long long> g_commands_completed{0};   // do_command jobs finished
+std::atomic<long long> g_connections_closed{0};   // connections torn down
+std::atomic<long long> g_active_coroutines{0};    // live frontend coroutines
+std::atomic<long long> g_hp_jobs_submitted{0};    // jobs submitted to the HP queue
+std::atomic<long long> g_hp_jobs_executed{0};     // HP jobs that finished
+
+// -------------------------------------------------------------------
+// Executor job helpers
+// -------------------------------------------------------------------
+
+/// Run a THD-bound function on an executor pool thread.
+/// Sets up thread-local globals and stack, then signals the frontend
+/// coroutine when done.
+static void run_thd_job(std::shared_ptr<ConnectionState> self,
+                         std::function<void(THD *)> fn) {
+  THD *thd = self->thd;
+  thd_set_thread_stack(thd, reinterpret_cast<const char *>(&thd));
+  thd->store_globals();
+  /* Publish the holder's wait count to the sched_ext scheduler while this
+   * job (which may hold row locks others are waiting on) runs on this OS
+   * thread.  No-op when not connected / not a lock holder. */
+  sched_ext::thread_job_begin(thd);
+  try {
+    fn(thd);
+  } catch (...) {
+    // Never let an exception escape the worker thread: it would skip
+    // signal_command_done() (hanging the frontend coroutine forever)
+    // and then kill the whole server via std::terminate.  Flag the job
+    // so the frontend tears the connection down instead of continuing.
+    LogErr(ERROR_LEVEL, ER_INTERNAL_ERROR,
+           "coroutine executor: uncaught exception in THD job");
+    self->job_threw = true;
+  }
+  sched_ext::thread_job_end(thd);
+  thd->restore_globals();
+  signal_command_done(std::move(self));
+}
+
+/// Submit a THD job to the executor pool.  When the THD currently holds
+/// locks that other transactions are waiting on, the job goes to the
+/// high-priority queue so a lock holder's next statement (notably its
+/// COMMIT) is not stuck behind every other job in the pool.
+static void submit_thd_job(std::shared_ptr<ConnectionState> self,
+                            std::function<void(THD *)> fn,
+                            bool high_priority = false) {
+  if (high_priority) {
+    g_hp_jobs_submitted.fetch_add(1, std::memory_order_relaxed);
+    Coroutine_connection_handler::executor()->submit(
+        [self = std::move(self), fn = std::move(fn)]() mutable {
+          run_thd_job(std::move(self), std::move(fn));
+        },
+        /*high_priority=*/true);
+    return;
+  }
+  Coroutine_connection_handler::executor()->submit(
+      [self = std::move(self), fn = std::move(fn)]() mutable {
+        run_thd_job(std::move(self), std::move(fn));
+      });
+}
+
+// -------------------------------------------------------------------
+// Connection lifecycle helpers
+// -------------------------------------------------------------------
+
+/// @return true if the connection should be torn down.
+static bool should_close(const std::shared_ptr<ConnectionState> &self) {
+  if (self->connection_closed.load(std::memory_order_relaxed)) return true;
+  THD *thd = self->thd;
+  if (connection_events_loop_aborted()) return true;
+  if (thd->killed.load(std::memory_order_relaxed) != THD::NOT_KILLED)
+    return true;
+  return false;
+}
+
+/// Signal that the executor job has finished.  Resumes the frontend
+/// coroutine via the reactor's post queue.
+static void signal_command_done(std::shared_ptr<ConnectionState> self) {
+  std::coroutine_handle<> h;
+  {
+    std::lock_guard<std::mutex> lk(self->cmd_mu);
+    self->cmd_done.store(true, std::memory_order_release);
+    h = self->cmd_waiting;
+    self->cmd_waiting = nullptr;
+  }
+  if (h) {
+    // Resume on the reactor thread.
+    Coroutine_connection_handler::netpoller()->post(
+        [h]() { h.resume(); });
+  }
+}
+
+/// Ensure the underlying VIO socket is in non-blocking mode
+/// (required by the epoll frontend).
+static void ensure_nonblocking(const std::shared_ptr<ConnectionState> &self) {
+  Vio *vio = self->thd->get_protocol_classic()->get_vio();
+  if (vio != nullptr && vio_is_blocking(vio)) {
+    vio_set_blocking_flag(vio, false);
+  }
+}
+
+/// Check whether data is available on the socket without blocking.
+[[maybe_unused]] static bool data_available(int fd) {
+  struct pollfd pfd;
+  pfd.fd = fd;
+  pfd.events = POLLIN;
+  pfd.revents = 0;
+  int rc = poll(&pfd, 1, 0);
+  return (rc > 0) && (pfd.revents & (POLLIN | POLLHUP | POLLERR));
+}
+
+/// Clean up THD, VIO, globals, fd, and decrement the connection count.
+/// Safe to call multiple times (idempotent via connection_closed flag).
+static void teardown(std::shared_ptr<ConnectionState> self) {
+  if (self->connection_closed.exchange(true)) return;
+
+  g_active_coroutines.fetch_sub(1, std::memory_order_relaxed);
+  g_connections_closed.fetch_add(1, std::memory_order_relaxed);
+
+  THD *thd = self->thd;
+
+  // Remove the fd from the epoll set before closing it.  The token
+  // guards against cancelling a waiter that belongs to a different
+  // connection which recycled this fd number.
+  if (self->client_fd >= 0) {
+    Coroutine_connection_handler::netpoller()->cancel_fd(self->client_fd,
+                                                         self.get());
+  }
+
+  // Teardown runs on the reactor thread (not a pool thread), so set up
+  // thread-local state for this THD.  The reactor is single-threaded and
+  // teardown is synchronous, so this cannot interfere with other
+  // connections.
+  thd_set_thread_stack(thd, reinterpret_cast<const char *>(&thd));
+  thd->store_globals();
+
+  end_connection(thd);
+  close_connection(thd, 0, false, false);
+
+  /* Remove any residual lock-wait graph entries for this THD (both as
+   * waiter and as holder) so the bridge's wait counts cannot leak. */
+  sched_ext::forget_thd(thd);
+
+  thd->get_stmt_da()->reset_diagnostics_area();
+  thd->release_resources();
+
+  Global_THD_manager::get_instance()->remove_thd(thd);
+  Connection_handler_manager::dec_connection_count();
+
+  thd->restore_globals();
+  delete thd;
+  self->thd = nullptr;
+
+  // Close the fd exactly once, here on the reactor thread.  The vio
+  // pre-close hook prevented vio_shutdown() (invoked above via
+  // close_connection(), or earlier by a KILL on another thread) from
+  // closing it, so the fd number cannot have been recycled while
+  // registered.  The registry copy of the instrumented socket lets
+  // mysql_socket_close() also destroy the PSI socket instrument.
+  if (self->client_fd >= 0) {
+    MYSQL_SOCKET sock = MYSQL_INVALID_SOCKET;
+    {
+      std::lock_guard<std::mutex> lk(g_fd_mu);
+      auto it = g_fd_registry.find(self->client_fd);
+      if (it != g_fd_registry.end() && it->second.owner == self.get()) {
+        sock = it->second.socket;
+        g_fd_registry.erase(it);
+      }
+    }
+    if (mysql_socket_getfd(sock) >= 0)
+      mysql_socket_close(sock);
+    else
+      ::close(self->client_fd);
+    self->client_fd = -1;
+  }
+}
+
+// -------------------------------------------------------------------
+// Main connection coroutine
+// -------------------------------------------------------------------
+
+coroutine::DetachedTask ConnectionState::run() {
+  auto self = shared_from_this();
+
+  // Ensure non-blocking mode before any reactor interaction.
+  ensure_nonblocking(self);
+
+  // ---- Phase 1: Authentication ----
+  // The server initiates the handshake by sending the greeting, so we
+  // must NOT wait for client data first (that would deadlock: the client
+  // waits for our greeting before sending anything).  Instead submit the
+  // auth job immediately; the executor thread performs the blocking I/O
+  // via vio_io_wait()/poll() internally and signals us when done.
+  {
+    if (should_close(self)) {
+      teardown(std::move(self));
+      co_return;
+    }
+    {
+      std::lock_guard<std::mutex> lk(self->cmd_mu);
+      self->cmd_done.store(false, std::memory_order_relaxed);
+      self->cmd_waiting = nullptr;
+    }
+    bool auth_ok = false;
+    submit_thd_job(self, [self, &auth_ok](THD *thd) {
+      const MYSQL_SOCKET sock =
+          thd->get_protocol_classic()->get_vio()->mysql_socket;
+      mysql_socket_set_thread_owner(sock);
+      auth_ok = !thd_prepare_connection(thd);
+    });
+    co_await CommandDone(self.get());
+
+    if (self->connection_closed.load()) {
+      teardown(std::move(self));
+      co_return;
+    }
+    if (self->job_threw) {
+      teardown(std::move(self));
+      co_return;
+    }
+    if (!auth_ok) {
+      teardown(std::move(self));
+      co_return;
+    }
+  }
+
+  // ---- Phase 2: Command loop ----
+  for (;;) {
+    if (should_close(self)) break;
+
+    // Wait (via epoll, not polling) for the next command packet to
+    // arrive before submitting to the executor pool.  This keeps an
+    // executor thread from blocking inside do_command() → my_net_read()
+    // while the client is idle, and avoids the latency of a polling loop.
+    bool readable = co_await Coroutine_connection_handler::netpoller()
+                        ->wait_readable(self->client_fd, self.get());
+    if (!readable || should_close(self)) break;
+
+    // The socket may have been set to blocking by my_net_read during
+    // the previous command.  Reset it to non-blocking so the epoll
+    // registration stays valid.
+    ensure_nonblocking(self);
+
+    // Submit the command to the executor pool.  The executor thread
+    // runs do_command() and signals us when done.
+    {
+      std::lock_guard<std::mutex> lk(self->cmd_mu);
+      self->cmd_done.store(false, std::memory_order_relaxed);
+      self->cmd_waiting = nullptr;
+    }
+    bool cmd_result = false;
+    const bool hp = sched_ext::is_lock_holder(thd);
+    submit_thd_job(self, [&cmd_result](THD *thd) {
+      cmd_result = do_command(thd);
+    }, hp);
+    co_await CommandDone(self.get());
+
+    if (hp) g_hp_jobs_executed.fetch_add(1, std::memory_order_relaxed);
+    g_commands_completed.fetch_add(1, std::memory_order_relaxed);
+
+    if (self->connection_closed.load()) break;
+    if (self->job_threw) break;  // executor job threw; tear down
+    if (cmd_result) break;  // do_command requested disconnect
+  }
+
+  teardown(std::move(self));
+}
+
+}  // anonymous namespace
+
+// -------------------------------------------------------------------
+// Coroutine_connection_handler implementation
+// -------------------------------------------------------------------
+
+Coroutine_connection_handler::Coroutine_connection_handler() {
+  // Lazy one-time initialisation of the global runtime.
+  if (!s_initialized) {
+    init();
+  }
+}
+
+Coroutine_connection_handler::~Coroutine_connection_handler() {
+  destroy();
+}
+
+void Coroutine_connection_handler::init() {
+  if (s_initialized) return;
+  /* Probe (once) whether a sched_ext scheduler is running with its maps
+   * pinned.  When it is not (or WITH_SCX_SCHEDULER is OFF), this is a
+   * no-op and the server keeps working normally. */
+  sched_ext::init();
+  try {
+    s_netpoller = new (std::nothrow) coroutine::Netpoller();
+    if (s_netpoller == nullptr) return;
+
+    size_t n = std::thread::hardware_concurrency();
+    if (n == 0) n = 4;
+    // Scale the executor pool by 4× so that I/O-blocked threads (inside
+    // do_command → my_net_read → vio_io_wait) do not exhaust the pool
+    // and starve new connection authentication.
+    size_t pool_size = std::max(n * 4, size_t{16});
+    s_executor = new (std::nothrow) coroutine::ExecutorPool(pool_size, 0);
+    if (s_executor == nullptr) {
+      delete s_netpoller;
+      s_netpoller = nullptr;
+      return;
+    }
+
+    // NOTE: we intentionally do NOT set a notify_reactor callback.  The
+    // reactor is already woken by signal_command_done(), which posts the
+    // coroutine resume callback for every completed job; a per-job empty
+    // post here would only add a redundant eventfd write per command.
+
+    coroutine::ExecutorPool::ThreadHooks hooks;
+    hooks.on_start = []() {
+      my_thread_init();
+      // Register this worker thread in the sched_ext bridge so lock-wait
+      // edges can be translated into the OS tid the BPF maps are keyed by.
+      // No-op when WITH_SCX_SCHEDULER=OFF.
+      sched_ext::thread_start();
+    };
+    hooks.on_stop = []() {
+      sched_ext::thread_end();
+      my_thread_end();
+    };
+    s_executor->set_thread_hooks(std::move(hooks));
+    s_executor->start();
+
+    s_reactor_thread = new (std::nothrow) std::thread([]() {
+      my_thread_init();
+      sched_ext::thread_start();
+      if (s_netpoller) s_netpoller->run();
+      sched_ext::thread_end();
+      my_thread_end();
+    });
+    if (s_reactor_thread == nullptr) {
+      s_executor->stop();
+      s_executor->join();
+      delete s_executor;
+      s_executor = nullptr;
+      delete s_netpoller;
+      s_netpoller = nullptr;
+      return;
+    }
+
+    // Install the vio pre-close hook so that vio_shutdown() (e.g. from
+    // a KILL on another thread) defers closing coroutine-owned fds to
+    // teardown() on the reactor thread.  Must be set before connections
+    // can be accepted.
+    vio_pre_close_hook = coroutine_vio_pre_close;
+
+    s_initialized = true;
+  } catch (...) {
+    // If construction failed, clean up everything we have.
+    if (s_executor) {
+      s_executor->stop();
+      s_executor->join();
+      delete s_executor;
+      s_executor = nullptr;
+    }
+    if (s_netpoller) {
+      delete s_netpoller;
+      s_netpoller = nullptr;
+    }
+    s_initialized = false;
+  }
+}
+
+void Coroutine_connection_handler::destroy() {
+  if (!s_initialized) return;
+  s_initialized = false;
+
+  // Detach the vio pre-close hook first: fds shut down from now on are
+  // closed directly by vio_shutdown() again.
+  vio_pre_close_hook = nullptr;
+
+  // Stop the executor first so it stops posting to the netpoller.
+  if (s_executor) {
+    s_executor->stop();
+    s_executor->join();
+    delete s_executor;
+    s_executor = nullptr;
+  }
+
+  // Stop the reactor and join the reactor thread.
+  if (s_netpoller) {
+    s_netpoller->stop();
+    if (s_reactor_thread) {
+      if (s_reactor_thread->joinable()) s_reactor_thread->join();
+      delete s_reactor_thread;
+      s_reactor_thread = nullptr;
+    }
+    delete s_netpoller;
+    s_netpoller = nullptr;
+  }
+}
+
+bool Coroutine_connection_handler::add_connection(
+    Channel_info *channel_info) {
+  if (!s_initialized) {
+    channel_info->send_error_and_close_channel(ER_CANT_CREATE_THREAD, 0, true);
+    Connection_handler_manager::dec_connection_count();
+    return true;
+  }
+
+  THD *thd = channel_info->create_thd();
+  if (thd == nullptr) {
+    channel_info->send_error_and_close_channel(ER_OUT_OF_RESOURCES, 0, false);
+    Connection_handler_manager::dec_connection_count();
+    return true;
+  }
+
+  thd->set_new_thread_id();
+
+  // Channel_info is no longer needed; the THD has its own copy of
+  // everything it needs.
+  delete channel_info;
+
+  Vio *vio = thd->get_protocol_classic()->get_vio();
+  if (vio == nullptr) {
+    Connection_handler_manager::dec_connection_count();
+    delete thd;
+    return true;
+  }
+
+  const MYSQL_SOCKET mysql_sock = vio->mysql_socket;
+  int fd = mysql_socket_getfd(mysql_sock);
+  if (fd < 0) {
+    Connection_handler_manager::dec_connection_count();
+    delete thd;
+    return true;
+  }
+
+  // Set the socket to non-blocking for the epoll frontend.
+  vio_set_blocking_flag(vio, false);
+
+  auto state = std::make_shared<ConnectionState>();
+  state->thd = thd;
+  state->client_fd = fd;
+
+  // Register the fd before the THD becomes visible to KILL: the vio
+  // pre-close hook looks it up here to defer the close to teardown().
+  {
+    std::lock_guard<std::mutex> lk(g_fd_mu);
+    g_fd_registry.emplace(fd, FdRegistration{state.get(), mysql_sock});
+  }
+
+  Global_THD_manager::get_instance()->add_thd(thd);
+
+  // Spawn the connection coroutine on the reactor thread.
+  s_netpoller->post([state]() { state->run(); });
+
+  g_active_coroutines.fetch_add(1, std::memory_order_relaxed);
+
+  return false;
+}
+
+uint Coroutine_connection_handler::get_max_threads() const {
+  return max_connections;
+}
+
+// -------------------------------------------------------------------
+// Observability accessors
+// -------------------------------------------------------------------
+
+long long Coroutine_connection_handler::connections() {
+  if (!s_initialized) return 0;
+  return Connection_handler_manager::get_connection_count();
+}
+
+long long Coroutine_connection_handler::handoff_queue_depth() {
+  if (s_executor == nullptr) return 0;
+  return static_cast<long long>(s_executor->queued_jobs());
+}
+
+long long Coroutine_connection_handler::reactor_events() {
+  if (s_netpoller == nullptr) return 0;
+  return s_netpoller->events_processed();
+}
+
+long long Coroutine_connection_handler::executor_threads() {
+  if (s_executor == nullptr) return 0;
+  return static_cast<long long>(s_executor->num_workers());
+}
+
+long long Coroutine_connection_handler::commands_completed() {
+  return g_commands_completed.load(std::memory_order_relaxed);
+}
+
+long long Coroutine_connection_handler::connections_closed() {
+  return g_connections_closed.load(std::memory_order_relaxed);
+}
+
+long long Coroutine_connection_handler::active_coroutines() {
+  return g_active_coroutines.load(std::memory_order_relaxed);
+}
+
+long long Coroutine_connection_handler::hp_jobs_submitted() {
+  return g_hp_jobs_submitted.load(std::memory_order_relaxed);
+}
+
+long long Coroutine_connection_handler::hp_jobs_executed() {
+  return g_hp_jobs_executed.load(std::memory_order_relaxed);
+}

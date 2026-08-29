@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2006, 2026, Oracle and/or its affiliates.
+# Copyright (c) 2006, 2026, Oracle and/or its affiliates.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0,
@@ -787,6 +787,13 @@ ELSEIF(WIN32)
     resourcegroups/platform/thread_attrs_api_win.cc)
 ENDIF()
 
+# DB-aware sched_ext bridge. The THD-level lock-wait graph half (which also
+# drives the userspace high-priority queue in the coroutine handler) is
+# ALWAYS compiled; the BPF map publication half is only active when
+# WITH_SCX_SCHEDULER=ON (see the #ifdef HAVE_SCX_SCHEDULER blocks in
+# sql/sched_ext_bridge.cc).
+LIST(APPEND SQL_SHARED_SOURCES sched_ext_bridge.cc)
+
 SET(SQL_SOURCE
   ${GEN_SOURCES}
   ${GEN_DIGEST_SOURCES}
@@ -819,6 +826,7 @@ SET(SQL_SOURCE
   conn_handler/channel_info.cc
   conn_handler/connection_handler_per_thread.cc
   conn_handler/connection_handler_one_thread.cc
+  conn_handler/coroutine_connection_handler.cc
   conn_handler/socket_connection.cc
   conn_handler/init_net_server_extension.cc
   event_data_objects.cc
@@ -968,6 +976,21 @@ TARGET_LINK_LIBRARIES(sql_main ${MYSQLD_STATIC_PLUGIN_LIBS}
   mysql_server_component_services mysys library_mysys strings vio
   mysql_binlog_event ${LIBWRAP} ${LIBDL} OpenSSL::SSL OpenSSL::Crypto
   extra::rapidjson extra::boost)
+
+# The coroutine connection handler (--thread-handling=coroutine-epoll).
+TARGET_LINK_LIBRARIES(sql_main mysql_coroutine)
+
+# ---------------------------------------------------------------------------
+# DB-aware sched_ext scheduler bridge (WITH_SCX_SCHEDULER=ON).
+# When enabled, the bridge library (sql/sched_ext_bridge.cc) uses libbpf to
+# talk to the scx_db_sched BPF scheduler.  Default is OFF — the bridge then
+# compiles to static no-ops and mysqld has zero libbpf dependency.
+# ---------------------------------------------------------------------------
+IF(WITH_SCX_SCHEDULER)
+  TARGET_COMPILE_DEFINITIONS(sql_main PRIVATE HAVE_SCX_SCHEDULER)
+  TARGET_LINK_LIBRARIES(sql_main bpf)
+  MESSAGE(STATUS "WITH_SCX_SCHEDULER=ON: DB-aware sched_ext bridge enabled")
+ENDIF()
 
 # sql/immutable_string.h uses
 # google::protobuf::io::CodedOutputStream::WriteVarint64ToArray
