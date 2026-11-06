@@ -49,21 +49,23 @@
 <div class="abstract">
 <p><strong>摘要</strong>　通用操作系统的 CPU 调度器以线程公平份额为目标，而数据库的并发需求由事务依赖、锁临界区与提交路径等结构语义决定。两者之间的语义鸿沟在混合负载、外部干扰与突发流量下表现为尾延迟放大、优先级反转与过载崖点。既有工作（如 UFS）通过要求用户显式划分时间敏感与后台两层来缓解该问题，但在业务高频变化、AI Agent 动态生成负载的现实下，人工优先级标注既不可持续也不可行。</p>
 <p>本文提出<strong>韧性优先（resilience-first）</strong>的调度目标：优化对象不是单场景峰值吞吐，而是服务级目标下的有效吞吐（goodput）、尾延迟、过载崖点位置与恢复时间。在此目标下，本文设计 EEVDF-Sem——一个以 EEVDF 公平思想为基座、通过 sched_ext 实现的单池调度器。它不要求任何业务标注，仅施加两类普适的结构语义微调：（1）<strong>提交早行</strong>，对 COMMIT/ROLLBACK 施加有界虚拟截止期奖励；（2）<strong>锁持有者条件性优先级继承</strong>，仅在等待边出现时让持有者继承最急等待者的虚拟截止期，继承深度与时间均有硬上限，并以<strong>借还记账</strong>保证周期级公平。配合以排队时间为信号的准入控制与突发吸收机制，系统在过载时退化而非崩溃。</p>
-<p>基于 MySQL 9.7 的分阶段原型（前台协程 reactor + 固定执行池 + sched_ext 桥接）的初步测量表明：在外部 CPU 噪声下，语义发布使点查 p99 劣化从 7.6 倍降至 1.4–1.7 倍；热点更新负载吞吐提升 66%；代价是干净负载约 5% 的吞吐开销。完整评估计划见 §6.7。</p>
+<p>基于 MySQL 9.7 的分阶段原型采用<strong>前台协程 reactor + 固定执行池 + sched_ext 桥接</strong>的混合架构：reactor 将连接等待、断连感知与 SQL parse 前置，使准入和调度在执行前获得语义；v4 设计进一步取消已不再具有客户端价值的排队工作；worker 保留 MySQL 的同步执行语义，避免将协程化误当作并发控制。初步测量表明：在外部 CPU 噪声下，语义发布使点查 p99 劣化从 7.6 倍降至 1.4–1.7 倍；热点更新负载吞吐提升 66%；代价是干净负载约 5% 的吞吐开销。断连早弃尚未纳入这些实测结果，完整评估计划见 §6.7。</p>
 <p class="keywords"><strong>关键词</strong>：数据库调度；sched_ext；优先级反转；尾延迟；过载控制；性能韧性</p>
 </div>
 
 <h2>1 引言</h2>
-<p>数据库管理系统（DBMS）的并发控制决定了事务间的逻辑顺序，但“可运行的事务如何获得 CPU”traditionally 被交给操作系统。这一分工在专用硬件与平稳负载的时代运转良好，如今却在三方面同时失效：</p>
+<p>数据库管理系统（DBMS）的并发控制决定了事务间的逻辑顺序，但“可运行的事务如何获得 CPU”传统上被交给操作系统。这一分工在专用硬件与平稳负载的时代运转良好，如今却在三方面同时失效：</p>
 <p><strong>第一，负载形态变了。</strong>AI Agent 成为主要服务调用方后，数据库访问呈现强烈的潮汐与脉冲特征：一次任务拆解扇出数十个并行子查询，超时即程序性重试，重试过载互为正反馈。此类负载由程序动态生成，既无法预测，也无法人工标注优先级。</p>
 <p><strong>第二，优化的目标函数错了。</strong>工业界的基准竞赛历史表明，针对特定场景的调优往往对客户日常负载收益甚微甚至为负，却把复杂度转嫁给用户 [24]。当业务以周为单位调整时，任何“为某负载特调”的参数都必然过期。真正需要的不是最好情况下的峰值，而是<strong>最坏情况下的可预期性</strong>：突发不崩溃、越崖不雪崩、噪声下尾延迟有界。</p>
 <p><strong>第三，瓶颈的位置变了。</strong>随着锁与缓冲池优化日趋成熟，非业务开销的重心上移至通信、上下文切换与调度协同：近期全栈剖析显示简单事务 52%–67% 的运行时消耗在消息传递上 [28]；本仓库原型亦观测到，队列为空时仍有 33% 的执行任务因 worker 被抢占或迁移而等待 100–500µs。这意味着仅在数据库内部优化已不足够，必须打通数据库语义与内核调度。</p>
 <p><strong>本文的出发点</strong>是：调度器应消费<strong>结构语义</strong>而非<strong>业务标签</strong>。有些调度事实无需任何人告知系统——COMMIT 是 2PL 锁的批量释放点；锁/latch 持有者被抢占会连带放大所有等待者的延迟；等待时长本身就是紧迫度信号。这些事实普适、可自动获得、与业务无关。</p>
 <p>据此，本文提出 <strong>EEVDF-Sem</strong>，一个以 EEVDF 虚拟时间公平性为基座、经 sched_ext/eBPF 实现的调度器，并围绕它构建完整的数据库韧性栈。本文的贡献如下：</p>
 <ol>
-<li><strong>韧性优先的目标形式化</strong>（§2.3）：以 goodput 崖点、越崖行为、恢复时间与噪声下尾延迟劣化倍数为第一优化对象，并给出可证伪的验收口径。</li>
+<li><strong>韧性优先的目标形式化与提前越崖模型</strong>（§2.2–§2.4）：以 goodput 膝点/崖点、基线越崖行为、恢复时间与噪声下尾延迟劣化倍数为优化对象；以 <code>G = C − S</code> 分离服务端完成尝试与客户端有效完成，给出 <code>S′ &gt; C′ &gt; 0</code> 时 goodput 先于完成率峰值下降的可证伪条件。</li>
+<li><strong>主流线程池能力边界的机制化分析</strong>（§2.3、§6）：比较 MySQL/MariaDB/Percona、TiKV、CockroachDB 与代理池，将限制归纳为依赖失明、计数失真、静态尺寸与过载语义四类；区分配置、存活、busy 与 runnable，并以 N14 提供可复现验证路径。</li>
 <li><strong>单池公平基座上的两类结构语义微调</strong>（§4）：COMMIT/ROLLBACK 的有界虚拟截止期奖励，与锁持有者沿等待边的有界虚拟截止期继承，辅以先借后还的公平记账。</li>
-<li><strong>以排队时间为信号的数据库准入控制</strong>（§4.4）：区别于以线程数或队列深度为信号的做法，直接观测包含 OS 调度等待的排队时间，将崖点推远并保证越崖后退化而非崩溃。</li>
+<li><strong>以排队时间为信号的数据库准入控制</strong>（§4.4）：区别于以线程数或队列深度为信号的做法，直接观测包含 OS 调度等待的排队时间，将膝点与崖点推远，并保证基线越崖后退化而非持续崩溃。</li>
+<li><strong>面向请求生命周期的混合执行边界</strong>（§3、§5.2）：前台 reactor 在 worker 之前完成连接多路复用、断连感知与 parse，使语句分类、准入和取消成为执行前决策；固定执行池保留 MySQL 的线程与阻塞语义，避免全局协程化的高风险改造。</li>
 <li><strong>分阶段原型与初步证据</strong>（§5–§6）：语义发布在外部噪声下将 p99 劣化从 7.6× 降至 1.4–1.7×，热点更新吞吐提升 66%，干净负载代价约 5%。</li>
 </ol>
 
@@ -71,8 +73,8 @@
 <h3>2.1 两层调度的语义鸿沟</h3>
 <p>EEVDF/CFS 将线程视为可互换的 CPU 消费者，按权重分配虚拟时间；数据库则掌握事务状态、锁等待图、提交路径与后台角色。信息的不对称是双向的：数据库的优先级队列无法保证被唤醒的 worker 立即获得 CPU；内核无法从一个普通 tid 推断它正持有数十个事务所等待的锁。Practical DB-OS Co-Design [27] 将此类问题归因于通用 POSIX 接口缺乏数据库定制支持；UFS [5] 进一步证明，即使配置 cgroup 权重，EEVDF 的唤醒放置启发式仍会使 CPU-bursty 事务扎堆至少数核，吞吐损失达 50%。</p>
 
-<h3>2.2 三种典型失效模式</h3>
-<p><strong>优先级反转放大。</strong>持锁者 H、等待者 W 与无关 CPU 密集任务 M 构成经典三角（图 1）：M 抢占 H，W 事实上继承 H 的低优先级。在 MySQL/InnoDB 上，该问题有两个独特形态：显式事务持有者在语句间隙不占任何线程（<code>real_id = 0</code>），内核侧无法定位提权对象；线程池模型下全部 worker 阻塞于行锁时，持有者的 COMMIT 在队列尾部等待无线程可用的执行池，形成<strong>执行池活性死锁</strong>——它在 InnoDB 等待图上无环，死锁检测器不可见。</p>
+<h3>2.2 五类典型失效模式</h3>
+<p><strong>a. 优先级反转放大。</strong>持锁者 H、等待者 W 与无关 CPU 密集任务 M 构成经典三角（图 1）：M 抢占 H，W 事实上继承 H 的低优先级。在 MySQL/InnoDB 上，该问题有两个独特形态：显式事务持有者在语句间隙不占任何线程（<code>real_id = 0</code>），内核侧无法定位提权对象；线程池模型下全部 worker 阻塞于行锁时，持有者的 COMMIT 在队列尾部等待无线程可用的执行池，形成<strong>执行池活性死锁</strong>——它在 InnoDB 等待图上无环，死锁检测器不可见。</p>
 
 <figure>
 <svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">
@@ -100,24 +102,160 @@
 <figcaption>图 1｜优先级反转三角：数据库语义与 OS 调度的断裂使等待时间被无关任务放大。</figcaption>
 </figure>
 
-<p><strong>过载崖点。</strong>超过最优并发度后，lock thrashing [26] 与上下文切换使 goodput 随负载下降。Agent 负载的程序性重试使该过程自我加速。固定大小线程池避免了线程爆炸（MySQL Thread Pool 极端情况下可达 65536 线程），却把过载转化为无界排队。</p>
-<p><strong>非业务开销主导。</strong>本仓库微基准量化了三类开销的量级：<code>notify_all</code> 惊群造成每秒 25 万次上下文切换，吞吐仅为修复后的 1/10；每命令两次切换加 epoll 重注册的交接开销可解释廉价点查场景近八成的性能差距；外部 CPU 噪声使默认调度器下 p99 劣化 7.6 倍。</p>
+<p><strong>b. 过载膝点与崖点。</strong>超过最优并发度后，lock thrashing [26] 与上下文切换使边际 goodput 收益下降；排队则使端到端 RT 通常比吞吐更快上升。固定大小线程池避免了线程爆炸（MySQL Thread Pool 极端情况下可达 65536 线程），却把过载转化为排队与 RT 增长，为后续超时崩塌埋下条件。过载服务器研究同样表明，响应时间增长会诱发客户端放弃，而服务器继续处理被放弃请求会造成无效功与 goodput 下降 [41]。</p>
+<p><strong>c. 非业务开销主导。</strong>本仓库微基准量化了三类开销的量级：<code>notify_all</code> 惊群造成每秒 25 万次上下文切换，吞吐仅为修复后的 1/10；每命令两次切换加 epoll 重注册的交接开销可解释廉价点查场景近八成的性能差距；外部 CPU 噪声使默认调度器下 p99 劣化 7.6 倍。</p>
+<p><strong>d. 客户端超时把“变慢”转化为“额外负载”。</strong>设客户端 deadline 为 <code>D</code>、端到端 RT 为 <code>R(λ)</code>。过了膝点，排队使 <code>R(λ)</code> 显著上升；一旦 <code>R(λ) &gt; D</code>，客户端可能主动断连、重建连接并重新发送同一请求。经典 MySQL 协议以命令—响应往返驱动连接，传统线程池只限制执行线程数，并不天然持续观测排队连接的 socket：任务可能直到被 worker 取出后才读到 EOF/RST；尤其在命令已经读入的执行路径上，往往要到结果写回时才通过 <code>my_net_write()</code>/<code>net_flush()</code> 感知连接不可用，此前的 optimize、锁等待与 execute 已成为无效功。重建连接还引入握手、认证、THD/协程建立及旧连接清理成本，因此重连重试既增加请求数量，也提高每次有效请求的路径开销。</p>
+<p><strong>e. 提前越崖的充分条件。</strong>令 <code>λ = λ_new + λ_retry</code> 为原始与重试请求的总到达率，<code>C(λ)</code> 为服务端全部完成尝试率，<code>S(λ)</code> 为断连、超时或重复等不计入客户端价值的完成尝试率，则 <code>G(λ) = C(λ) − S(λ)</code>。对负载求导，<strong>当 <code>S′(λ) &gt; C′(λ) &gt; 0</code> 时，必有 <code>G′(λ) &lt; 0</code></strong>：完成率仍在增长，goodput 却已下降；若 <code>C</code> 进入平台而 <code>S</code> 继续增长，结论同样成立。因此客户端 goodput 的崖点可早于服务端原始执行能力的峰值，这是本文关注的提前越崖机制的局部充分条件，而非所有崖点的必要条件。无退避的立即重连重发会同步抬高 <code>λ_retry</code>，形成“RT 上升 → 超时/断连 → 无效执行与重连重试 → 队列更深 → RT 进一步上升”的正反馈；有退避和抖动可推迟并削弱重试同步，却只能控制新增负载，不能消除原请求已经产生的无效执行。这正是重试驱动的工作放大与亚稳态失效研究所描述的持续机制 [42][44]。<strong>崖点与亚稳态并不等价</strong>：前者是负载曲线上的持续下降，后者是触发撤除后仍维持低 goodput；本文以容量扫描识别前者，以撤载后的重试残留、恢复阈值与迟滞识别后者。</p>
 
-<h3>2.3 设计目标：性能韧性</h3>
-<p>本文将<strong>性能韧性（performance resilience）</strong>定义为四个可测量属性的合取：</p>
+<p>为统一上述失效模式的度量，借鉴拥塞控制的容量曲线 [40]，令 <code>λ</code> 为 offered load、<code>G(λ)</code> 为 goodput。低负载线性区有 <code>G(λ) ≈ ηλ</code>；<strong>膝点（knee）</strong>是曲线开始持续偏离该线性段、边际吞吐收益显著下降且 RT 增长明显加快的点，此后仍可经历一段次线性增长或近似平台，而不是立即下降；<strong>崖点（cliff）</strong>是 goodput 由此进入持续、显著下降段的点，通常伴随排队、超时与重试的急剧放大。膝点刻画容量开始饱和，崖点刻画过载开始崩塌，二者不可混用。</p>
+
+<figure>
+<svg viewBox="0 0 960 440" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">
+  <rect x="90" y="30" width="210" height="320" fill="#f8fafc"/>
+  <rect x="300" y="30" width="220" height="320" fill="#fffbeb" fill-opacity="0.55"/>
+  <rect x="520" y="30" width="390" height="320" fill="#fef2f2" fill-opacity="0.65"/>
+
+  <line x1="90" y1="350" x2="910" y2="350" stroke="#475569" stroke-width="1.4"/>
+  <line x1="90" y1="350" x2="90" y2="30" stroke="#475569" stroke-width="1.4"/>
+  <text x="500" y="425" text-anchor="middle" font-size="13" fill="#475569">offered load λ（开放环：请求速率或并发，含重试）</text>
+  <text x="28" y="200" font-size="12" fill="#64748b" transform="rotate(-90 28 200)" text-anchor="middle">吞吐率（C / G）</text>
+  <text x="195" y="375" text-anchor="middle" font-size="12" fill="#64748b">线性增长区</text>
+  <text x="410" y="375" text-anchor="middle" font-size="12" fill="#92400e">膝点后：次线性增长 / 平台</text>
+  <text x="715" y="375" text-anchor="middle" font-size="12" fill="#991b1b">基线崖点后：持续下降</text>
+
+  <line x1="300" y1="350" x2="300" y2="190" stroke="#2563eb" stroke-width="1.2" stroke-dasharray="4 4"/>
+  <line x1="520" y1="350" x2="520" y2="140" stroke="#dc2626" stroke-width="1.2" stroke-dasharray="4 4"/>
+  <line x1="440" y1="350" x2="440" y2="84" stroke="#059669" stroke-width="1.2" stroke-dasharray="4 4"/>
+
+  <path d="M90 350 L480 53" fill="none" stroke="#94a3b8" stroke-width="1.6" stroke-dasharray="7 5"/>
+  <path d="M90 350 L300 190 C360 172 440 150 520 140 C620 155 710 230 830 310" fill="none" stroke="#2563eb" stroke-width="2.8"/>
+  <path d="M90 350 L300 190 C390 160 480 112 600 88 C700 72 790 70 870 70" fill="none" stroke="#475569" stroke-width="2.2" stroke-dasharray="8 5"/>
+  <path d="M90 350 L440 84 C520 68 620 58 720 58 L870 58" fill="none" stroke="#059669" stroke-width="2.8"/>
+
+  <circle cx="300" cy="190" r="5" fill="#2563eb"/>
+  <circle cx="520" cy="140" r="5" fill="#dc2626"/>
+  <circle cx="440" cy="84" r="5" fill="#059669"/>
+
+  <text x="285" y="216" text-anchor="end" font-size="13" font-weight="bold" fill="#1e40af">基线膝点：RT 开始快速上升</text>
+  <text x="285" y="234" text-anchor="end" font-size="11" fill="#1e40af">goodput 开始偏离线性</text>
+  <text x="535" y="230" font-size="13" font-weight="bold" fill="#991b1b">基线 goodput 崖点</text>
+  <text x="535" y="250" font-size="12" fill="#991b1b">S′ &gt; C′ &gt; 0 ⇒ G′ &lt; 0（早于 C 峰值）</text>
+  <text x="425" y="48" text-anchor="end" font-size="11" fill="#065f46">目标：后移</text>
+  <text x="425" y="67" text-anchor="end" font-size="13" font-weight="bold" fill="#065f46">目标膝点</text>
+
+  <line x1="650" y1="92" x2="650" y2="182" stroke="#d97706" stroke-width="1.4" stroke-dasharray="3 3"/>
+  <text x="662" y="142" font-size="11" font-weight="bold" fill="#b45309">S：无效完成</text>
+  <text x="700" y="295" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e40af">goodput 爆降</text>
+  <text x="700" y="316" text-anchor="middle" font-size="12" fill="#475569">RT↑ → 超时断连 → 重连重发 → S↑</text>
+  <text x="700" y="337" text-anchor="middle" font-size="11" fill="#64748b">无退避加速；退避不能消除旧请求的无效功</text>
+  <text x="690" y="42" text-anchor="middle" font-size="12" font-weight="bold" fill="#065f46">目标：有界平台（本范围无崖点）</text>
+
+  <line x1="118" y1="49" x2="146" y2="49" stroke="#2563eb" stroke-width="2.8"/>
+  <text x="155" y="54" font-size="12" fill="#334155">G：基线 goodput（无准入）</text>
+  <line x1="118" y1="72" x2="146" y2="72" stroke="#059669" stroke-width="2.8"/>
+  <text x="155" y="77" font-size="12" fill="#334155">目标 goodput（queue-time 准入）</text>
+  <line x1="118" y1="95" x2="146" y2="95" stroke="#475569" stroke-width="2.2" stroke-dasharray="8 5"/>
+  <text x="155" y="100" font-size="12" fill="#334155">C：基线完成尝试率（含 stale）</text>
+  <line x1="118" y1="118" x2="146" y2="118" stroke="#94a3b8" stroke-width="1.6" stroke-dasharray="7 5"/>
+  <text x="155" y="123" font-size="12" fill="#64748b">理想线性 G = ηλ</text>
+
+  <text x="900" y="400" text-anchor="end" font-size="11" fill="#64748b">容量目标：膝点/崖点后移；基线越崖后保持有界平台</text>
+</svg>
+<figcaption>图 2｜客户端超时驱动的 goodput 崖点【示意，非实测】。基线在线性增长后经膝点进入次线性增长或平台区；此后 RT 快速上升，超时断连、重连重发与结果写回时才感知的无效执行使 S 增长，因而蓝色 G 可在深灰色 C 仍上升或保持平台时提前越崖。无退避重试使下降更陡，退避只能减缓新增负载。绿线表示目标在所示负载范围内保持有界平台，因此不虚构“目标崖点”；容量目标见 §2.4，恢复与干扰度量见图 3。</figcaption>
+</figure>
+
+<h3>2.3 主流线程池为何不是完整答案</h3>
+<p>面对上述 a–e 类失效模式，线程池通常是应对突发流量的标准答案：它解耦连接与执行线程，复用线程栈，限制短语句并发，减少线程创建、上下文切换和缓存扰动，并将无限并发转化为显式排队 [37][45]。这些收益真实且必要。但线程池约束的是<strong>执行实体的数量与生命周期</strong>，并不自动获得事务依赖、锁等待图、客户端 deadline 或 OS 可运行状态。因此，更准确的问题不是“是否需要线程池”，而是“线程池能看到什么、依据什么扩容、又让谁获得 CPU”。主流实现的能力边界并不相同。</p>
+<table>
+<tr><th>实现</th><th>并发控制与优先级</th><th>仍然存在的边界</th></tr>
+<tr><td>MySQL Enterprise Thread Pool</td><td>连接按组分配；默认限制每组短语句并发，stall 后允许扩容；listener 可兼作 worker；按事务是否已开始区分高低优先级队列，并以等待回调处理部分阻塞 [45]</td><td>未插桩等待只能等 stall 超时；组间按连接而非实际成本分配；事务状态不等于锁依赖，队列 credit 与 OS runnable 不同</td></tr>
+<tr><td>MariaDB / Percona Thread Pool</td><td>采用 thread group、动态 worker、oversubscribe 与 stall/timer 检测；Percona 增加高优票据及 normal queue 节流 [46]</td><td>某些等待无法感知并会造成 CPU 欠利用；等待中标记 inactive 的线程不占 oversubscribe，总线程数仍可能涨至上限，持锁事务若未被取出则可形成死锁</td></tr>
+<tr><td>TiKV</td><td>gRPC、Scheduler、Raftstore、StoreWriter、Apply 与 UnifyReadPool 分工；部分池支持按 CPU 利用率自动调容 [48]</td><td>一个池扩容会改变其他池的 CPU、日志与 IO 压力，瓶颈可跨阶段迁移；单池利用率不能代表端到端有效并发</td></tr>
+<tr><td>CockroachDB</td><td>在 admission queue 中按动态 slot/token 控制 CPU 与存储；根据 runnable goroutine、调度延迟调节并发，并提高持锁事务的 admission 优先级 [47]</td><td>低 runnable 阈值可降低峰值 CPU 利用率；工作大小与完成边界有时不可知，锁优先级提升仍不能替代完整等待图和内核调度</td></tr>
+<tr><td>PgBouncer</td><td>在代理层复用 PostgreSQL 后端连接，提供 session/transaction/statement pooling [48]</td><td>主要减少连接数，并不调度数据库内的执行线程；transaction pooling 还会破坏部分 SET、session advisory lock、WITH HOLD CURSOR 等会话语义</td></tr>
+</table>
+
+<p><strong>机制边界一（对应 a）：依赖失明导致队列内和 OS 内双重优先级反转。</strong>MySQL 的高低队列主要依据事务是否已经开始，而不是 <code>waiter→holder</code> 等待边。普通 worker 可能全部阻塞在行锁上，而持有锁的事务仍在队列中等待 credit；即使 holder 已占用 worker，也可能被无关 CPU 任务抢占，数据库队列无法约束内核。Percona 文档明确描述了等待线程不占 oversubscribe、线程数逼近上限且持锁事务无法被取出的死锁路径 [46]。CockroachDB 专门提高持锁事务的 admission 优先级，恰好说明仅靠固定池与 FIFO/事务队列不足以消除反转 [47]。因此，线程池可以限制“同时执行多少”，却不能天然决定“哪一个必须先执行以释放系统关键路径”。</p>
+<p><strong>机制边界二（对应 b/c）：配置数、存活数、忙碌数与可运行数被混为一谈。</strong>至少需要区分 <code>N_cfg</code>（组数、每组目标或上限）、<code>N_alive</code>（已创建且尚未退出的线程）、<code>N_busy</code>（正在处理语句的线程）与 <code>N_run</code>（OS runnable 线程）。动态池按需创建和回收线程，<code>N_alive &lt; N_cfg</code> 本身不是 bug，因为 max 往往不是常驻目标；但若把配置上限当成 CPU 并发保证，就会误判容量。更关键的是，<code>N_busy</code> 还可能包含锁/IO 阻塞、未上报等待以及被 OS 抢占的线程，<code>N_run</code> 才能直接解释 CPU 是否为空转。MySQL 文档明确指出，未被回调插桩的阻塞要等待 stall 时间后才能触发新线程；MariaDB 进一步列出 page fault 等无法通知线程池的等待会造成 CPU 欠利用 [45][46]。于是可能出现“组内队列非空、配置尚未到顶、busy 看似很高，但 CPU 实际空闲”的扩容滞后。</p>
+<p>本仓库的实现也展示了这种计数语义：<code>plugin/thread_pool/src/thread_pool.cc</code> 中，<code>threads_active</code> 通过事件增减，<code>max_active_threads = threads_user_request + stalled_threads</code> 由 stall 检查更新，<code>is_credit_available()</code> 再依据这些计数决定是否放行。该设计具有明确的工程目的——避免未上报的长等待永久堵死一个组——但它是<strong>基于事件与周期的最终一致视图</strong>，不是逐时刻的 OS 调度视图。类似地，<code>Threadpool_threads − Threadpool_idle_threads</code> 可以表示请求处理忙闲，却不能直接当成 runnable；本论文观测到“队列为空仍有 worker 等待 100–500µs”正是 OS 抢占造成的另一层计数盲区。</p>
+<p><strong>机制边界三（对应 b/c）：静态尺寸和连接分组无法适应负载成本变化。</strong>请求速率并不能完整描述负载，服务时间、锁等待比例和 IO 阻塞比例同样决定所需线程数 [49]。按连接 round-robin 分组只保证数量近似均匀，不能保证 CPU 成本、热点行或事务依赖均匀，因而可出现热组排队而其他组空闲。listener 兼作 worker 时还会暂时失去监听能力，直到新 listener 被创建。TiKV 的调优文档则显示，扩大一个阶段的池会增加其他阶段的 CPU 与日志/IO 压力，瓶颈会迁移而不是消失 [48]。这意味着“CPU 核数乘以一个固定系数”只能是起始经验值，不可能同时适配干净点查、长事务、锁风暴和突发重连。</p>
+<p><strong>机制边界四（对应 d/e）：线程池限制执行并发，却不天然提供过载语义。</strong>固定池把突发流量转化为排队后，仍需要决定按什么信号准入、过期工作何时取消、客户端重连重试如何约束。否则，线程数配置得再精确，也只是更快地消耗有效与无效工作。PgBouncer 证明连接复用本身很有价值，但代理池既不代表数据库内执行调度，也可能牺牲会话语义 [48]；Bouncer 则进一步说明，以响应时间目标驱动的早期准入与队列控制是独立于线程数调优的一层 [50]。</p>
+<p>因此，本文的立场是<strong>保留线程池作为高效执行底座，但拒绝把它当作完整的韧性方案</strong>。对应地，HP/VIP、COMMIT 早行与锁等待边处理 a 的活性与优先级反转；固定池、唤醒纪律、queue-time 准入和 EEVDF-Sem 共同治理 b/c 的并发开销与容量失控；前台 reactor 的断连早弃、Q2/Q3 取消和客户端/中间件退避治理 d/e 的无效执行与重试放大。固定池只负责其最擅长的执行复用，其他层分别补齐依赖语义、可观测状态、准入取消与内核调度。</p>
+
+<h3>2.4 设计目标：性能韧性</h3>
+<p>膝点与崖点均为<strong>配置相关</strong>的测量量；本文未加限定的“越崖”指越过基线配置的崖点。为避免凭肉眼选点，实验分别对 G 与 RT 做分段线性回归，以 G 持续偏离线性且 RT 斜率显著上升共同识别膝点，以连续至少三个负载档的 goodput 均较此前峰值下降超过 10% 识别崖点，并在运行前冻结拟合窗口与阈值；扫描范围内未出现崖点时记为 <code>λ_cliff &gt; λ_max</code> 的下界，不得把最大测点伪装成崖点。据此，本文将<strong>性能韧性（performance resilience）</strong>定义为四个可测量属性的合取：</p>
 <ul>
-<li><strong>R1 崖点韧性</strong>：goodput 随 offered load 开始下降的点（崖点）尽量推远；</li>
-<li><strong>R2 越崖行为</strong>：超过崖点后 goodput 不崩溃、无活性故障、无重试放大；</li>
-<li><strong>R3 恢复韧性</strong>：负载回落后尾延迟在秒级内恢复至基线邻域；</li>
-<li><strong>R4 干扰韧性</strong>：外部干扰下尾延迟劣化倍数有界。</li>
+<li><strong>R1 容量韧性</strong>：膝点与崖点尽量推远，扩大线性区和可持续平台区；</li>
+<li><strong>R2 基线越崖行为</strong>：在基线崖点及更高负载下，目标配置不进入持续下降段，且无活性故障、无重试放大；若目标自身最终出现崖点，单独报告其位置与后续平台；</li>
+<li><strong>R3 恢复韧性</strong>：触发撤除后，重试残留与排队及时消散；以 <strong>RTO（恢复时间目标）</strong>度量从撤载到 p99/p999 恢复至基线 1.2× 并持续一个观测窗口的时间，目标为秒级，未恢复记为 <code>RTO = +∞</code>，而非“恢复较慢”；同时报告恢复负载阈值与迟滞；</li>
+<li><strong>R4 干扰韧性</strong>：比较外部干扰前后的 p99/p999 与完整 RT CDF，要求尾延迟右移和劣化倍数有界，不以 max 或单一均值替代尾部。</li>
 </ul>
+
+<figure>
+<svg viewBox="0 0 960 420" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">
+  <rect x="35" y="50" width="430" height="340" rx="10" fill="#fbfdff" stroke="#e2e4ee"/>
+  <rect x="500" y="50" width="430" height="340" rx="10" fill="#fbfdff" stroke="#e2e4ee"/>
+  <text x="55" y="77" font-size="14" font-weight="bold" fill="#334155">（a）R3：撤载后的 p99 RT 与 RTO</text>
+  <text x="520" y="77" font-size="14" font-weight="bold" fill="#334155">（b）R4：干扰下尾延迟 CDF（越左越好）</text>
+
+  <rect x="210" y="90" width="90" height="230" fill="#fef3c7" fill-opacity="0.55"/>
+  <text x="255" y="108" text-anchor="middle" font-size="11" fill="#92400e">流量阶跃</text>
+  <line x1="80" y1="320" x2="430" y2="320" stroke="#475569" stroke-width="1.3"/>
+  <line x1="80" y1="320" x2="80" y2="90" stroke="#475569" stroke-width="1.3"/>
+  <text x="58" y="100" font-size="11" fill="#64748b">p99 RT</text>
+  <text x="430" y="380" text-anchor="end" font-size="11" fill="#64748b">时间 t</text>
+
+  <line x1="80" y1="285" x2="430" y2="285" stroke="#94a3b8" stroke-width="1.2" stroke-dasharray="5 4"/>
+  <text x="86" y="279" font-size="10" fill="#64748b">基线</text>
+  <line x1="80" y1="265" x2="430" y2="265" stroke="#64748b" stroke-width="1.1" stroke-dasharray="3 3"/>
+  <text x="86" y="258" font-size="10" fill="#64748b">1.2× 基线</text>
+
+  <path d="M80 285 L180 285 C205 280 215 190 240 160 C260 130 280 125 300 130 L430 145" fill="none" stroke="#dc2626" stroke-width="2.4"/>
+  <path d="M80 285 L180 285 C205 280 215 210 240 185 C260 160 275 175 290 205 C310 250 335 280 355 285 L430 285" fill="none" stroke="#059669" stroke-width="2.4"/>
+  <text x="315" y="140" font-size="11" fill="#991b1b">未恢复 / 亚稳态</text>
+  <text x="360" y="275" font-size="11" fill="#065f46">恢复</text>
+
+  <line x1="300" y1="90" x2="300" y2="320" stroke="#64748b" stroke-width="1.1" stroke-dasharray="4 4"/>
+  <line x1="355" y1="205" x2="355" y2="320" stroke="#059669" stroke-width="1.1" stroke-dasharray="4 4"/>
+  <circle cx="355" cy="285" r="4.5" fill="#059669"/>
+  <text x="300" y="336" text-anchor="middle" font-size="10" fill="#475569">撤载 t1</text>
+  <text x="355" y="336" text-anchor="middle" font-size="10" fill="#065f46">t_rec</text>
+  <line x1="300" y1="350" x2="355" y2="350" stroke="#059669" stroke-width="1.5"/>
+  <line x1="300" y1="344" x2="300" y2="356" stroke="#059669" stroke-width="1.5"/>
+  <line x1="355" y1="344" x2="355" y2="356" stroke="#059669" stroke-width="1.5"/>
+  <text x="327" y="370" text-anchor="middle" font-size="12" font-weight="bold" fill="#065f46">RTO</text>
+
+  <line x1="545" y1="320" x2="895" y2="320" stroke="#475569" stroke-width="1.3"/>
+  <line x1="545" y1="320" x2="545" y2="90" stroke="#475569" stroke-width="1.3"/>
+  <text x="522" y="100" font-size="11" fill="#64748b">CDF</text>
+  <text x="760" y="380" text-anchor="middle" font-size="11" fill="#64748b">latency（向右更差）</text>
+  <line x1="545" y1="105" x2="895" y2="105" stroke="#94a3b8" stroke-width="1.1" stroke-dasharray="4 4"/>
+  <text x="540" y="109" text-anchor="end" font-size="10" fill="#64748b">0.99</text>
+
+  <path d="M545 310 C580 295 600 230 630 170 C650 130 680 108 710 100 L895 100" fill="none" stroke="#94a3b8" stroke-width="1.8" stroke-dasharray="6 4"/>
+  <path d="M565 310 C610 295 635 225 670 165 C700 125 730 108 770 100 L895 100" fill="none" stroke="#059669" stroke-width="2.4"/>
+  <path d="M650 310 C710 295 735 225 775 165 C810 125 840 108 875 100 L895 100" fill="none" stroke="#dc2626" stroke-width="2.4"/>
+
+  <line x1="690" y1="105" x2="690" y2="320" stroke="#94a3b8" stroke-width="1.1" stroke-dasharray="4 4"/>
+  <line x1="750" y1="105" x2="750" y2="320" stroke="#059669" stroke-width="1.1" stroke-dasharray="4 4"/>
+  <line x1="855" y1="105" x2="855" y2="320" stroke="#dc2626" stroke-width="1.1" stroke-dasharray="4 4"/>
+  <text x="690" y="340" text-anchor="middle" font-size="10" fill="#64748b">p99 clean</text>
+  <text x="750" y="358" text-anchor="middle" font-size="10" fill="#065f46">p99 Sem</text>
+  <text x="855" y="340" text-anchor="middle" font-size="10" fill="#991b1b">p99 default</text>
+  <text x="600" y="145" font-size="10" fill="#64748b">clean</text>
+  <text x="710" y="150" font-size="10" fill="#065f46">Sem + noise</text>
+  <text x="790" y="195" font-size="10" fill="#991b1b">default + noise</text>
+</svg>
+<figcaption>图 3｜恢复与干扰韧性的度量【示意，非实测】。（a）RTO 从撤载时刻开始计时，直到 p99/p999 持续回到基线 1.2× 邻域；未恢复记为 +∞，用于区分快速恢复与亚稳态。（b）CDF 与 0.99 水平线的交点给出 p99；干扰后的曲线越向左，尾延迟保护越好，p999 以同一方式读取。</figcaption>
+</figure>
 <p>约束条件为：<strong>C1 免标注</strong>（默认配置不依赖任何业务优先级输入）；<strong>C2 公平有界</strong>（任何微调不得造成可观测的饿死）；<strong>C3 干净开销小</strong>（无干扰低争用下吞吐代价 ≤5%）；<strong>C4 可降级</strong>（内核不支持 sched_ext 时用户态机制独立有效）。</p>
 <p>峰值吞吐在本框架中是回归约束而非优化目标：打榜负载仅用于确认无退化，与 Snowflake 所批评的“为基准特调”划清界限 [24]。</p>
 
 <h2>3 系统概述</h2>
-<p>EEVDF-Sem 部署于 MySQL 9.7 的分层架构中（图 2）：</p>
+<h3>3.1 分层架构</h3>
+<p>EEVDF-Sem 部署于 MySQL 9.7 的分层架构中（图 4）：</p>
 <ol>
-<li><strong>前台 reactor 组</strong>：reactor 线程数可配置（默认 1），每个 reactor 一个独立 epoll 实例，连接按 fd 哈希分片到各 reactor；每连接一个 C++20 无栈协程，承载全部网络等待；<strong>收包后在 reactor 上同步完成 parse</strong>（纯 CPU、有界、不触碰 MDL/TABLE），输出语句类型、访问表集合与事务边界供调度决策，解析失败直接返回错误、不占 worker；optimize/execute 仍由 worker 执行。</li>
+<li><strong>前台 reactor 组</strong>：reactor 线程数可配置（默认 1），每个 reactor 一个独立 epoll 实例，连接按 fd 哈希分片到各 reactor；每连接一个 C++20 无栈协程，承载连接与命令读等待；<strong>收包后在 reactor 上同步完成 parse</strong>（纯 CPU、有界、不触碰 MDL/TABLE），输出语句类型、访问表集合与事务边界供调度决策，解析失败直接返回错误、不占 worker；排队期间继续感知断连【v4】，optimize/execute 仍由 worker 执行。</li>
 <li><strong>执行池</strong>：worker 数可配置的线程池（配置后固定，默认 4× 硬件并发数），以整个 THD 为交接单元；高优先级队列与 VIP worker 保证排队层活性。</li>
 <li><strong>准入层</strong>（本设计新增）：位于 reactor 与执行池之间，按排队时间发放 credit。</li>
 <li><strong>EEVDF-Sem 调度器</strong>：sched_ext BPF 程序，单池虚拟时间调度，消费用户态发布的意图。</li>
@@ -125,50 +263,138 @@
 </ol>
 
 <figure>
-<svg viewBox="0 0 900 560" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">
-  <defs><marker id="ar2" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#475569"/></marker></defs>
-  <rect x="250" y="14" width="400" height="44" rx="8" fill="#f1f5f9" stroke="#94a3b8"/>
-  <text x="450" y="41" text-anchor="middle" font-size="14" fill="#334155">Agent / 应用（突发、不可标注、重试敏感）</text>
-  <line x1="450" y1="58" x2="450" y2="82" stroke="#475569" stroke-width="1.6" marker-end="url(#ar2)"/>
+<svg viewBox="0 0 960 820" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">
+  <defs>
+    <marker id="ar2" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#475569"/></marker>
+    <marker id="ar2-orange" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#d97706"/></marker>
+    <marker id="ar2-purple" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#a855f7"/></marker>
+  </defs>
 
-  <rect x="140" y="86" width="620" height="72" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
-  <text x="450" y="112" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e40af">① 前台 reactor：协程 epoll（网络等待不占线程）</text>
-  <text x="450" y="138" text-anchor="middle" font-size="12" fill="#334155">收包后同步 parse：语句类型/表集合/事务边界 ｜ optimize 留 worker</text>
-  <line x1="450" y1="158" x2="450" y2="182" stroke="#475569" stroke-width="1.6" marker-end="url(#ar2)"/>
+  <rect x="20" y="6" width="920" height="42" rx="10" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="480" y="37" text-anchor="middle" font-size="15" font-weight="bold" fill="#334155">APP/Agent</text>
 
-  <rect x="140" y="186" width="620" height="64" rx="10" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
-  <text x="450" y="212" text-anchor="middle" font-size="15" font-weight="bold" fill="#065f46">② 准入层【v4】：queue-time credit + 按连接公平排队</text>
-  <text x="450" y="236" text-anchor="middle" font-size="12" fill="#334155">过载 → 延迟接纳（不拒绝、不崩溃）；租户泳道/限流上移中间件</text>
-  <line x1="450" y1="250" x2="450" y2="274" stroke="#475569" stroke-width="1.6" marker-end="url(#ar2)"/>
+  <rect x="20" y="70" width="920" height="370" rx="14" fill="#fbfdff" stroke="#cbd5e1"/>
+  <text x="36" y="95" font-size="13" font-weight="bold" fill="#475569">用户态 / mysqld</text>
+  <text x="924" y="95" text-anchor="end" font-size="11" fill="#64748b">实线：命令与完成流</text>
+  <line x1="140" y1="48" x2="140" y2="66" stroke="#475569" stroke-width="1.7" marker-end="url(#ar2)"/>
+  <line x1="310" y1="48" x2="310" y2="66" stroke="#475569" stroke-width="1.7" marker-end="url(#ar2)"/>
+  <line x1="480" y1="48" x2="480" y2="66" stroke="#475569" stroke-width="1.7" marker-end="url(#ar2)"/>
+  <line x1="650" y1="48" x2="650" y2="66" stroke="#475569" stroke-width="1.7" marker-end="url(#ar2)"/>
+  <line x1="820" y1="48" x2="820" y2="66" stroke="#475569" stroke-width="1.7" marker-end="url(#ar2)"/>
 
-  <rect x="140" y="278" width="620" height="86" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
-  <text x="450" y="304" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e40af">③ 执行池：worker 数可配置（默认 4×）+ HP/VIP 活性通道</text>
-  <text x="450" y="328" text-anchor="middle" font-size="12" fill="#334155">THD 整体移交（store/restore_globals）｜ cascade notify 防惊群</text>
-  <text x="450" y="350" text-anchor="middle" font-size="12" fill="#334155">holder 的 COMMIT 走 HP 队列 + VIP worker，排队层不堵死</text>
-  <line x1="450" y1="364" x2="450" y2="388" stroke="#475569" stroke-width="1.6" marker-end="url(#ar2)"/>
+  <rect x="45" y="110" width="260" height="212" rx="11" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+  <text x="175" y="138" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e40af">前台 Reactor 组（m 个线程）</text>
+  <rect x="60" y="155" width="36" height="72" rx="4" fill="#ffffff" stroke="#93c5fd"/>
+  <path d="M78 163 C70 176 86 188 78 201 C70 207 86 215 78 221" fill="none" stroke="#2563eb" stroke-width="2"/>
+  <text x="78" y="243" text-anchor="middle" font-size="10" fill="#1e40af">R1</text>
+  <rect x="110" y="155" width="36" height="72" rx="4" fill="#ffffff" stroke="#93c5fd"/>
+  <path d="M128 163 C120 176 136 188 128 201 C120 207 136 215 128 221" fill="none" stroke="#2563eb" stroke-width="2"/>
+  <text x="128" y="243" text-anchor="middle" font-size="10" fill="#1e40af">R2</text>
+  <text x="193" y="199" text-anchor="middle" font-size="18" fill="#64748b">…</text>
+  <rect x="240" y="155" width="36" height="72" rx="4" fill="#ffffff" stroke="#93c5fd"/>
+  <path d="M258 163 C250 176 266 188 258 201 C250 207 266 215 258 221" fill="none" stroke="#2563eb" stroke-width="2"/>
+  <text x="258" y="243" text-anchor="middle" font-size="10" fill="#1e40af">Rm</text>
+  <text x="175" y="267" text-anchor="middle" font-size="12" fill="#334155">Q1：epoll + 协程；命令读等待</text>
+  <text x="175" y="289" text-anchor="middle" font-size="11" fill="#334155">parse → 语句分类；HUP/ERR 早弃【v4】</text>
+  <text x="175" y="311" text-anchor="middle" font-size="11" fill="#64748b">fd 分片；空闲连接不占 worker</text>
 
-  <rect x="140" y="392" width="620" height="64" rx="10" fill="#f8fafc" stroke="#64748b"/>
-  <text x="450" y="418" text-anchor="middle" font-size="14" fill="#334155">InnoDB：行锁/latch（CATS 决定谁下一个拿锁）</text>
-  <text x="450" y="440" text-anchor="middle" font-size="12" fill="#64748b">等待边 waiter→holder 经意图通道发布</text>
+  <rect x="365" y="140" width="230" height="172" rx="11" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+  <text x="480" y="166" text-anchor="middle" font-size="15" font-weight="bold" fill="#065f46">THD Queue</text>
+  <rect x="390" y="184" width="45" height="44" fill="#ffffff" stroke="#059669"/>
+  <rect x="435" y="184" width="45" height="44" fill="#ffffff" stroke="#059669"/>
+  <rect x="480" y="184" width="45" height="44" fill="#ffffff" stroke="#059669"/>
+  <rect x="525" y="184" width="45" height="44" fill="#ffffff" stroke="#059669"/>
+  <text x="412" y="211" text-anchor="middle" font-size="10" fill="#065f46">THD 1</text>
+  <text x="457" y="211" text-anchor="middle" font-size="10" fill="#065f46">THD 2</text>
+  <text x="502" y="211" text-anchor="middle" font-size="14" fill="#64748b">…</text>
+  <text x="547" y="211" text-anchor="middle" font-size="10" fill="#065f46">THD i</text>
+  <text x="480" y="254" text-anchor="middle" font-size="11" fill="#334155">Q2 准入：queue-time credit</text>
+  <text x="480" y="278" text-anchor="middle" font-size="11" fill="#334155">Q3 执行：Normal + HP/VIP</text>
+  <text x="480" y="300" text-anchor="middle" font-size="10" fill="#64748b">断连早弃 / 出队检查【v4】</text>
 
-  <rect x="140" y="476" width="620" height="70" rx="10" fill="#fdf4ff" stroke="#a855f7" stroke-width="1.5"/>
-  <text x="450" y="502" text-anchor="middle" font-size="15" font-weight="bold" fill="#7e22ce">④ EEVDF-Sem 调度器（sched_ext BPF，单池 vd 排序）</text>
-  <text x="450" y="528" text-anchor="middle" font-size="12" fill="#334155">COMMIT 早行 ｜ 锁持有者 vd 继承 + 借还记账 ｜ aging/clamp 防饿死</text>
+  <line x1="305" y1="206" x2="359" y2="206" stroke="#475569" stroke-width="1.8" marker-end="url(#ar2)"/>
+  <text x="335" y="196" text-anchor="middle" font-size="10" fill="#475569">submit</text>
+  <line x1="595" y1="206" x2="649" y2="206" stroke="#475569" stroke-width="1.8" marker-end="url(#ar2)"/>
+  <text x="625" y="196" text-anchor="middle" font-size="10" fill="#475569">dequeue</text>
 
-  <rect x="788" y="278" width="100" height="180" rx="10" fill="#fffbeb" stroke="#d97706" stroke-width="1.5"/>
-  <text x="838" y="304" text-anchor="middle" font-size="13" font-weight="bold" fill="#92400e">⑤ 意图通道</text>
-  <text x="838" y="330" text-anchor="middle" font-size="11" fill="#78350f">job_type[tid]</text>
-  <text x="838" y="352" text-anchor="middle" font-size="11" fill="#78350f">blocked_by</text>
-  <text x="838" y="374" text-anchor="middle" font-size="11" fill="#78350f">debt/borrowed</text>
-  <text x="838" y="396" text-anchor="middle" font-size="11" fill="#78350f">时间戳清扫</text>
-  <text x="838" y="428" text-anchor="middle" font-size="11" fill="#78350f">BPF maps</text>
-  <line x1="760" y1="322" x2="782" y2="322" stroke="#d97706" stroke-width="1.6" marker-end="url(#ar2)"/>
-  <line x1="760" y1="512" x2="700" y2="512" stroke="#d97706" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#ar2)"/>
-  <line x1="838" y1="458" x2="838" y2="500" stroke="#d97706" stroke-width="1.6" stroke-dasharray="5 3"/>
-  <line x1="838" y1="500" x2="766" y2="500" stroke="#d97706" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#ar2)"/>
+  <rect x="655" y="110" width="260" height="212" rx="11" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+  <text x="785" y="138" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e40af">固定执行池（n 个 worker）</text>
+  <rect x="675" y="155" width="36" height="72" rx="4" fill="#ffffff" stroke="#93c5fd"/>
+  <path d="M693 163 C685 176 701 188 693 201 C685 207 701 215 693 221" fill="none" stroke="#2563eb" stroke-width="2"/>
+  <text x="693" y="243" text-anchor="middle" font-size="10" fill="#1e40af">W1</text>
+  <rect x="725" y="155" width="36" height="72" rx="4" fill="#ffffff" stroke="#93c5fd"/>
+  <path d="M743 163 C735 176 751 188 743 201 C735 207 751 215 743 221" fill="none" stroke="#2563eb" stroke-width="2"/>
+  <text x="743" y="243" text-anchor="middle" font-size="10" fill="#1e40af">W2</text>
+  <text x="808" y="199" text-anchor="middle" font-size="18" fill="#64748b">…</text>
+  <rect x="855" y="155" width="36" height="72" rx="4" fill="#ffffff" stroke="#93c5fd"/>
+  <path d="M873 163 C865 176 881 188 873 201 C865 207 881 215 873 221" fill="none" stroke="#2563eb" stroke-width="2"/>
+  <text x="873" y="243" text-anchor="middle" font-size="10" fill="#1e40af">Wn</text>
+  <text x="785" y="267" text-anchor="middle" font-size="12" fill="#334155">optimize / execute / COMMIT</text>
+  <text x="785" y="289" text-anchor="middle" font-size="11" fill="#334155">THD 整体移交；同步执行语义</text>
+  <text x="785" y="311" text-anchor="middle" font-size="11" fill="#64748b">cascade + HP/VIP；锁/IO 可阻塞</text>
+
+  <path d="M785 322 L785 342 L175 342 L175 328" fill="none" stroke="#475569" stroke-width="1.5" marker-end="url(#ar2)"/>
+  <text x="480" y="336" text-anchor="middle" font-size="11" fill="#475569">eventfd / CommandDone：完成回投</text>
+
+  <rect x="655" y="362" width="260" height="56" rx="9" fill="#fff7ed" stroke="#ea580c" stroke-width="1.5"/>
+  <text x="785" y="385" text-anchor="middle" font-size="13" font-weight="bold" fill="#9a3412">Q4：InnoDB lock / latch</text>
+  <text x="785" y="407" text-anchor="middle" font-size="11" fill="#9a3412">CATS 管锁授予；产生 waiter→holder 等待边</text>
+  <line x1="825" y1="322" x2="825" y2="356" stroke="#ea580c" stroke-width="1.5" marker-end="url(#ar2-orange)"/>
+
+  <rect x="20" y="460" width="920" height="340" rx="14" fill="#fdfcff" stroke="#c4b5fd"/>
+  <text x="36" y="486" font-size="13" font-weight="bold" fill="#6d28d9">OS / Linux</text>
+  <text x="924" y="486" text-anchor="end" font-size="11" fill="#7e22ce">Q5：只调度 runnable tid，不接管锁授予</text>
+
+  <path d="M365 240 L335 240 L335 528 L344 528" fill="none" stroke="#d97706" stroke-width="1.7" stroke-dasharray="6 4" marker-end="url(#ar2-orange)"/>
+  <text x="323" y="405" text-anchor="end" font-size="11" fill="#b45309">parse / job_type / COMMIT</text>
+  <path d="M655 390 L610 390 L610 528" fill="none" stroke="#d97706" stroke-width="1.7" stroke-dasharray="6 4" marker-end="url(#ar2-orange)"/>
+  <text x="620" y="448" font-size="11" fill="#b45309">blocked_by</text>
+
+  <rect x="350" y="490" width="260" height="76" rx="10" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
+  <text x="480" y="514" text-anchor="middle" font-size="14" font-weight="bold" fill="#92400e">意图通道：BPF maps</text>
+  <text x="480" y="536" text-anchor="middle" font-size="11" fill="#78350f">job_type · blocked_by · borrowed / debt</text>
+  <text x="480" y="555" text-anchor="middle" font-size="11" fill="#78350f">队列与锁的语义 → CPU 调度意图</text>
+
+  <path d="M45 250 L32 250 L32 633 L214 633" fill="none" stroke="#a855f7" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#ar2-purple)"/>
+  <text x="43" y="619" font-size="11" fill="#7e22ce">reactor tids</text>
+  <path d="M915 250 L930 250 L930 633 L746 633" fill="none" stroke="#a855f7" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#ar2-purple)"/>
+  <text x="917" y="619" text-anchor="end" font-size="11" fill="#7e22ce">worker tids</text>
+
+  <line x1="480" y1="566" x2="480" y2="584" stroke="#d97706" stroke-width="1.8" marker-end="url(#ar2-orange)"/>
+  <rect x="220" y="590" width="520" height="86" rx="11" fill="#fdf4ff" stroke="#a855f7" stroke-width="1.8"/>
+  <text x="480" y="616" text-anchor="middle" font-size="15" font-weight="bold" fill="#7e22ce">EEVDF-Sem（sched_ext）｜ Q5 OS 运行队列</text>
+  <text x="480" y="640" text-anchor="middle" font-size="12" fill="#334155">单池 vd 排序：reactor / worker / 后台及外部任务</text>
+  <text x="480" y="662" text-anchor="middle" font-size="11" fill="#7e22ce">COMMIT 早行 · holder 继承 · 借还公平 · 唤醒选核</text>
+
+  <line x1="480" y1="676" x2="480" y2="694" stroke="#a855f7" stroke-width="1.8" marker-end="url(#ar2-purple)"/>
+  <rect x="150" y="700" width="660" height="76" rx="10" fill="#f8fafc" stroke="#64748b" stroke-width="1.5"/>
+  <text x="480" y="723" text-anchor="middle" font-size="13" font-weight="bold" fill="#334155">k 个 CPU 核（共享资源池，动态放置）</text>
+  <rect x="190" y="735" width="110" height="27" rx="5" fill="#e2e8f0"/>
+  <text x="245" y="754" text-anchor="middle" font-size="11" fill="#334155">CPU 0</text>
+  <rect x="320" y="735" width="110" height="27" rx="5" fill="#e2e8f0"/>
+  <text x="375" y="754" text-anchor="middle" font-size="11" fill="#334155">CPU 1</text>
+  <text x="480" y="754" text-anchor="middle" font-size="15" fill="#64748b">…</text>
+  <rect x="550" y="735" width="150" height="27" rx="5" fill="#e2e8f0"/>
+  <text x="625" y="754" text-anchor="middle" font-size="11" fill="#334155">CPU k−1</text>
+
+  <text x="480" y="794" text-anchor="middle" font-size="11" fill="#64748b">边界：Q2/Q3 用户态排队 ｜ Q4 InnoDB 锁授予 ｜ Q5 OS 分配 CPU</text>
 </svg>
-<figcaption>图 2｜系统架构：前台协程承载等待，执行池保留 MySQL 执行语义，意图通道把结构语义发布给单池公平调度器。</figcaption>
+<figcaption>图 4｜混合执行与跨层调度。命令沿 Reactor → THD Queue（Q2/Q3）→ worker 流动，完成事件反向回投；Q4 的锁授予仍由 InnoDB/CATS 负责，队列与锁仅通过 BPF maps 发布调度语义，EEVDF-Sem 在 Q5 调度可运行线程。m、n、k 分别是 reactor 线程数、worker 线程数与 CPU 核数，三者不要求相等，图中调度箭头不表示静态绑核。</figcaption>
 </figure>
+
+<h3>3.2 为什么需要前台 reactor</h3>
+<p>前台 reactor 不是简单替换网络 API，而是在 worker 之前建立一个<strong>执行前控制点</strong>：在消耗执行槽位、获取锁和产生事务副作用之前，系统第一次同时掌握请求内容、连接状态与排队状态。其必要性来自三个相互强化、但可独立成立的原因。</p>
+<ol>
+<li><strong>调度所需的语句语义只有 parse 后才存在。</strong>socket 可读只说明字节到达，不能区分普通 SELECT、COMMIT/ROLLBACK 或锁持有者的下一条重型查询；仅知道“这是 holder”而不知“它要做什么”，就只能笼统提权下一条语句，重新打开 §4.2 所述的博弈缝隙。reactor 在 Q2/Q3 之前完成 parse，并将语句类型、事务边界与该 THD 的锁持有状态联合为调度输入，才能决定进入 Normal 还是 HP/VIP、是否值得提权以及是否释放资源。若直到 worker 取任务后才 parse，排队与提权决策已经发生，语义便失去前置价值。</li>
+<li><strong>断连取消必须发生在 worker 执行之前。</strong>经典 MySQL 协议是请求—响应式的 <strong>ping-pong</strong>：一条连接上的命令与其 OK/ERR/结果集响应串行交替，一个显式事务又由 BEGIN、DML、COMMIT 等多轮组成 [38]。客户端通常在每轮等待上设置 deadline；过载时，响应前的排队时间可能单独超过该 deadline。默认 one-thread-per-connection 在 <code>do_command()</code> 内依次完成阻塞读包、dispatch、parse/execute 和结果写回（<code>sql/sql_parse.cc</code>、<code>sql-common/net_serv.cc</code>），线程池改变的是语句由哪个 worker 执行，而不是这条生命周期 [37][38]。任务排队时若无人读取其 fd，FIN/RST 不会自动转化为队列取消；若命令尚未读入，往往要到 worker 取任务后的读包才发现断连，若命令已读入，则可能到 <code>my_net_write()</code>/<code>net_flush()</code> 返回错误时才发现，之前的 optimize、锁等待与执行已成为无效功。前台 reactor 持续掌握 fd，可将 EOF/RST 对应的可读/HUP/ERR 事件转成连接代次失效，在提交前和出队后、真正执行前各检查一次，安全丢弃尚未开始的旧命令【v4】。</li>
+<li><strong>网络等待与查询执行具有不同的最佳并发粒度。</strong>Reactor 模式原本就针对 thread-per-connection 的上下文切换、同步与数据移动开销 [35]；SEDA 进一步证明事件驱动阶段与有界线程池可以组合，在巨大负载变化下保持高吞吐与受控退化 [36]。在本系统的目标区间——大量长连接、短网络事件、频繁 ping-pong——一个 reactor 批量处理多个就绪 fd，空闲连接不对应可运行线程；fd 固定分片与连接内串行处理又减少跨核迁移、共享队列锁和缓存/TLB 扰动。MySQL 对默认线程模型与线程池的分析同样将缓存占用、上下文切换和过度并行列为主要伸缩限制 [37][38]。因此 reactor 是<strong>网络侧的最佳匹配</strong>，而非仅为少改代码的折中；但该结论以事件处理短小、有界为前提，不能外推到 optimize/execute。</li>
+</ol>
+<p><strong>取消语义的两个边界。</strong>第一，客户端“本地已经超时”不是网络事实：只有 FIN/RST、读/写错误或显式协议信号到达后才可观测；对仍在线但已静默放弃的连接，需要客户端显式传递 deadline，或由保活/超时机制判定，不能凭排队时长臆断。第二，执行前丢弃没有副作用，执行中取消则必须通过 <code>THD::killed</code>、存储引擎唤醒和事务清理协作完成；尤其不能把断连简单映射为强行回滚，更不能跳过已经不可中断的提交阶段。前台 reactor 保证的是<strong>尽早发现与尽早停止无效工作</strong>，不是瞬时、无条件取消。</p>
+
+<h3>3.3 为什么不全局采用 reactor + 协程</h3>
+<p><strong>协程解决的是控制流的挂起与恢复，不是并发调度。</strong>把 optimize/execute 全部改成协程，并不会减少事务数量、行锁/MDL/latch 临界区或共享缓冲池状态；更多可挂起的并发实体反而可能带来更深的锁队列、更大的缓存足迹和更多等待边。若所有协程只运行在少数 reactor 上，长查询等不可抢占的 CPU 段会造成队头阻塞；若让它们运行在多核执行器上，则 Q4 的锁竞争与 Q5 的 CPU 分配问题原样存在，仍需要准入、锁持有者保护和 EEVDF-Sem。换言之，<code>co_await</code> 可以降低一次让出的成本，却不能决定“谁应当运行、何时运行、运行多久”。</p>
+<p><strong>在并发度与唤醒纪律修正后，固定线程池依然高效，而且更贴合 MySQL。</strong>有界 worker 数限制了同时进入锁系统和 OS 运行队列的实体数，cascade notify 消除惊群，HP/VIP 保证提交活性，语义发布再修正 OS 分配；操作系统线程还提供长 CPU 段所需的抢占性，并直接容纳 InnoDB、同步 IO、条件变量与插件中的阻塞调用。相反，全局协程化要求逐一改造所有潜在阻塞点，并在每次恢复时维护 <code>current_thd</code>/TLS、THD mem-root 生命周期、PSI 线程归属、异常与清理语义；无栈协程由编译器保存协程帧，并不会自动迁移这些线程亲和状态。其改造面覆盖服务器、存储引擎和插件，正确性风险远大于仅前移网络与 parse。</p>
+<p>因此本文选择<strong>网络等待协程化、事务执行线程化、CPU 分配内核协同</strong>的分阶段结构，与 SEDA 将不同阶段置于不同资源控制边界的思想一致 [36]。这也是对“事件与线程谁更优”之争的具体回答：事件模型存在阻塞、调度与可编程性限制 [35][39]，固定线程并非天然低效，失控的并发度和错误的调度才是本文要消除的问题。执行侧协程化可以作为未来独立优化，但不能替代本文的调度机制，也不是获得上述收益的前提。</p>
 
 <p>设计原则可概括为一句话：<strong>公平是默认，语义是微调，微调必有界</strong>。</p>
 
@@ -244,7 +470,7 @@
   <text x="635" y="26" text-anchor="middle" font-size="12" fill="#991b1b">后续周期：用等待还回来（≤ D_max 未偿还）</text>
   <text x="460" y="312" text-anchor="middle" font-size="13" fill="#334155">Σ借入 ≈ Σ偿还 ⇒ 周期级公平不变；继承管“窗口内多急”，借还管“窗口后怎么还”</text>
 </svg>
-<figcaption>图 3｜借还记账时间线：提权是“有抵押的短期借款”，而非免费插队。</figcaption>
+<figcaption>图 5｜借还记账时间线：提权是“有抵押的短期借款”，而非免费插队。</figcaption>
 </figure>
 
 <p><strong>为什么必须“先借后还”而不是储蓄。</strong>cgroup CFS 带宽控制的 burst（<code>cpu.cfs_burst_us</code>/<code>cpu.max.burst</code>，Linux 5.14+ [31]）允许任务组消耗历史周期累积的未用配额：这是<strong>储蓄模型</strong>，其前提是该组曾被限流且有用剩的配额。锁/latch 持有者通常持续 runnable，不存在“用剩的配额”可存，储蓄模型对它结构性失效。因此本设计采用<strong>信用模型</strong>：提权窗口内多消耗的 CPU 记为借入，窗口关闭后转为 debt，通过推迟后续调度偿还——<strong>短窗口内允许多拿，周期级总量守恒</strong>。继承决定“窗口内多急”，借还决定“窗口后怎么还”，两者正交、可独立消融。debt 独立于 vruntime 存储且不随 lag clamp 抹除，防止持有者以睡眠逃债；debt 达到上限即禁止再借，消除持续争用下的无限优先。</p>
@@ -252,11 +478,12 @@
 <p><strong>latch 的发布成本控制。</strong>InnoDB latch 每秒进出百万次量级，逐次发布不可行；仅在 latch 等待发生时（sync 等待数组路径）发布等待边，与 UFS 的 wait-event 触发式上报同构，稳态零开销。</p>
 
 <h3>4.4 以排队时间为信号的准入控制</h3>
-<p>削减开销无法单独防止崖点，必须限制在制工作量。本设计的准入层采用闭环 credit 控制，与既有方案的区别在信号选择：</p>
+<p>削减开销无法单独防止崖点，必须限制在制工作量。客户端存在 deadline 时，准入目标不是榨出最后一次服务端完成尝试，而是在膝点后 RT 快速逼近 deadline 之前收缩 credit，避免“完成率仍高、goodput 已降”的超时崖点。Breakwater 的 queue-time credit 提供控制信号 [6]，超时放弃模型与亚稳态研究则解释为何还需同时削减存量无效功 [41][42]：准入抑制未来的超时反馈，断连早弃降低当前 <code>S</code>。本设计的准入层采用闭环 credit 控制，与既有方案的区别在信号选择：</p>
 <ul>
 <li><strong>信号为排队时间而非队列深度或线程数</strong>。原型测量表明队列深度为 0 时仍有 33% 的任务等待 100–500µs（worker 被 OS 抢占），深度信号在此类失效下完全失明。</li>
-<li><strong>过载时的行为是延迟接纳而非拒绝</strong>。新命令在 reactor 侧排队，客户端观测到延迟增加而非超时失败，从源头削弱重试放大。</li>
+<li><strong>过载时对仍在等待的客户端延迟接纳而非主动拒绝</strong>。新命令在 reactor 侧排队，系统不以过载错误制造额外重试；客户端仍可能按自身 deadline 超时，这由断连早弃而非“绝不超时”的假设处理。</li>
 <li><strong>准入等待按连接公平轮询</strong>，防止单个 Agent 连接的突发扇出挤占全部容量。租户级资源分配不在 DB 内实现，由中间件承担（§7）。</li>
+<li><strong>准入与排队取消正交【v4】</strong>。credit 限制仍有客户端价值的在制工作量；已观测断连，或携带显式 deadline 且已过期的命令，从 Q2/Q3 移除并归还 credit，不再占用 worker。取消只作用于尚未执行的工作，执行中请求遵循 §3.2 的协作取消边界。</li>
 <li><strong>迟滞控制</strong>：credit 乘性收缩、加性恢复，避免振荡。</li>
 </ul>
 
@@ -276,13 +503,15 @@
 <tr><td>COMMIT 注入点</td><td><code>sql/handler.cc</code>（<code>ha_commit_trans</code> 入口/出口）</td><td>【已有】</td></tr>
 <tr><td>BPF 调度器与加载器</td><td><code>support-files/scx/scx_db_sched.bpf.c</code>、<code>scx_db_sched_main.c</code></td><td>【已有 v3；v4 重写为单池 EEVDF-Sem】</td></tr>
 <tr><td>准入层（queue-time credit）</td><td>reactor 与 executor 之间（新增模块）</td><td>【v4】</td></tr>
+<tr><td>断连早弃（连接代次 + 出队检查）</td><td><code>coroutine_connection_handler.cc</code>、<code>coroutine/src/netpoller.cc</code></td><td>【v4，复用已有 HUP/ERR 事件能力】</td></tr>
 <tr><td>借还账户（borrowed/debt）</td><td>BPF per-task 状态 map + 调度器记账路径</td><td>【v4】</td></tr>
 </table>
 
-<h3>5.2 协程在哪里：只协程化网络等待，不协程化执行</h3>
-<p><strong>协程的边界</strong>：前台协程承担网络 IO 与 parse，optimize/execute 保持在线程上。parse 是纯 CPU、有界（语句长度限制）、不打开 TABLE、不触碰 MDL（表打开与 MDL 获取发生在 optimize 阶段），因此可在 reactor 上同步执行而不阻塞事件循环；多 reactor 分片使该部分 CPU 可水平扩展。THD 上下文仅在同步段内持有：<code>store_globals → parse → restore_globals</code>，不跨 <code>co_await</code>。optimize/execute 协程化需要完整保存 THD/TLS/锁/异常语义，代价与风险远超收益，不做。</p>
+<h3>5.2 协程在哪里：只协程化连接与命令读等待，不协程化执行</h3>
+<p><strong>协程的边界</strong>：前台协程承担连接/命令读 IO 与 parse，optimize/execute 保持在线程上。parse 是纯 CPU、有界（语句长度限制）、不打开 TABLE、不触碰 MDL（表打开与 MDL 获取发生在 optimize 阶段），因此可在 reactor 上同步执行而不阻塞事件循环；多 reactor 分片使该部分 CPU 可水平扩展。THD 上下文仅在同步段内持有：<code>store_globals → parse → restore_globals</code>，不跨 <code>co_await</code>。执行侧不做全局协程化的原因与改造边界见 §3.3。</p>
 <p><strong>连接生命周期</strong>【已有框架 + v4 parse 前移】（<code>coroutine_connection_handler.cc</code>）：每个连接一个 C++20 无栈协程帧（约几百字节），主循环为 <code>co_await wait_readable(fd)</code> → 同步 <code>parse</code>（失败直接回错、不占 worker）→ <code>submit_thd_job(do_command)</code> → <code>co_await CommandDone</code>。多语句包、存储过程与 parse 异常路径回退到 worker 内完整处理。认证同样以 job 形式提交执行池（<code>thd_prepare_connection</code>）。等待 socket 可读的连接<strong>不占任何执行线程</strong>——这是与 one-thread-per-connection 的本质区别。</p>
-<p><strong>Netpoller</strong>【已有】（<code>coroutine/src/netpoller.cc</code>）：单 epoll 实例同时驱动监听 fd 与全部连接 fd，ET + EPOLLONESHOT（避免惊群与重复事件），eventfd 用于跨线程唤醒（执行完成回投），内置定时器堆与 fd 兴趣表，单批事件上限 1024。KILL 与 fd 所有权采用单点关闭纪律：fd 只在 reactor 线程的 teardown 关闭；其他线程的 <code>vio_shutdown()</code> 经 pre-close 钩子转为带 token 校验的强制取消，挂起在 <code>wait_readable</code> 的协程被唤醒后走正常 teardown——fd 关闭前不复用，消除误 cancel/误 close 新连接的串扰。</p>
+<p><strong>Netpoller 与断连早弃</strong>【已有事件机制 + v4 排队取消】（<code>coroutine/src/netpoller.cc</code>）：每个 reactor 的 epoll 实例驱动其监听 fd 与连接 fd 分片，ET + EPOLLONESHOT 避免惊群与重复事件，eventfd 用于跨线程唤醒（执行完成回投），内置定时器堆与 fd 兴趣表，单批事件上限 1024；<code>EPOLLIN/EPOLLRDHUP/EPOLLHUP/EPOLLERR</code> 已能唤醒读等待者。v4 在此基础上为等待准入、执行队列和 <code>CommandDone</code> 的连接保留独立断连订阅，以连接代次标记失效，并在 submit 与 worker 出队两个时点检查；已失效且尚未进入执行的 job 直接回收、归还 credit。检查后、真正进入执行前发生的断连转入 <code>THD::killed</code> 协作取消，不直接销毁仍在使用的 THD。</p>
+<p><strong>fd 与结果写回边界</strong>：fd 只在 reactor 线程的 teardown 关闭；其他线程的 <code>vio_shutdown()</code> 经 pre-close 钩子转为带 token 校验的强制取消，fd 关闭前不复用，消除误 cancel/误 close 新连接的串扰【已有】。【已有】路径中，<code>do_command()</code> 内的结果写回仍由 worker 同步完成，因此本文不声称“所有网络 IO 已协程化”；将结果发送迁回 reactor 需要另行处理部分写、大包背压与写缓冲生命周期，不应计入断连早弃机制的待验证收益。</p>
 <p><strong>CommandDone 同步</strong>【已有】：双阶段协议（<code>cmd_mu</code> mutex + <code>cmd_done</code> atomic + <code>cmd_waiting</code> handle）。执行线程完成 job 后先置 <code>cmd_done</code> 再经 eventfd 通知 reactor；协程侧 <code>await_ready</code> 快路径在作业已完成时直接返回不挂起，慢路径注册 handle 挂起。该协议保证“完成信号不丢失、协程不永久悬挂”，是每命令两次线程切换的固定成本所在。</p>
 <p><strong>THD 移交</strong>【已有】：交接单元是整个 THD 对象而非执行计划——AccessPath 内嵌大量指向 THD <code>main_mem_root</code> 的指针，不可序列化。worker 接管时执行 <code>store_globals()</code> + <code>thd_set_thread_stack()</code>，释放时 <code>restore_globals()</code>。这是 MySQL 上游已有的跨线程迁移机制，本架构只是复用。</p>
 
@@ -295,9 +524,9 @@
 <p>调度问题被分解为五个语义不同的排队点，每点有明确的负责人：</p>
 <table>
 <tr><th>#</th><th>队列</th><th>实现位置</th><th>等待内容</th><th>负责机制</th></tr>
-<tr><td>Q1</td><td>网络等待</td><td>reactor 协程（<code>wait_readable</code>，无队列实体）</td><td>客户端命令到达</td><td>epoll；不占线程</td></tr>
-<tr><td>Q2</td><td>准入队列【v4】</td><td>reactor 与 executor 之间的 credit 闸门</td><td>过载时的延迟接纳</td><td>queue-time credit + 按连接公平轮询</td></tr>
-<tr><td>Q3</td><td>执行队列</td><td>executor 共享 Normal 队列 + HP 队列</td><td>已接纳命令等 worker</td><td>cascade notify；HP/VIP 保活性</td></tr>
+<tr><td>Q1</td><td>命令读等待</td><td>reactor 协程（<code>wait_readable</code>，无队列实体）</td><td>客户端命令到达或连接关闭</td><td>epoll；不占执行线程</td></tr>
+<tr><td>Q2</td><td>准入队列【v4】</td><td>reactor 与 executor 之间的 credit 闸门</td><td>过载时的延迟接纳</td><td>queue-time credit + 按连接公平轮询 + 断连早弃</td></tr>
+<tr><td>Q3</td><td>执行队列</td><td>executor 共享 Normal 队列 + HP 队列</td><td>已接纳命令等 worker</td><td>cascade notify；HP/VIP 保活性；出队存活检查【v4】</td></tr>
 <tr><td>Q4</td><td>锁/latch 等待</td><td>InnoDB 等待数组 / THD 等待图</td><td>行锁、latch</td><td>CATS（锁授予顺序）；等待边发布给 Q5</td></tr>
 <tr><td>Q5</td><td>OS 运行队列</td><td>EEVDF-Sem 的 DSQ</td><td>runnable 任务等 CPU</td><td>单池 vd 排序 + 语义微调 + 借还</td></tr>
 </table>
@@ -307,8 +536,8 @@
   <defs><marker id="ar4" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#475569"/></marker></defs>
   <g font-size="13">
     <rect x="20" y="60" width="140" height="90" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
-    <text x="90" y="92" text-anchor="middle" font-weight="bold" fill="#1e40af">Q1 网络等待</text>
-    <text x="90" y="118" text-anchor="middle" font-size="11" fill="#334155">协程挂起，不占线程</text>
+    <text x="90" y="92" text-anchor="middle" font-weight="bold" fill="#1e40af">Q1 命令读等待</text>
+    <text x="90" y="118" text-anchor="middle" font-size="11" fill="#334155">协程挂起，不占执行线程</text>
     <rect x="200" y="60" width="140" height="90" rx="10" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
     <text x="270" y="92" text-anchor="middle" font-weight="bold" fill="#065f46">Q2 准入队列</text>
     <text x="270" y="118" text-anchor="middle" font-size="11" fill="#334155">queue-time credit</text>
@@ -329,7 +558,7 @@
   <text x="720" y="216" text-anchor="middle" font-size="12" fill="#9a3412">等待边发布：Q4 → Q5 唯一需要传递的信息</text>
   <text x="330" y="40" text-anchor="middle" font-size="12" fill="#64748b">Q2/Q3 分离：限流 ≠ 保活性 ｜ Q4/Q5 打通：CATS 管谁拿锁，管不了 holder 有没有 CPU</text>
 </svg>
-<figcaption>图 4｜五个排队点：每个队列有明确的语义与负责机制。</figcaption>
+<figcaption>图 6｜五个排队点：每个队列有明确的语义与负责机制。</figcaption>
 </figure>
 
 <h3>5.5 调度怎么实现：EEVDF-Sem 的 BPF 实现</h3>
@@ -346,8 +575,8 @@
 <p><strong>性能预算</strong>：意图写入仅发生在事件路径（job 边界、锁等待、COMMIT 进出），稳态无写；对标 UFS 的 hinting 开销实测 ≤1%，本设计 v3 已测得干净负载约 5% 总开销（含 BPF 回调），v4 预算不高于该水平。</p>
 
 <h3>5.6 可观测性与降级</h3>
-<p>状态变量【已有 + v4 扩展】：<code>Coroutine_handoff_queue_depth</code>、<code>submit_to_run</code> 七桶直方图（区分 DB 排队与 OS 调度丢失）、<code>hp_jobs_submitted/executed</code>、<code>admission_deferred</code>【v4】、借还账户快照（borrowed/debt 总量）【v4】、BPF loader <code>--dump</code> 内核侧 map 快照。</p>
-<p>降级矩阵【已有原则，v4 继承】：无 sched_ext 内核时 BPF 半边整体关闭，Q1/Q2/Q3/Q4 的全部用户态机制（协程等待、准入、HP/VIP、等待图）独立有效，Q5 退化为原生 EEVDF；<code>WITH_SCX_SCHEDULER=OFF</code> 时构建期不链接任何 BPF 代码。</p>
+<p>状态变量【已有 + v4 扩展】：<code>Coroutine_handoff_queue_depth</code>、<code>submit_to_run</code> 七桶直方图（区分 DB 排队与 OS 调度丢失）、<code>hp_jobs_submitted/executed</code>、<code>admission_deferred</code>【v4】、<code>disconnect_detected</code>、<code>queued_jobs_cancelled</code>、<code>cancelled_after_start</code>【v4】、借还账户快照（borrowed/debt 总量）【v4】、BPF loader <code>--dump</code> 内核侧 map 快照。新增【v4】按组分列 <code>pool_configured_threads</code>、<code>pool_alive_threads</code>、<code>pool_busy_threads</code>、<code>pool_runnable_threads</code>、stall/callback 覆盖与创建节流计数，以及“队列非空且 CPU 空闲”时长；明确禁止以 busy 代替 runnable。</p>
+<p>降级矩阵【已有原则，v4 继承】：无 sched_ext 内核时 BPF 半边整体关闭，Q1/Q2/Q3/Q4 的全部用户态机制（协程等待、准入、断连早弃、HP/VIP、等待图）独立有效，Q5 退化为原生 EEVDF；<code>WITH_SCX_SCHEDULER=OFF</code> 时构建期不链接任何 BPF 代码。</p>
 
 <h2>6 实验评估</h2>
 <h3>6.1 研究问题</h3>
@@ -355,8 +584,10 @@
 <li><strong>RQ1（干扰韧性）</strong>：外部 CPU 干扰下，语义发布能否约束尾延迟劣化？</li>
 <li><strong>RQ2（锁活性）</strong>：等待者数超过执行线程数时，持有者 COMMIT 是否仍被调度执行？</li>
 <li><strong>RQ3（代价与公平）</strong>：干净负载的吞吐代价是多少？持续高优流下后台与普通任务是否前进？</li>
-<li><strong>RQ4（崖点与恢复，v4 目标）</strong>：准入控制能否推远崖点、保证越崖不退化并缩短恢复时间？</li>
-<li><strong>RQ5（突发吸收，v4 目标）</strong>：Agent 式阶跃与潮汐负载下，系统是否免重试放大？</li>
+<li><strong>RQ4（容量曲线与恢复，v4 目标）</strong>：准入控制能否推远膝点和崖点、在基线越崖后保持有界 goodput，并缩短负载回落后的恢复时间？</li>
+<li><strong>RQ5（突发吸收，v4 目标）</strong>：Agent 式阶跃与潮汐负载下，系统能否抑制超时重连与重试放大？无退避和指数退避加抖动时，崖点位置与恢复时间有何差异？</li>
+<li><strong>RQ6（前台边界，v4 目标）</strong>：reactor + 固定池能否以可控的交接成本降低高连接网络开销？客户端超时断连时，执行前取消能否消除无效工作并保护 goodput？</li>
+<li><strong>RQ7（线程池计数与分组，v4 目标）</strong>：<code>N_cfg/N_alive/N_busy/N_run</code> 在未上报等待、组间热点、创建节流和 OS 抢占下如何偏离？哪些信号能够解释“队列非空但 CPU 空闲”，而不是用配置值或 busy 误判执行能力？</li>
 </ul>
 
 <h3>6.2 实验设置</h3>
@@ -364,9 +595,10 @@
 
 <h3>6.3 测量方法学</h3>
 <p><strong>开放环与封闭环分工。</strong>封闭环（固定客户端线程数，完成一个再发下一个）适合可重复地比较吞吐，但存在 coordinated omission：服务变慢时客户端自动少发请求，尾部被“测没”[32][33]。因此<strong>过载、突发、尾延迟类实验一律采用开放环</strong>（按预定到达过程发送，速率不随响应变慢而降低），封闭环仅用于正向回归基线。</p>
-<p><strong>指标口径。</strong>分列 offered rate、完成率、<strong>goodput</strong>（提交且不计入 abort/重试的有效吞吐）、abort/retry 计数；延迟报告 p50/p95/p99/p999/max 与 SLO 违约率，不用均值替代尾部。每配置 ≥2 轮取中位数，max 离群必须复测确认。</p>
-<p><strong>观测分解。</strong>结果（goodput）、排队（handoff 深度、submit→run 直方图、OS run queue）、依赖（row lock waits/time、deadlocks、HP submitted/executed、map 条目）、资源（上下文切换、迁移、IPC、RSS/FD）。submit→run 混合用户态排队与 OS 调度等待，不单独归因于任何一层。</p>
-<p><strong>对照与消融。</strong>C0 = 原生 Thread Pool、C1 = one-thread-per-connection、C2 = 协程执行池无 SCX、C4 = EEVDF-Sem。逐项消融：COMMIT 奖励开/关、vd 继承开/关、借还开/关、准入开/关。噪声注入必须在数据库节点；每配置独立输出目录；远程状态采集失败不得静默归零。</p>
+<p><strong>指标口径。</strong>分列原始到达率 <code>λ_new</code>、重试率 <code>λ_retry</code>、总 offered rate <code>λ = λ_new + λ_retry</code>、服务端完成尝试率 <code>C</code>、无效完成率 <code>S</code> 与 <strong>goodput</strong> <code>G = C − S</code>（在客户端 deadline 前完成且结果被有效接收、不计入 abort/重试的吞吐）。断连、超时或重复等完成尝试均计入 S，不能把“服务器做了事”误记为客户端价值；同时报告 <code>S/C</code>、重试放大系数 <code>λ/λ_new</code>、重连/认证速率、C 的峰值位置与 G 的崖点位置，以检验二者是否分离。RT 报告 p50/p95/p99/p999/max 与 SLO 违约率，不用均值替代尾部。每配置 ≥2 轮取中位数，max 离群必须复测确认。</p>
+<p><strong>观测分解。</strong>结果（C、S、G、断连前后取消数）、排队（handoff 深度、submit→run 直方图、OS run queue）、依赖（row lock waits/time、deadlocks、HP submitted/executed、map 条目）、资源（上下文切换、迁移、IPC、RSS/FD、重连与认证开销）。submit→run 混合用户态排队与 OS 调度等待，不单独归因于任何一层。</p>
+<p><strong>客户端重试模型。</strong>开放环客户端为每个逻辑请求设置 deadline 和 request ID，超时后主动关闭连接、重建并重新发送同一请求，以便识别旧连接无效执行与跨连接重复完成。至少比较三组：（a）不重试；（b）立即重连重发，无退避；（c）指数退避加全抖动后重连重发。deadline、退避初值/上限和最大重试次数在运行前冻结；三组使用相同的原始到达过程，分别记录实际 λ_retry，不能用封闭环客户端自带的背压代替重试模型。测量时区分单次尝试超时与逻辑请求总 deadline，退避等待计入端到端 RT，不得通过每次重试重置计时器来隐藏总延迟。</p>
+<p><strong>对照与消融。</strong>C0 = 原生 Thread Pool、C1 = one-thread-per-connection、C2 = 协程执行池无 SCX、C4 = EEVDF-Sem。逐项消融：COMMIT 奖励开/关、vd 继承开/关、借还开/关、准入开/关；针对 RQ6 再比较 reactor parse 开/关、断连早弃开/关，并报告 reactor 数量与每命令交接成本。全局执行协程化没有实现，不作为未经验证的性能对照。噪声注入必须在数据库节点；每配置独立输出目录；远程状态采集失败不得静默归零。</p>
 
 <h3>6.4 正向基准（传统负载，仅作回归约束）</h3>
 <table>
@@ -387,12 +619,14 @@
 <tr><td>N4</td><td>热点 skew 扫描</td><td>uniform → zipfian θ 递增；小表/单仓 TPC-C</td><td>goodput/p99、row lock waits、deadlocks</td><td>无吞吐崩塌、无活性故障</td><td>DBx1000、CATS</td></tr>
 <tr><td>N5</td><td>执行池耗竭（C1）</td><td>长事务多语句阻塞风暴，N &gt; worker</td><td>活性、队列深度、恢复时间</td><td>HP 通道活性，无 0 TPS</td><td>本仓库 v1 限制</td></tr>
 <tr><td>N6</td><td>死锁雪崩（C3）</td><td>反向顺序更新 2–4 行 + KILL/timeout/retry</td><td>deadlocks、goodput、重试放大</td><td>victim 回滚快、无重试风暴</td><td>—</td></tr>
-<tr><td>N7</td><td>Agent 突发与潮汐</td><td>open-loop 方波（1s 内 0→4× 崖点）+ 程序性重试</td><td>准入收缩、恢复时间、重试放大系数</td><td>不崩溃、秒级恢复</td><td>Breakwater、TailBench</td></tr>
-<tr><td>N8</td><td>过载膝点（C5）</td><td>offered rate 阶梯越过崖点</td><td>崖点位置、越崖 goodput 保持率</td><td>崖点 ≥ 基线 1.2×、goodput 不降</td><td>Breakwater</td></tr>
+<tr><td>N7</td><td>Agent 突发、超时与潮汐</td><td>open-loop 方波（1s 内 0→4× 无重试基线崖点）；不重试 / 立即重连重发 / 指数退避加抖动三组；撤载后继续观察</td><td>RT、C/S/G、重连/认证速率、撤载后 λ_retry、恢复时间、恢复负载阈值与迟滞</td><td>目标不进入持续下降段、秒级恢复；若撤载后不恢复则判亚稳态而非“恢复慢”</td><td>Breakwater、TailBench、Metastability [42][44]</td></tr>
+<tr><td>N8</td><td>过载膝点与崖点（C5）</td><td>offered rate 细粒度阶梯覆盖线性区、膝点、平台区并越过基线崖点；分别叠加三组客户端重试模型</td><td>膝点/崖点位置、C 峰值与 G 崖点间距、S/C、RT、基线越崖 goodput 保持率</td><td>崖点 ≥ 基线 1.2×；基线越崖后无持续下降；解释 C 与 G 是否及为何分离</td><td>Jain [40]、Breakwater</td></tr>
 <tr><td>N9</td><td>高连接与 churn（C4）</td><td>空闲 1k/5k/20k 连接 + 高频 connect/disconnect/KILL</td><td>RSS/FD/协程计数回落、认证排队</td><td>无泄漏、正常查询 p99 稳定</td><td>—</td></tr>
 <tr><td>N10</td><td>争用 soak（C6）</td><td>30–60min 热点负载</td><td>RSS 斜率、map/图节点趋势、TPS/p99 漂移</td><td>无降解、无泄漏</td><td>—</td></tr>
 <tr><td>N11</td><td>借还公平对抗</td><td>持续 latch 争用；提权后立即睡眠；分钟级份额测量</td><td>份额偏差、D_max 到顶行为、debt 残留</td><td>偏差 &lt;1%、到顶回落公平、无逃债</td><td>cgroup burst 思想 [31]</td></tr>
 <tr><td>N12</td><td>快路径审计</td><td>idle CPU 唤醒直插 SCX_DSQ_LOCAL vs enqueue 路径对照</td><td>提权是否生效、记账完整性</td><td>两路径语义一致</td><td>仓库已知陷阱</td></tr>
+<tr><td>N13</td><td>客户端超时与断连早弃（RQ6）</td><td>open-loop 超过容量；deadline 扫描并在出队前注入 FIN/RST，另测执行开始后断连与仅超时不发 FIN 的静默放弃</td><td>出队前/后取消数、stale completion、无效 worker 时间、goodput、credit 泄漏</td><td>已取消未开始任务不消耗执行 CPU；无 THD/协议/事务清理错误；静默放弃仅在显式 deadline 下取消</td><td>MySQL ping-pong 与 §3.2</td></tr>
+<tr><td>N14</td><td>线程池计数与分组失真（RQ7）</td><td>C0/MySQL Thread Pool 对照：未插桩锁/IO 等待、单热组与多组不均、listener 兼作 worker、创建节流、OS 抢占分别注入</td><td>按组 N_cfg/N_alive/N_busy/N_run、callback/stall、队列非空且 CPU 空闲时长、每组 p99</td><td>所有“排队但 CPU 空闲”样本均可归因；busy 不被误报为 runnable；热组与创建/扩容延迟可见</td><td>MySQL/MariaDB/Percona [45][46]、CockroachDB [47]</td></tr>
 </table>
 
 <h3>6.6 初步结果【实测，v1–v3 原型】</h3>
@@ -431,7 +665,7 @@
   <rect x="640" y="62" width="16" height="12" fill="#059669"/><text x="662" y="73" font-size="12" fill="#334155">EEVDF-Sem 语义发布</text>
   <text x="450" y="318" text-anchor="middle" font-size="12" fill="#64748b">噪声期绝对 p99 相差 4–5 倍；C4 的 max（~22ms）不优于 C2（18ms），保护作用于分位数而非极端离群</text>
 </svg>
-<figcaption>图 5｜B7 外部 CPU 噪声实验【实测】：语义发布将 p99 劣化从 7.6× 约束到 1.4–1.7×。</figcaption>
+<figcaption>图 7｜B7 外部 CPU 噪声实验【实测】：语义发布将 p99 劣化从 7.6× 约束到 1.4–1.7×。</figcaption>
 </figure>
 
 <p>噪声期绝对 p99 相差 4–5 倍。诚实记录：C4 的 max（约 22 ms）并不优于 C2（18 ms）——tier 保护作用于分位数而非极端离群；该结果仅证明 CPU 噪声，不能外推至 IO/内存带宽干扰。</p>
@@ -443,52 +677,37 @@
 <h3>6.7 验收标准与覆盖状态【计划，未执行】</h3>
 <p>以下实验在实现冻结指标后执行，当前不构成结果：</p>
 <ol>
-<li><strong>Agent 突发（RQ5，核心新增场景）</strong>：open-loop 方波负载（1 秒内 0 → 4× 崖点速率阶跃），叠加程序性重试模型。度量准入收缩曲线、连接间排队公平、恢复时间（R3）与重试放大系数。</li>
-<li><strong>崖点扫描（RQ4）</strong>：offered rate 阶梯爬升越过崖点，报告崖点位置（R1）、越崖后 goodput 保持率（R2）、无 hang 验证。验收口径：崖点 ≥ EEVDF 基线的 1.2×。</li>
+<li><strong>Agent 突发与重试（RQ5，核心新增场景）</strong>：open-loop 方波负载（1 秒内 0 → 4× 无重试基线崖点速率阶跃），分别叠加不重试、立即重连重发、指数退避加全抖动三组模型。度量准入收缩曲线、RT、C/S/G、重连与认证开销、连接间排队公平及重试放大系数，区分退避对新增负载的抑制与断连早弃对存量无效功的消除。撤除流量阶跃后继续观测 λ_retry 和排队是否消散，记录恢复时间、恢复负载阈值与迟滞（R3）；若低负载下仍不恢复，则按亚稳态失效 [42][44] 单独判定，而不是计入“秒级恢复”。</li>
+<li><strong>容量曲线扫描（RQ4）</strong>：offered rate 细粒度阶梯依次覆盖线性区、膝点、平台区与基线崖点；按 §2.4 的统一算法报告各配置膝点/崖点位置、平台区宽度及基线越崖后的 goodput 保持率（R1/R2），并验证无 hang。每组同时报告 C 的峰值与 G 的崖点，并用同一平滑窗口的有限差分估计 C′、S′、G′，直接检验 <code>S′ &gt; C′ &gt; 0</code> 是否成立，而不是只凭两条曲线的形态推断客户端超时机制。验收口径：目标崖点 ≥ EEVDF 基线的 1.2×，且在基线越崖后不进入持续下降段。</li>
+<li><strong>前台边界与断连早弃（RQ6，新增）</strong>：在相同执行池与调度策略下比较 C0/C1/C2，分离网络复用、parse 前移和交接成本；执行 N13 的 FIN/RST、执行中断连与静默放弃矩阵，报告 stale completion 和节省的 worker 时间。该实验验证混合边界的收益，不以未实现的全局协程化版本充当对照。</li>
+<li><strong>线程池计数与分组失真（RQ7，新增）</strong>：执行 N14，分别注入未插桩等待、单热组、listener 角色切换、创建节流和 OS 抢占；对照配置值、存活值、请求 busy 与 OS runnable，要求所有“队列非空但 CPU 空闲”样本可归因到具体机制，验证 §2.3 的线程池边界而非只比较峰值 TPS。</li>
 <li><strong>提交早行的消融（RQ1/RQ3）</strong>：借入量与提前量联合扫描，区分收益来源；<code>innodb_flush_log_at_trx_commit=1</code> 下验证 IO 瓶颈时无负效应。</li>
 <li><strong>继承参数扫描（RQ2/RQ3）</strong>：深度上限 D 与清扫超时的敏感性；构造提权泄漏对抗场景（KILL/teardown/回滚）验证清理路径。</li>
 <li><strong>借还记账的公平回归（RQ3，新增）</strong>：分钟级长窗测量被提权任务的实际 CPU 份额偏差（目标 &lt;1%）；<code>B_max/D_max ∈ {1,2,4} slice</code> 扫描；两个对抗场景——（a）持续 latch 争用：借债达到 D_max 后必须回落普通公平，验证无无限优先、无饿死；（b）sleep 逃债：提权后立即阻塞/睡眠，验证 debt 不被 lag clamp 抹除、唤醒后仍须偿还。COMMIT 路径做借入量与提前量的联合消融。</li>
-<li><strong>负向矩阵回归</strong>：C1 执行线程耗竭、C2 热点 skew、C3 死锁雪崩、C4 连接 churn、C5 过载膝点、C6 争用 soak，全部从待办提升为验收门槛。</li>
+<li><strong>负向矩阵回归</strong>：C1 执行线程耗竭、C2 热点 skew、C3 死锁雪崩、C4 连接 churn、C5 过载膝点/崖点、C6 争用 soak，全部从待办提升为验收门槛。</li>
 <li><strong>公平下限</strong>：持续高优流下监控 purge history 长度与普通会话最大连续等待，确认保底窗口生效。</li>
 </ol>
 
-<figure>
-<svg viewBox="0 0 860 320" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">
-  <line x1="90" y1="260" x2="800" y2="260" stroke="#475569" stroke-width="1.4"/>
-  <line x1="90" y1="260" x2="90" y2="30" stroke="#475569" stroke-width="1.4"/>
-  <text x="450" y="296" text-anchor="middle" font-size="13" fill="#475569">offered rate（开放环加压）</text>
-  <text x="34" y="150" font-size="12" fill="#64748b" transform="rotate(-90 34 150)" text-anchor="middle">goodput</text>
-  <path d="M90 240 Q 300 130 460 90 Q 560 120 700 220" fill="none" stroke="#2563eb" stroke-width="2.5"/>
-  <path d="M90 240 Q 420 100 620 70 L 760 70" fill="none" stroke="#059669" stroke-width="2.5"/>
-  <line x1="460" y1="260" x2="460" y2="90" stroke="#2563eb" stroke-width="1.2" stroke-dasharray="4 4"/>
-  <line x1="620" y1="260" x2="620" y2="70" stroke="#059669" stroke-width="1.2" stroke-dasharray="4 4"/>
-  <text x="460" y="278" text-anchor="middle" font-size="12" fill="#2563eb">基线崖点</text>
-  <text x="620" y="278" text-anchor="middle" font-size="12" fill="#059669">目标崖点 ≥1.2×</text>
-  <rect x="560" y="30" width="16" height="4" fill="#2563eb"/><text x="582" y="37" font-size="12" fill="#334155">无准入：越崖后 goodput 崩塌（R2 失效）</text>
-  <rect x="560" y="50" width="16" height="4" fill="#059669"/><text x="582" y="57" font-size="12" fill="#334155">queue-time 准入：越崖后退化不崩溃</text>
-  <text x="620" y="150" font-size="12" fill="#2563eb">重试放大 → 雪崩</text>
-  <text x="660" y="60" font-size="12" fill="#059669">延迟接纳，goodput 保持</text>
-</svg>
-<figcaption>图 6｜韧性目标的曲线形态【示意，非实测】：R1 崖点后移、R2 越崖不退化；R3 恢复时间在方波实验中单独测量。</figcaption>
-</figure>
-
 <h3>6.8 执行规范</h3>
-<p>噪声必须注入数据库节点（早期误注压测节点导致实验无效）；每配置独立输出目录；≥2 轮中位数并检查 max 离群（单次 217 ms 离群经复测排除）；远程状态采集失败不得静默归零；封闭环与开放环数字不混用。</p>
+<p>噪声必须注入数据库节点（早期误注压测节点导致实验无效）；每配置独立输出目录；≥2 轮中位数并检查 max 离群（单次 217 ms 离群经复测排除）；远程状态采集失败不得静默归零；封闭环与开放环数字不混用。原始 offered rate 与包含重试后的实际到达率分列，不重试/立即重试/退避重试不得共用结果目录；RT 以客户端 request ID 测量，C/S/G 由客户端与服务端记录对齐，避免将重连后的成功、旧连接迟到响应和重复执行重复计数。</p>
 
 <h2>7 讨论</h2>
 <p><strong>为什么不做自动负载分类？</strong>IconqSched [29]、LSched [22] 证明了预测式调度的潜力，但其前提是负载可标注或可预测。本设计刻意将智能限制在结构语义内：COMMIT 与锁等待边是确定事实，无模型误差、无训练成本、无回退负担。</p>
 <p><strong>为什么不做库内业务优先级？</strong>resource group、租户权重等机制把高频变化的业务语义固化进最难变更的组件，且只能控制线程级 nice/绑核，无法覆盖锁、缓冲池、IO 与内存带宽，既不完整也不可持续。本设计将业务间资源分配整体上移中间件：泳道隔离、租户配额、限流与重试退避由最了解租户与 SLO 的一层执行；数据库只对自身效率负责——结构语义微调、全局 queue-time 准入（业务无关的自我保护）与按连接公平排队，并向中间件暴露 queue-time、goodput、准入延迟等闭环信号。需要强隔离的租户，推荐泳道级独立实例而非库内权重。</p>
 <p><strong>与 PreemptDB 的分工。</strong>PreemptDB [13] 在数据库层用用户态中断实现事务级抢占，适合需要事务内精细抢占的场景；本设计在 OS 层工作，任务阻塞即让出 CPU、可同核并发多个高优任务，且不依赖特定硬件特性。两者解决的是不同粒度的抢占问题，可组合。</p>
-<p><strong>局限。</strong>本设计不解决 IO 瓶颈、应用不发 COMMIT、NUMA 分区与 AP 内部算子级并行；sched_ext 无稳定 ABI 承诺，需锁定内核版本。reactor 支持可配置多分片（默认 1）以消除极高 QPS 下的单点。</p>
+<p><strong>局限。</strong>本设计不解决 IO 瓶颈、应用不发 COMMIT、NUMA 分区与 AP 内部算子级并行；sched_ext 无稳定 ABI 承诺，需锁定内核版本。reactor 支持可配置多分片（默认 1）以缓解极高 QPS 下的单点，但 parse 仍须有 CPU 时间预算，不能把超大或异常复杂语句的长期占用隐藏在“有界”二字之后。断连早弃只覆盖可观测的 FIN/RST/错误或显式 deadline，不能凭空发现网络黑洞；执行后断连也不保证立即终止。结果写回当前仍可能阻塞 worker，网络侧最优结论不覆盖尚未协程化的大结果集发送。</p>
 
 <h2>8 相关工作</h2>
 <p><strong>数据库调度与优先级。</strong>Carey 等 [8] 早已指出 DBMS 优先级需跨 CPU、磁盘与缓冲协同；CATS [25] 以阻塞面加权决定锁授予顺序，与本设计的 CPU 侧继承互补；R-SMF [9] 与 DRFT [10] 分别探索事务排序空间与多租户事务公平；Polaris [23]、Natto [20] 在 OCC/分布式语境下实现事务优先级。PreemptDB [13] 提供事务级用户态抢占。与上述工作不同，本文聚焦免标注的结构语义与内核 CPU 分配。</p>
-<p><strong>OS 调度与干扰治理。</strong>IX [4]、Shinjuku [17]、Caladan [11] 等量化并治理微秒级调度开销与干扰；Breakwater [6] 以排队时间驱动 credit 准入，本文将其信号机制适配到数据库执行池。cgroup CFS 带宽 burst [31] 提供储蓄型配额借还，本文针对持续 runnable 的锁持有者改造为信用型借还。EEVDF 的唤醒放置缺陷在 [5] 及内核社区多次报告中均有记载。</p>
+<p><strong>事件驱动、线程与混合服务器。</strong>Reactor [35] 给出同步事件分派的基本结构及其非抢占、不可阻塞约束；SEDA [36] 用显式队列连接事件驱动阶段和有界线程池，证明混合架构可同时获得高并发与过载退化能力。von Behren 等 [39] 则从可编程性与调度角度反驳“所有高并发服务都应事件化”。MySQL 默认连接模型和 Enterprise Thread Pool 的分析 [37][38] 进一步表明，减少连接线程数有价值，但并不替代事务并发控制。本文据此只把 reactor 放在 Q1 与执行前语义边界，把 Q2–Q5 分别交给准入、固定执行池、锁系统与 OS 调度器，而不是重述“事件优于线程”的一般性结论。</p>
+<p><strong>线程池、动态调参与准入。</strong>MySQL Enterprise Thread Pool 以分组、stall 扩容和事务队列控制短语句并发 [45]；MariaDB/Percona 暴露未感知等待、oversubscription 与锁依赖死锁问题 [46]。TiKV 采用多阶段专用池 [48]，CockroachDB 则以动态 slot、runnable/调度延迟和持锁事务提权实现准入 [47]，说明线程池正从静态尺寸走向信号驱动，但也证明仅靠池无法终结调度问题。Bahadur 等指出仅用请求率调容不足，还需考虑服务时间 [49]；Bouncer 将准入推进到响应时间目标与早期拒绝 [50]。PgBouncer 位于连接代理层并附带会话限制 [48]。与这些工作不同，本文不另造一个池尺寸算法，而是区分配置、存活、busy 与 runnable，并将锁依赖、排队时间和客户端超时语义接入固定执行池与 OS 调度器。</p>
+<p><strong>OS 调度与干扰治理。</strong>IX [4]、Shinjuku [17]、Caladan [11] 等量化并治理微秒级调度开销与干扰；Breakwater [6] 以排队时间驱动 credit 准入，本文将其信号机制适配到数据库执行池。Jain 的膝点/崖点容量模型 [40] 为本文区分“饱和后增长放缓”与“过载后持续崩塌”提供术语基础，本文进一步将其落实为数据库 goodput 的可测判据。cgroup CFS 带宽 burst [31] 提供储蓄型配额借还，本文针对持续 runnable 的锁持有者改造为信用型借还。EEVDF 的唤醒放置缺陷在 [5] 及内核社区多次报告中均有记载。</p>
+<p><strong>超时放弃、重试放大与取消。</strong>Mathur 和 Apte [41] 在 listener/worker 两阶段共享 CPU 模型中指出，超时放弃后的无效处理会使 goodput 在资源持续满 utilization 时显著下降，为本文区分 C 与 G 提供直接依据。Bronson 等 [42] 将数据库后端重试归纳为工作放大和亚稳态失效，Huang 等 [44] 进一步证明此类失效在真实事故中反复出现；本文补充 MySQL 特有的已读命令执行至结果写回才感知断连、重连认证成本，以及 <code>S′ &gt; C′ &gt; 0</code> 的提前越崖判据。Dean 和 Barroso [43] 的 hedged/tied requests 表明及时取消能约束重复工作，本文将这一原则落实到 reactor 的执行前断连早弃，但保留事务执行中的协作取消边界。退避与重试预算属于客户端/中间件反馈控制，不能替代数据库侧的准入与存量无效功消除。</p>
 <p><strong>DB–OS 协同。</strong>Practical DB-OS Co-Design [27] 采用特权内核 bypass；Tigger [7] 与 BPF-DB [26b] 用 eBPF 下沉数据库逻辑；MosaicDB [14] 以协程化事务隐藏 OS 调度延迟。UFS [5] 与本文最为接近：本文保留其意图通道与条件性提权，去除其人工 TS/BG 分层，并将基座替换为单池 EEVDF 虚拟时间模型，新增过载准入与突发韧性目标。</p>
 <p><strong>性能剖析。</strong>Looking Glass 系列 [12, 28]、DBx1000 [26]、Shore-MT [18]、微架构分析 [19] 共同构成本文开销归因的证据链：瓶颈从锁与缓冲池上移至通信、内存层次与调度协同。</p>
 
 <h2>9 结论</h2>
-<p>本文主张将数据库高并发调度的目标从峰值吞吐转向性能韧性，并给出一条无需业务标注的技术路线：以 EEVDF 公平虚拟时间为基座，用两类普适结构语义（提交早行、锁持有者条件性继承）做有界微调，以先借后还的记账保证周期级公平，配合排队时间准入控制应对 Agent 时代的突发与过载。分阶段原型的实测证据表明，语义发布在外部干扰下将尾延迟劣化从 7.6 倍降至 1.4–1.7 倍，代价约为 5% 干净吞吐。完整韧性评估（崖点、恢复时间、突发吸收）是下一步工作。</p>
+<p>本文主张将数据库高并发调度的目标从峰值吞吐转向性能韧性，并给出一条无需业务标注的技术路线：前台 reactor 将连接多路复用、断连感知与 parse 置于执行之前，固定执行池保留 MySQL 的同步语义；在此混合边界上，以 EEVDF 公平虚拟时间为基座，用两类普适结构语义（提交早行、锁持有者条件性继承）做有界微调，以先借后还的记账保证周期级公平，配合排队时间准入与失效工作早弃应对 Agent 时代的突发、过载和客户端超时。协程只用于最有收益的网络等待，不被当作锁管理或 CPU 调度的替代品。同时，<code>G = C − S</code> 模型将客户端超时导致的无效完成纳入容量分析，解释 goodput 为何可先于服务端完成率峰值越崖，并以有/无退避对照和撤载迟滞区分暂时过载与亚稳态。分阶段原型的实测证据表明，语义发布在外部干扰下将尾延迟劣化从 7.6 倍降至 1.4–1.7 倍，代价约为 5% 干净吞吐；断连早弃的收益仍属 v4 待验证设计。完整韧性评估（膝点/崖点、恢复时间、突发吸收与前台取消）是下一步工作。</p>
 
 <h2>参考文献</h2>
 <div class="refs">
@@ -521,6 +740,22 @@
 <p>[32] Kasture, Sanchez. TailBench: A Benchmark Suite and Evaluation Methodology for Latency-Critical Applications. IISWC 2016.</p>
 <p>[33] Fruth et al. Tell-Tale Tail Latencies: Pitfalls and Perils in Database Benchmarking. arXiv:2107.11607, 2021.</p>
 <p>[34] Cole et al. The Mixed Workload CH-benCHmark. DBTest 2011.</p>
+<p>[35] Schmidt, D. C. Reactor: An Object Behavioral Pattern for Demultiplexing and Dispatching Handles for Synchronous Events. Pattern Languages of Program Design, 1995. https://www.dre.vanderbilt.edu/~schmidt/PDF/reactor-siemens.pdf</p>
+<p>[36] Welsh, Culler, Brewer. SEDA: An Architecture for Well-Conditioned, Scalable Internet Services. SOSP 2001. https://www.sosp.org/2001/papers/welsh.pdf</p>
+<p>[37] MySQL. MySQL Connection Handling and Scaling. 2019. https://dev.mysql.com/blog-archive/mysql-connection-handling-and-scaling/</p>
+<p>[38] MySQL. MySQL Client/Server Protocol: Command Phase；MySQL 9.7 Reference Manual: MySQL Enterprise Thread Pool. https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_command_phase.html；https://dev.mysql.com/doc/refman/9.7/en/thread-pool.html</p>
+<p>[39] von Behren, Condit, Brewer. Why Events Are A Bad Idea (for High-Concurrency Servers). HotOS 2003. https://www.usenix.org/conference/hotos-ix/why-events-are-bad-idea-high-concurrency-servers</p>
+<p>[40] Jain, R. A Delay-Based Approach for Congestion Avoidance in Interconnected Heterogeneous Computer Networks. ACM SIGCOMM Computer Communication Review 19(5), 1989, 56–71. https://www.cse.wustl.edu/~jain/papers/ftp/delay.pdf</p>
+<p>[41] Mathur, Apte. An Overhead and Resource Contention Aware Analytical Model for Overloaded Web Servers. WOSP 2007. https://www.cse.iitb.ac.in/~varsha/allpapers/mypapers/wosp07.pdf</p>
+<p>[42] Bronson, Aghayev, Charapko, Zhu. Metastable Failures in Distributed Systems. HotOS 2021, 221–227. https://sigops.org/s/conferences/hotos/2021/papers/hotos21-s11-bronson.pdf</p>
+<p>[43] Dean, Barroso. The Tail at Scale. Communications of the ACM 56(2), 2013, 74–80. https://cacm.acm.org/research/the-tail-at-scale/</p>
+<p>[44] Huang et al. Metastable Failures in the Wild. OSDI 2022, 73–90. https://www.usenix.org/system/files/osdi22-huang-lexiang.pdf</p>
+<p>[45] MySQL. MySQL 9.7 Reference Manual: Thread Pool Operation. https://dev.mysql.com/doc/refman/9.7/en/thread-pool-operation.html</p>
+<p>[46] MariaDB. Thread Groups in the Unix Implementation of the Thread Pool；Percona. Thread Pool. https://mariadb.com/kb/en/thread-groups-in-the-unix-implementation-of-the-thread-pool/；https://docs.percona.com/percona-server/9.7/threadpool.html</p>
+<p>[47] Cockroach Labs. Admission Control in CockroachDB（2022）；Admission Control in CockroachDB: How It Protects Against Unexpected Overload（2024）. https://www.cockroachlabs.com/blog/admission-control-in-cockroachdb/；https://www.cockroachlabs.com/blog/admission-control-unexpected-overload/</p>
+<p>[48] PgBouncer. Features；PingCAP. Tune TiKV Thread Pool Performance. https://www.pgbouncer.org/features.html；https://docs.pingcap.com/tidb/stable/tune-tikv-thread-performance/</p>
+<p>[49] Bahadur et al. A Perfect Knob to Scale Thread Pool on Runtime. Computers, Materials &amp; Continua 72(1), 2022, 1483–1493. https://doi.org/10.32604/cmc.2022.024936</p>
+<p>[50] Xu, Colmenares. Bouncer: Admission Control with Response Time Objectives for Low-latency Online Data Systems. SIGMOD 2024. https://arxiv.org/abs/2312.15123</p>
 </div>
 
 </div>
