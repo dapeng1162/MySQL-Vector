@@ -59,6 +59,7 @@
 #include "sql/sql_parse.h"            // do_command
 #include "sql/sql_thd_internal_api.h" // thd_set_thread_stack
 #include "sql/sched_ext_bridge.h"     // sched_ext::init
+#include "sql/stmt_priority.h"        // stmt_priority::classify
 #include "violite.h"                  // vio_is_blocking, vio_set_blocking_flag
 
 // -------------------------------------------------------------------
@@ -415,6 +416,60 @@ static bool parse_on_reactor(const std::shared_ptr<ConnectionState> &self,
   return close_connection;
 }
 
+// -------------------------------------------------------------------
+// Statement-priority taxonomy (D5)
+// -------------------------------------------------------------------
+
+/// Whether the just-parsed statement's top-level SELECT list contains
+/// RELEASE_LOCK()/RELEASE_ALL_LOCKS(): executing it releases advisory
+/// user locks that other sessions may be blocked on in GET_LOCK().
+/// Only the top-level SELECT list is inspected; a RELEASE_LOCK() hidden
+/// in a subquery or a WHERE clause is not detected (documented limit).
+static bool parsed_select_releases_user_lock(const THD *thd) {
+  const LEX *lex = thd->lex;
+  if (lex->sql_command != SQLCOM_SELECT) return false;
+  const Query_block *qb = lex->query_block;
+  if (qb == nullptr) return false;
+  for (const Item *item : qb->fields) {
+    if (item == nullptr || item->type() != Item::FUNC_ITEM) continue;
+    const Item_func *func = down_cast<const Item_func *>(item);
+    if (strcmp(func->func_name(), "release_lock") == 0 ||
+        strcmp(func->func_name(), "release_all_locks") == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Adapt a reactor-parsed statement into the pure classifier input
+/// (sql/stmt_priority.h).  Runs on the reactor thread after
+/// parse_on_reactor() and before the job is submitted, i.e. while this
+/// coroutine has exclusive access to the THD.
+static stmt_priority::Input stmt_priority_input(
+    const THD *thd, enum enum_server_command command,
+    bool lock_conflict_victim) {
+  stmt_priority::Input in;
+  in.command = command;
+  in.parsed = true;
+  in.sql_command = thd->lex->sql_command;
+  in.holds_open_tables = thd->open_tables != nullptr;
+  in.contains_release_lock = parsed_select_releases_user_lock(thd);
+  in.lock_conflict_victim = lock_conflict_victim;
+  return in;
+}
+
+/// Whether the previous executed statement on this connection failed
+/// with a lock conflict, marking it a deadlock / lock-wait-timeout
+/// victim whose next COMMIT/ROLLBACK should be prioritized.  Runs on
+/// the reactor thread after the executor job completed (exclusive THD
+/// access via the coroutine handoff).
+static bool is_lock_conflict_victim(const THD *thd) {
+  const Diagnostics_area *da = thd->get_stmt_da();
+  return da->is_error() &&
+         (da->mysql_errno() == ER_LOCK_DEADLOCK ||
+          da->mysql_errno() == ER_LOCK_WAIT_TIMEOUT);
+}
+
 /// Clean up THD, VIO, globals, fd, and decrement the connection count.
 /// Safe to call multiple times (idempotent via connection_closed flag).
 static void teardown(std::shared_ptr<ConnectionState> self) {
@@ -539,6 +594,10 @@ coroutine::DetachedTask ConnectionState::run() {
   }
 
   // ---- Phase 2: Command loop ----
+  // Set while the previous executed statement failed with a lock conflict
+  // (deadlock victim / lock wait timeout): the next COMMIT or ROLLBACK
+  // releases locks other transactions are waiting on and is prioritized.
+  bool lock_conflict_victim = false;
   for (;;) {
     if (should_close(self)) break;
 
@@ -592,7 +651,20 @@ coroutine::DetachedTask ConnectionState::run() {
     }
 
     bool cmd_result = false;
-    const bool hp = sched_ext::is_lock_holder(self->thd);
+    // Statement-priority taxonomy (D5): rare, globally beneficial
+    // statements (KILL, post-lock-conflict COMMIT/ROLLBACK, UNLOCK
+    // TABLES, RELEASE_LOCK) use the high-priority queue in addition to
+    // the existing lock-holder path.  Requires the reactor parse, so it
+    // is a no-op when coroutine_reactor_parse is OFF.
+    stmt_priority::Reason stmt_prio = stmt_priority::Reason::None;
+    if (parsed) {
+      stmt_prio = stmt_priority::classify(
+          stmt_priority_input(self->thd, command, lock_conflict_victim));
+      if (stmt_prio != stmt_priority::Reason::None)
+        stmt_priority::note_prioritized(stmt_prio);
+    }
+    const bool hp = stmt_prio != stmt_priority::Reason::None ||
+                    sched_ext::is_lock_holder(self->thd);
     if (parsed) {
       submit_thd_job(
           self,
@@ -607,6 +679,11 @@ coroutine::DetachedTask ConnectionState::run() {
       }, hp);
     }
     co_await CommandDone(self.get());
+
+    // Sample the statement outcome for the victim heuristic.  The
+    // executor job completed, so this coroutine owns the THD again;
+    // reading the diagnostics area is race-free.
+    lock_conflict_victim = is_lock_conflict_victim(self->thd);
 
     if (hp) g_hp_jobs_executed.fetch_add(1, std::memory_order_relaxed);
     g_commands_completed.fetch_add(1, std::memory_order_relaxed);

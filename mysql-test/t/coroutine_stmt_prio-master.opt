@@ -1,0 +1,9 @@
+# Run this test with the coroutine connection handler and reactor-side
+# parsing enabled: the statement-priority taxonomy (sql/stmt_priority.h)
+# is classified on the reactor after the parse, so without
+# coroutine_reactor_parse=ON every counter delta below would be 0.
+--thread-handling=coroutine-epoll
+--coroutine-reactor-parse=ON
+--coroutine-reactor-threads=2
+--coroutine-executor-threads=8
+--skip-log-bin

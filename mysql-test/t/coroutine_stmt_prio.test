@@ -1,0 +1,121 @@
+# Statement-priority taxonomy (D5) under the coroutine connection handler.
+#
+# Verifies, via the Coroutine_stmt_prio_* status counters, that rare and
+# globally beneficial statements are submitted to the high-priority queue
+# (see sql/stmt_priority.h):
+#   - KILL QUERY                     -> Coroutine_stmt_prio_kill
+#   - COMMIT/ROLLBACK after a lock
+#     wait timeout (victim rollback) -> Coroutine_stmt_prio_victim_rollback
+#   - UNLOCK TABLES with open tables -> Coroutine_stmt_prio_unlock_tables
+#   - SELECT RELEASE_LOCK(...)       -> Coroutine_stmt_prio_release_lock
+# and the deliberate non-prioritization of ROLLBACK TO SAVEPOINT and of
+# ordinary statements.
+#
+# Counter deltas are computed from snapshots taken inside this test, so the
+# result does not depend on statements that ran earlier.
+
+# mysqld logs this at startup when it detects it is running inside a
+# container with --container_aware=OFF (the default).  Not related to this
+# test's coverage; suppressed so the error-log check does not fail on it.
+call mtr.add_suppression("Server ignores the discovered container restrictions");
+
+CREATE TABLE t1 (id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1, 0), (2, 0);
+
+--echo # 1. KILL QUERY is prioritized
+connect (con_a, localhost, root,,);
+connect (con_killer, localhost, root,,);
+connection con_a;
+let $con_a_id = `SELECT CONNECTION_ID()`;
+--send SELECT SLEEP(20)
+connection con_killer;
+let $wait_condition = SELECT COUNT(*) = 1 FROM information_schema.processlist WHERE ID = $con_a_id AND INFO LIKE 'SELECT SLEEP%';
+--source include/wait_condition.inc
+let $kill_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_kill'`;
+eval KILL QUERY $con_a_id;
+let $kill_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_kill'`;
+eval SELECT $kill_after - $kill_before AS kill_delta;
+connection con_a;
+# SLEEP() returns 1 when interrupted, it does not raise ER_QUERY_INTERRUPTED.
+--reap
+
+--echo # 2. ROLLBACK after a lock wait timeout is prioritized (victim rollback)
+# The victim flag only applies to the statement that immediately follows the
+# failed one, so no query may run on con_killer between the failing UPDATE
+# and the ROLLBACK; the counter snapshots are taken from the default
+# connection instead.
+connection con_killer;
+SET SESSION innodb_lock_wait_timeout = 1;
+connection con_a;
+SET SESSION innodb_lock_wait_timeout = 1;
+BEGIN;
+UPDATE t1 SET v = v + 1 WHERE id = 1;
+connection default;
+let $victim_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_victim_rollback'`;
+connection con_killer;
+BEGIN;
+--error ER_LOCK_WAIT_TIMEOUT
+UPDATE t1 SET v = v + 1 WHERE id = 1;
+ROLLBACK;
+connection default;
+let $victim_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_victim_rollback'`;
+eval SELECT $victim_after - $victim_before AS victim_rollback_delta;
+connection con_a;
+ROLLBACK;
+
+--echo # 3. ROLLBACK TO SAVEPOINT is NOT prioritized
+connection con_killer;
+BEGIN;
+SAVEPOINT sp1;
+connection con_a;
+BEGIN;
+UPDATE t1 SET v = v + 1 WHERE id = 2;
+connection default;
+let $savepoint_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_victim_rollback'`;
+connection con_killer;
+--error ER_LOCK_WAIT_TIMEOUT
+UPDATE t1 SET v = v + 1 WHERE id = 2;
+ROLLBACK TO SAVEPOINT sp1;
+connection default;
+let $savepoint_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_victim_rollback'`;
+eval SELECT $savepoint_after - $savepoint_before AS savepoint_delta;
+connection con_killer;
+ROLLBACK;
+connection con_a;
+ROLLBACK;
+
+--echo # 4. UNLOCK TABLES while holding open tables is prioritized
+connection con_killer;
+let $unlock_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_unlock_tables'`;
+LOCK TABLES t1 READ;
+UNLOCK TABLES;
+let $unlock_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_unlock_tables'`;
+eval SELECT $unlock_after - $unlock_before AS unlock_delta;
+
+--echo # 5. SELECT RELEASE_LOCK() is prioritized
+let $release_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_release_lock'`;
+SELECT GET_LOCK('stmt_prio_test', 0) AS got;
+SELECT RELEASE_LOCK('stmt_prio_test') AS released;
+let $release_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_release_lock'`;
+eval SELECT $release_after - $release_before AS release_delta;
+
+--echo # 6. Ordinary statements touch no taxonomy counter
+connection default;
+let $c1 = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_kill'`;
+let $c2 = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_victim_rollback'`;
+let $c3 = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_unlock_tables'`;
+let $c4 = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_release_lock'`;
+SELECT 42 AS ordinary;
+UPDATE t1 SET v = v + 1 WHERE id = 1;
+let $d1 = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_kill'`;
+let $d2 = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_victim_rollback'`;
+let $d3 = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_unlock_tables'`;
+let $d4 = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_stmt_prio_release_lock'`;
+eval SELECT $d1 - $c1 + $d2 - $c2 + $d3 - $c3 + $d4 - $c4 AS total_delta;
+
+disconnect con_a;
+disconnect con_killer;
+
+--echo # 7. Server is still healthy afterwards
+SELECT COUNT(*) AS rows_left FROM t1;
+DROP TABLE t1;

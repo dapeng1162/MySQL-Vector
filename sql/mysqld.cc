@@ -898,6 +898,7 @@ MySQL clients support the protocol:
 #include "sql/ssl_acceptor_context_operator.h"
 #include "sql/ssl_acceptor_context_status.h"
 #include "sql/ssl_init_callback.h"
+#include "sql/stmt_priority.h"  // stmt_priority::counter
 #include "sql/sys_vars.h"         // fixup_enforce_gtid_consistency_...
 #include "sql/sys_vars_shared.h"  // intern_find_sys_var
 #include "sql/table_cache.h"      // table_cache_manager
@@ -11405,6 +11406,41 @@ static int show_coroutine_hp_jobs_submitted(THD *, SHOW_VAR *var,
   return 0;
 }
 
+static int show_coroutine_stmt_prio_kill(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      stmt_priority::counter(stmt_priority::Reason::Kill));
+  return 0;
+}
+
+static int show_coroutine_stmt_prio_victim_rollback(THD *, SHOW_VAR *var,
+                                                    char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      stmt_priority::counter(stmt_priority::Reason::VictimRollback));
+  return 0;
+}
+
+static int show_coroutine_stmt_prio_unlock_tables(THD *, SHOW_VAR *var,
+                                                  char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      stmt_priority::counter(stmt_priority::Reason::UnlockTables));
+  return 0;
+}
+
+static int show_coroutine_stmt_prio_release_lock(THD *, SHOW_VAR *var,
+                                                 char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      stmt_priority::counter(stmt_priority::Reason::ReleaseLock));
+  return 0;
+}
+
 static int show_coroutine_admission_deferred(THD *, SHOW_VAR *var,
                                               char *buff) {
   var->type = SHOW_LONG;
@@ -11965,6 +12001,17 @@ SHOW_VAR status_vars[] = {
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Coroutine_reactor_parsed", (char *)&show_coroutine_reactor_parsed,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Coroutine_stmt_prio_kill", (char *)&show_coroutine_stmt_prio_kill,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Coroutine_stmt_prio_release_lock",
+     (char *)&show_coroutine_stmt_prio_release_lock, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_stmt_prio_unlock_tables",
+     (char *)&show_coroutine_stmt_prio_unlock_tables, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_stmt_prio_victim_rollback",
+     (char *)&show_coroutine_stmt_prio_victim_rollback, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
     {"Coroutine_submit_to_run_avg_us",
      (char *)&show_coroutine_submit_to_run_avg_us, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},

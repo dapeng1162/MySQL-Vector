@@ -28,7 +28,8 @@ ENDIF()
 SET(TESTS
   task
   netpoller
-  executor)
+  executor
+  stmt_priority)
 
 FOREACH(test ${TESTS})
   MYSQL_ADD_EXECUTABLE(${test}-t ${test}-t.cc ADD_TEST ${test})

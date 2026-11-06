@@ -1,0 +1,66 @@
+call mtr.add_suppression("Server ignores the discovered container restrictions");
+CREATE TABLE t1 (id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1, 0), (2, 0);
+# 1. KILL QUERY is prioritized
+SELECT SLEEP(20);
+KILL QUERY 11;
+SELECT 1 - 0 AS kill_delta;
+kill_delta
+1
+SLEEP(20)
+1
+# 2. ROLLBACK after a lock wait timeout is prioritized (victim rollback)
+SET SESSION innodb_lock_wait_timeout = 1;
+SET SESSION innodb_lock_wait_timeout = 1;
+BEGIN;
+UPDATE t1 SET v = v + 1 WHERE id = 1;
+BEGIN;
+UPDATE t1 SET v = v + 1 WHERE id = 1;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+ROLLBACK;
+SELECT 1 - 0 AS victim_rollback_delta;
+victim_rollback_delta
+1
+ROLLBACK;
+# 3. ROLLBACK TO SAVEPOINT is NOT prioritized
+BEGIN;
+SAVEPOINT sp1;
+BEGIN;
+UPDATE t1 SET v = v + 1 WHERE id = 2;
+UPDATE t1 SET v = v + 1 WHERE id = 2;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+ROLLBACK TO SAVEPOINT sp1;
+SELECT 1 - 1 AS savepoint_delta;
+savepoint_delta
+0
+ROLLBACK;
+ROLLBACK;
+# 4. UNLOCK TABLES while holding open tables is prioritized
+LOCK TABLES t1 READ;
+UNLOCK TABLES;
+SELECT 1 - 0 AS unlock_delta;
+unlock_delta
+1
+# 5. SELECT RELEASE_LOCK() is prioritized
+SELECT GET_LOCK('stmt_prio_test', 0) AS got;
+got
+1
+SELECT RELEASE_LOCK('stmt_prio_test') AS released;
+released
+1
+SELECT 1 - 0 AS release_delta;
+release_delta
+1
+# 6. Ordinary statements touch no taxonomy counter
+SELECT 42 AS ordinary;
+ordinary
+42
+UPDATE t1 SET v = v + 1 WHERE id = 1;
+SELECT 1 - 1 + 1 - 1 + 1 - 1 + 1 - 1 AS total_delta;
+total_delta
+0
+# 7. Server is still healthy afterwards
+SELECT COUNT(*) AS rows_left FROM t1;
+rows_left
+2
+DROP TABLE t1;

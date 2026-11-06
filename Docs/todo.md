@@ -112,20 +112,23 @@ build/runtime_output_directory/mysqld --no-defaults \
 
 ## 4. 剩余工作（建议顺序）
 
-### P0：收尾验证
+### P0：收尾验证（已完成）
 
-- 完整编译并运行上述 D3 场景；特别检查 PSI statement/digest 从 reactor 到 worker 的跨线程生命周期。
-- 跑 `task-t`、`netpoller-t`、`executor-t`；若修改 executor 行为，补充并运行已有 gunit。
-- 不应只做 import/编译验证，要用真实 mysql 客户端执行事务与多语句。
+- 完整编译通过；真实 mysql 客户端事务、多语句、`mysqladmin ping` 回退、`SHOW GLOBAL STATUS LIKE 'Coroutine%'` 均验证通过。
+- gunit：`task-t`、`netpoller-t`、`executor-t` 全部通过。
 
-### P1：D5 优先语句谱系
+### P1：D5 优先语句谱系（已实现、已验证）
 
-尚未实现。
-
-- 已有：COMMIT/ROLLBACK（含 XA 路径）由事务提交钩子和 lock-holder 路径覆盖。
-- 待做：KILL QUERY/CONNECTION 优先、死锁/超时 victim 回滚提权、UNLOCK TABLES/RELEASE_LOCK 的条件提权。
-- 不要提权 `ROLLBACK TO SAVEPOINT`：它不一定释放全部行锁。
-- D3 后可在 reactor 根据 `thd->lex->sql_command` 和 THD 事务状态做更准确的用户态排队决策；内核侧仍需有界公平约束。
+- 分类器：`sql/stmt_priority.h`（header-only 纯函数，`stmt_priority::classify()`，Reason ∈ {Kill, VictimRollback, UnlockTables, ReleaseLock}），只依赖 `my_command.h`/`my_sqlcommand.h`，无 THD 依赖。
+- 接入：`sql/conn_handler/coroutine_connection_handler.cc` —— reactor parse 后调用分类器；命中则走 HP 队列（VIP worker 优先消费），并有原子计数器。
+  - KILL QUERY/CONNECTION 提权；死锁/超时 victim 的下一条 COMMIT/ROLLBACK/XA 提权（victim 语义 = 仅下一条语句，任何中间成功语句清除标志）；UNLOCK TABLES（需 `thd->open_tables != nullptr`）提权；SELECT list 顶层含 RELEASE_LOCK/RELEASE_ALL_LOCKS 时提权（子查询/WHERE 中不检测，已文档化）。
+  - 明确不提权 `ROLLBACK TO SAVEPOINT`（不一定释放全部行锁），有负例测试。
+- 可观测：`SHOW GLOBAL STATUS` 新增 `Coroutine_stmt_prio_kill/_victim_rollback/_unlock_tables/_release_lock`。
+- 测试（全部通过）：
+  - gunit：`unittest/gunit/coroutine/stmt_priority-t.cc`（9 个用例）。
+  - MTR：`mysql-test/t/coroutine_stmt_prio.test`（`main.coroutine_stmt_prio`，含 `--record` 录制与不带 `--record` 重放均通过）。
+- 性能测试（脚本已写好、未实测，留待专门环境）：`scripts/bench/sched/run_b8_stmt_prio.sh`（victim 风暴 + KILL 风暴 + sysbench 护栏三阶段），见 `scripts/bench/sched/TESTPLAN.md` 的 B8 行。
+- 已定论、勿重开：用户态 HP 队列是严格优先级，只有“稀有且全局有益”的语句可用；COMMIT 泛化提权会破坏有界公平，不做。
 
 ### P1：BPF 编译与加载验证
 
@@ -148,4 +151,7 @@ build/runtime_output_directory/mysqld --no-defaults \
 - 完整大 SQL 也可能让 reactor parse 较久；后续可评估报文/SQL 长度上限和 parse 时间预算，不要静默取消现有回退。
 - rw-lock latch 等待边未覆盖；业务 priority/resource-group 硬映射已移除是有意设计，不要恢复成永久分层。
 - `Docs/preemptdb-sigmod2025.pdf` 和 `/root/src/preemptdb` 是参考资料；PreemptDB zip 克隆没有 git 历史。
+- MTR 测试的选项文件必须命名为 `mysql-test/t/<test>-master.opt`（此版本不读裸 `.opt`）；从仓库根目录用 `./build/mysql-test/mtr [ --record ] <test>` 运行。
+- 本机容器环境下 MY-015655（"Server ignores the discovered container restrictions"）警告会使所有 MTR 测试失败（含 `main.1st`），是环境级问题；测试内用 `call mtr.add_suppression(...)` 处理。
+- mysqltest 变量只在 `eval` 命令中插值，含变量的 SELECT 必须写成 `eval SELECT ...`；mysql CLI `--force -e` 在报错后会发 COM_QUIT，驱动错误风暴场景应改用 mysqltest。
 - 云 benchmark 遵守根目录 `AGENTS.md`：结果先拉回并校验，实例测试后立即释放；Spot 实例构建产物及时备份。
