@@ -130,6 +130,21 @@ build/runtime_output_directory/mysqld --no-defaults \
 - 性能测试（脚本已写好、未实测，留待专门环境）：`scripts/bench/sched/run_b8_stmt_prio.sh`（victim 风暴 + KILL 风暴 + sysbench 护栏三阶段），见 `scripts/bench/sched/TESTPLAN.md` 的 B8 行。
 - 已定论、勿重开：用户态 HP 队列是严格优先级，只有“稀有且全局有益”的语句可用；COMMIT 泛化提权会破坏有界公平，不做。
 
+### P1：D6 rw-lock latch 等待边插桩（已实现、已验证）
+
+- Bridge 重构（`sql/sched_ext_bridge.h/.cc`）：latch 等待边从“仅 SCX 构建可用”移到**始终编译**的用户态半区——`latch_wait_begin(owner, Latch_kind)` 维护 `std::thread::id` 键控的 waiter→holder 镜像 + 每族（Mutex/RwLock）waits/edges 计数器；`HAVE_SCX_SCHEDULER` 构建下再由 `scx_publish_latch_edge/scx_clear_latch_edge` 写 tid 键控 BPF map（语义与原实现一致）。`ib0mutex.h` 调用点同步改为带 `Latch_kind::Mutex`。
+- 插桩点（`storage/innobase/sync/sync0rw.cc`，全部 4 个 `sync_array_wait_event` 等待路径）：
+  - S 等待（`rw_lock_s_lock_spin`）、X 等待（`rw_lock_x_lock_func`）、SX 等待（`rw_lock_sx_lock_func`）：holder = `recursive` 标志保护下的 `writer_thread`（pass≠0 的异步 IO 传递锁无法可靠解析，不发布边，只计数）。
+  - wait-ex（`rw_lock_x_lock_wait_func`，等 reader 排空）：`lock_word == threshold-1` 即恰好一个 reader 时，用 `reader_thread.recover_if_single()` 解析该 reader；多 reader 无单点 holder，不发布边。
+  - 已知竞态（已文档化）：holder 读取天然 TOCTOU，边只活到 `latch_wait_end()`，误解析的 id 通常不在注册表中被安全跳过。
+- 可观测：`SHOW GLOBAL STATUS` 新增 `Coroutine_latch_wait_mutex/_mutex_edge/_rw/_rw_edge`（任何线程模式可用，值掩码录制）。
+- 测试（全部通过）：
+  - gunit：`unittest/gunit/innodb/sync0rw-t.cc` 新增 `rw_lock_latch_wait_edges`——5 把锁覆盖 X 阻塞 X / 单 reader wait-ex / 双 reader 无边 / X 阻塞 S / X 阻塞 SX，验证镜像边、计数增量、解锁后镜像清空。注意 `sync_check_init(N)` 的 N 要 ≥ 并发等待者数（默认 4 槽，5 个等待者会触发 sync0arr 断言）。
+  - MTR：`mysql-test/t/coroutine_latch_status.test`（`main.coroutine_latch_status`，验证 4 个状态变量管道；录制与重放均通过）。
+  - 回归：`task-t/netpoller-t/executor-t/stmt_priority-t`（5+6+10+9）与 `main.coroutine_stmt_prio` 均通过。
+- 性能测试（脚本已写好、未实测）：`scripts/bench/sched/run_b9_latch_edges.sh`（uniform vs 单表热点 + 插桩开销护栏 + PFS rwlock 一致性对照），见 TESTPLAN B9 行。
+- 未验证：`WITH_SCX_SCHEDULER=ON` 构建下 `scx_publish_latch_edge` 路径的编译与运行（本机无 libbpf/BTF 环境，归入下方 BPF 任务）。
+
 ### P1：BPF 编译与加载验证
 
 - 本机无 `/sys/kernel/btf`；`/root/src/kernel` defconfig 生成的 `vmlinux.h` 为空。
@@ -149,7 +164,7 @@ build/runtime_output_directory/mysqld --no-defaults \
 - D3 让 slow-query 起点和 `thread_running` 覆盖 reactor→worker 排队时间，这是有意的语义变化，需在测试中确认。
 - 当前 runtime 初始化早于 daemonize fork，不能用 `--daemonize` 运行 coroutine 模式；后续若需要支持，应将 runtime 启动移到 fork 之后，而不是只隐藏问题。
 - 完整大 SQL 也可能让 reactor parse 较久；后续可评估报文/SQL 长度上限和 parse 时间预算，不要静默取消现有回退。
-- rw-lock latch 等待边未覆盖；业务 priority/resource-group 硬映射已移除是有意设计，不要恢复成永久分层。
+- rw-lock latch 等待边已由 D6 覆盖（见上）；pass≠0 传递锁与多 reader wait-ex 不发布边是能力边界而非缺陷；业务 priority/resource-group 硬映射已移除是有意设计，不要恢复成永久分层。
 - `Docs/preemptdb-sigmod2025.pdf` 和 `/root/src/preemptdb` 是参考资料；PreemptDB zip 克隆没有 git 历史。
 - MTR 测试的选项文件必须命名为 `mysql-test/t/<test>-master.opt`（此版本不读裸 `.opt`）；从仓库根目录用 `./build/mysql-test/mtr [ --record ] <test>` 运行。
 - 本机容器环境下 MY-015655（"Server ignores the discovered container restrictions"）警告会使所有 MTR 测试失败（含 `main.1st`），是环境级问题；测试内用 `call mtr.add_suppression(...)` 处理。

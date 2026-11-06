@@ -33,6 +33,7 @@
 #include <thread>
 
 #include "os0thread.h"
+#include "sql/sched_ext_bridge.h"
 #include "sync0arr_impl.h"
 
 namespace innodb_sync0rw_unittest {
@@ -234,6 +235,164 @@ TEST(sync0rw, rw_lock_reader_thread) {
           phase_task{2, [&] { rw_lock_x_unlock(rw_locks[0]); }},
           phase_task{3, [&] { rw_lock_x_unlock(rw_locks[1]); }},
           phase_task{4, [&] { rw_lock_x_unlock(rw_locks[2]); }},
+      }};
+
+  execute_multithreaded_phase_plan(phases, UT_ARR_SIZE(phases));
+
+  for (auto &rw_lock : rw_locks) {
+    rw_lock_free(rw_lock);
+    free(rw_lock);
+  }
+
+  sync_check_close();
+  os_event_global_destroy();
+}
+
+/* Tests the DB-aware scheduler latch wait-edge instrumentation of the
+rw-lock sync-array wait paths (sync0rw.cc).  Five locks, each driving a
+different wait shape:
+
+- lock A: X-locked by t1; t2's X-lock waits  -> edge t2 -> t1 (writer)
+- lock B: single S-reader t3; t4's X-lock is the wait_ex thread waiting
+  for readers to drain                                -> edge t4 -> t3
+- lock C: two S-readers t5, t6; t7's X-lock waits for both -> no edge
+  (multiple readers: no single holder to resolve)
+- lock D: X-locked by t8; t9's S-lock waits             -> edge t9 -> t8
+- lock E: X-locked by t10; t11's SX-lock waits         -> edge t11 -> t10
+
+While the waiters are parked on their events, the userspace mirror in
+the sched_ext bridge must show exactly these edges (it is always
+compiled, no sched_ext scheduler required), the per-family counters
+must have advanced, and after the holders release, the mirror must be
+empty again (wait ends are paired with waits). */
+TEST(sync0rw, rw_lock_latch_wait_edges) {
+  os_event_global_init();
+  /* Enough sync-array slots for the five concurrent waiters below (the
+  existing test above uses 4 slots for three waiters). */
+  sync_check_init(16);
+
+  rw_lock_t *rw_locks[5];
+  for (auto &rw_lock : rw_locks) {
+    rw_lock = static_cast<rw_lock_t *>(malloc(sizeof(rw_lock_t)));
+    rw_lock_create(PSI_NOT_INSTRUMENTED, rw_lock, LATCH_ID_BUF_BLOCK_LOCK);
+  }
+  rw_lock_t *const lock_a = rw_locks[0];
+  rw_lock_t *const lock_b = rw_locks[1];
+  rw_lock_t *const lock_c = rw_locks[2];
+  rw_lock_t *const lock_d = rw_locks[3];
+  rw_lock_t *const lock_e = rw_locks[4];
+
+  std::atomic<std::thread::id> thread_id[12];
+  for (auto &id : thread_id) {
+    id = std::thread::id{};
+  }
+
+  uint64_t waits_before = 0;
+  uint64_t edges_before = 0;
+
+  auto record_id = [&](size_t i) {
+    thread_id[i] = std::this_thread::get_id();
+  };
+
+  auto check_edges_action = [&] {
+    /* Let all waiters park on their events. */
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    EXPECT_EQ(sched_ext::latch_wait_holder(thread_id[2].load()),
+              thread_id[1].load());
+    EXPECT_EQ(sched_ext::latch_wait_holder(thread_id[4].load()),
+              thread_id[3].load());
+    EXPECT_EQ(sched_ext::latch_wait_holder(thread_id[7].load()),
+              std::thread::id{});
+    EXPECT_EQ(sched_ext::latch_wait_holder(thread_id[9].load()),
+              thread_id[8].load());
+    EXPECT_EQ(sched_ext::latch_wait_holder(thread_id[11].load()),
+              thread_id[10].load());
+
+    /* Every blocked request must have reached an OS wait; all but the
+    two-reader one must have produced an edge. */
+    EXPECT_GE(sched_ext::latch_wait_count(sched_ext::Latch_kind::RwLock) -
+                  waits_before,
+              5);
+    EXPECT_GE(sched_ext::latch_wait_edge_count(sched_ext::Latch_kind::RwLock) -
+                  edges_before,
+              4);
+  };
+
+  auto check_mirror_empty_action = [&] {
+    /* Waiters are woken and return through latch_wait_end(). */
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    for (size_t i : {2, 4, 7, 9, 11}) {
+      EXPECT_EQ(sched_ext::latch_wait_holder(thread_id[i].load()),
+                std::thread::id{});
+    }
+  };
+
+  std::vector<phase_task> phases[] = {
+      /* Record thread ids; holders take their latches; baseline counters. */
+      {
+          phase_task{1, [&] { record_id(1); }},
+          phase_task{1, [&] { rw_lock_x_lock(lock_a, UT_LOCATION_HERE); }},
+          phase_task{2, [&] { record_id(2); }},
+          phase_task{3, [&] { record_id(3); }},
+          phase_task{3, [&] { rw_lock_s_lock(lock_b, UT_LOCATION_HERE); }},
+          phase_task{4, [&] { record_id(4); }},
+          phase_task{5, [&] { record_id(5); }},
+          phase_task{5, [&] { rw_lock_s_lock(lock_c, UT_LOCATION_HERE); }},
+          phase_task{6, [&] { record_id(6); }},
+          phase_task{6, [&] { rw_lock_s_lock(lock_c, UT_LOCATION_HERE); }},
+          phase_task{7, [&] { record_id(7); }},
+          phase_task{8, [&] { record_id(8); }},
+          phase_task{8, [&] { rw_lock_x_lock(lock_d, UT_LOCATION_HERE); }},
+          phase_task{9, [&] { record_id(9); }},
+          phase_task{10, [&] { record_id(10); }},
+          phase_task{10, [&] { rw_lock_x_lock(lock_e, UT_LOCATION_HERE); }},
+          phase_task{11, [&] { record_id(11); }},
+          phase_task{
+              0,
+              [&] {
+                waits_before = sched_ext::latch_wait_count(
+                    sched_ext::Latch_kind::RwLock);
+                edges_before = sched_ext::latch_wait_edge_count(
+                    sched_ext::Latch_kind::RwLock);
+              }},
+      },
+      /* All waiters block (non-blocking tasks: phases advance while
+      the lock calls are still parked in their sync-array waits). */
+      {
+          phase_task{2, [&] { rw_lock_x_lock(lock_a, UT_LOCATION_HERE); },
+                     false},
+          phase_task{4, [&] { rw_lock_x_lock(lock_b, UT_LOCATION_HERE); },
+                     false},
+          phase_task{7, [&] { rw_lock_x_lock(lock_c, UT_LOCATION_HERE); },
+                     false},
+          phase_task{9, [&] { rw_lock_s_lock(lock_d, UT_LOCATION_HERE); },
+                     false},
+          phase_task{11, [&] { rw_lock_sx_lock(lock_e, UT_LOCATION_HERE); },
+                     false},
+      },
+      /* Check the mirror while every waiter is parked. */
+      {
+          phase_task{0, check_edges_action},
+      },
+      /* Release the holders; waiters acquire and release in turn. */
+      {
+          phase_task{1, [&] { rw_lock_x_unlock(lock_a); }},
+          phase_task{2, [&] { rw_lock_x_unlock(lock_a); }},
+          phase_task{3, [&] { rw_lock_s_unlock(lock_b); }},
+          phase_task{4, [&] { rw_lock_x_unlock(lock_b); }},
+          phase_task{5, [&] { rw_lock_s_unlock(lock_c); }},
+          phase_task{6, [&] { rw_lock_s_unlock(lock_c); }},
+          phase_task{7, [&] { rw_lock_x_unlock(lock_c); }},
+          phase_task{8, [&] { rw_lock_x_unlock(lock_d); }},
+          phase_task{9, [&] { rw_lock_s_unlock(lock_d); }},
+          phase_task{10, [&] { rw_lock_x_unlock(lock_e); }},
+          phase_task{11, [&] { rw_lock_sx_unlock(lock_e); }},
+      },
+      /* The mirror must be empty again. */
+      {
+          phase_task{0, check_mirror_empty_action},
       }};
 
   execute_multithreaded_phase_plan(phases, UT_ARR_SIZE(phases));

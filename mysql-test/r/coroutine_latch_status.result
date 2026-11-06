@@ -1,0 +1,19 @@
+call mtr.add_suppression("Server ignores the discovered container restrictions");
+SHOW GLOBAL STATUS LIKE 'Coroutine_latch_wait%';
+Variable_name	Value
+Coroutine_latch_wait_mutex	#
+Coroutine_latch_wait_mutex_edge	#
+Coroutine_latch_wait_rw	#
+Coroutine_latch_wait_rw_edge	#
+CREATE TABLE t1 (a INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1), (2), (3);
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+3
+DROP TABLE t1;
+SHOW GLOBAL STATUS LIKE 'Coroutine_latch_wait%';
+Variable_name	Value
+Coroutine_latch_wait_mutex	#
+Coroutine_latch_wait_mutex_edge	#
+Coroutine_latch_wait_rw	#
+Coroutine_latch_wait_rw_edge	#

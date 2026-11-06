@@ -31,14 +31,18 @@
 
   The file has two halves with different compile-time visibility:
 
-  * The THD-level lock-wait graph is ALWAYS compiled (pure userspace
-    state, no libbpf).  In the coroutine architecture the OS thread that
-    will execute a lock holder's next statement is not knowable at
-    lock-wait time — explicit transactions hold locks *between* statements
-    while the THD is parked on the reactor with real_id == 0.  So we track
-    the wait graph keyed by THD pointers: s_waiter_to_holder and
-    s_holder_wait_count.  These drive the userspace high-priority queue
-    (is_lock_holder) and the execution-time tid publication below.
+  * The THD-level lock-wait graph and the latch wait-edge mirror are
+    ALWAYS compiled (pure userspace state, no libbpf).  In the coroutine
+    architecture the OS thread that will execute a lock holder's next
+    statement is not knowable at lock-wait time — explicit transactions
+    hold locks *between* statements while the THD is parked on the
+    reactor with real_id == 0.  So we track the wait graph keyed by THD
+    pointers: s_waiter_to_holder and s_holder_wait_count.  These drive
+    the userspace high-priority queue (is_lock_holder) and the
+    execution-time tid publication below.  The latch mirror
+    (s_latch_waiter_to_holder, keyed by std::thread::id) plus the
+    Coroutine_latch_* counters serve the same purpose for InnoDB
+    internal latches (mutex and rw-lock OS waits).
 
   * The BPF map publication half is compiled only when
     HAVE_SCX_SCHEDULER is defined (WITH_SCX_SCHEDULER=ON in CMake).  When
@@ -62,6 +66,7 @@
 
 #include "sql/sched_ext_bridge.h"
 
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 
@@ -97,7 +102,25 @@ static uint32_t holder_wait_count(THD *holder) {
 /* Defined in the BPF half below. */
 void scx_publish_wait_edge(THD *waiter, THD *holder);
 void scx_clear_wait_edge(THD *waiter, THD *holder);
+void scx_publish_latch_edge(std::thread::id owner);
+void scx_clear_latch_edge();
 #endif
+
+// -----------------------------------------------------------------------
+// Latch-level wait mirror (always compiled).
+//
+// s_latch_waiter_to_holder[waiter] = holder   (set on begin, removed on end)
+//
+// Same leaf-mutex discipline as the THD wait graph above.  Keyed by
+// std::thread::id — the raw id the instrumentation sites read from the
+// latch — so no tid registry is needed for this userspace half.
+// -----------------------------------------------------------------------
+static std::mutex s_latch_mu;
+static std::unordered_map<std::thread::id, std::thread::id>
+    s_latch_waiter_to_holder;
+
+static std::atomic<uint64_t> s_latch_waits[2] = {};
+static std::atomic<uint64_t> s_latch_edges[2] = {};
 
 }  // anonymous namespace
 
@@ -188,6 +211,54 @@ void forget_thd(THD *thd) {
   // they will fail to resolve at end/forget time and be cleaned then.  Drop
   // our own count entry.
   s_holder_wait_count.erase(thd);
+}
+
+// -----------------------------------------------------------------------
+// Latch wait-edge API (always compiled).
+// -----------------------------------------------------------------------
+
+bool latch_wait_begin(std::thread::id owner, Latch_kind kind) {
+  const int k = static_cast<int>(kind);
+  s_latch_waits[k].fetch_add(1, std::memory_order_relaxed);
+  if (owner == std::thread::id{}) return false;
+
+  {
+    std::lock_guard<std::mutex> lock(s_latch_mu);
+    s_latch_waiter_to_holder[std::this_thread::get_id()] = owner;
+  }
+  s_latch_edges[k].fetch_add(1, std::memory_order_relaxed);
+
+#ifdef HAVE_SCX_SCHEDULER
+  /* Publish the tid-keyed BPF maps (no-op unless connected).  Scoped:
+     scx_publish_latch_edge() must not take s_latch_mu. */
+  scx_publish_latch_edge(owner);
+#endif
+  return true;
+}
+
+void latch_wait_end() {
+  {
+    std::lock_guard<std::mutex> lock(s_latch_mu);
+    s_latch_waiter_to_holder.erase(std::this_thread::get_id());
+  }
+
+#ifdef HAVE_SCX_SCHEDULER
+  scx_clear_latch_edge();
+#endif
+}
+
+uint64_t latch_wait_count(Latch_kind kind) {
+  return s_latch_waits[static_cast<int>(kind)].load(std::memory_order_relaxed);
+}
+
+uint64_t latch_wait_edge_count(Latch_kind kind) {
+  return s_latch_edges[static_cast<int>(kind)].load(std::memory_order_relaxed);
+}
+
+std::thread::id latch_wait_holder(std::thread::id waiter) {
+  std::lock_guard<std::mutex> lock(s_latch_mu);
+  auto it = s_latch_waiter_to_holder.find(waiter);
+  return it == s_latch_waiter_to_holder.end() ? std::thread::id{} : it->second;
 }
 
 }  // namespace sched_ext
@@ -393,7 +464,7 @@ static int32_t latch_owner_tid(std::thread::id owner) {
   return it == s_std_tid_registry.end() ? -1 : it->second;
 }
 
-void latch_wait_begin(std::thread::id owner) {
+void scx_publish_latch_edge(std::thread::id owner) {
   if (!s_connected || owner == std::thread::id{}) return;
 
   int32_t holder_tid = latch_owner_tid(owner);
@@ -411,7 +482,7 @@ void latch_wait_begin(std::thread::id owner) {
   bpf_map_update_elem(s_fd_lock_holder, &holder_tid, &count, BPF_ANY);
 }
 
-void latch_wait_end() {
+void scx_clear_latch_edge() {
   if (!s_connected) return;
 
   int32_t waiter_tid = current_tid();

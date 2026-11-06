@@ -540,7 +540,8 @@ struct TTASEventMutex {
       above. Otherwise we could have simply done the extra
       spin above. */
 
-      sched_ext::latch_wait_begin(peek_owner());
+      sched_ext::latch_wait_begin(peek_owner(),
+                                  sched_ext::Latch_kind::Mutex);
       bool latch_acquired = wait(filename, line, 4);
       sched_ext::latch_wait_end();
       if (latch_acquired) {

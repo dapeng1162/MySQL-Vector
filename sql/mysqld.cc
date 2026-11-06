@@ -897,6 +897,7 @@ MySQL clients support the protocol:
 #include "sql/ssl_acceptor_context_iterator.h"
 #include "sql/ssl_acceptor_context_operator.h"
 #include "sql/ssl_acceptor_context_status.h"
+#include "sql/sched_ext_bridge.h"  // sched_ext::latch_wait counters
 #include "sql/ssl_init_callback.h"
 #include "sql/stmt_priority.h"  // stmt_priority::counter
 #include "sql/sys_vars.h"         // fixup_enforce_gtid_consistency_...
@@ -11441,6 +11442,40 @@ static int show_coroutine_stmt_prio_release_lock(THD *, SHOW_VAR *var,
   return 0;
 }
 
+static int show_coroutine_latch_wait_mutex(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      sched_ext::latch_wait_count(sched_ext::Latch_kind::Mutex));
+  return 0;
+}
+
+static int show_coroutine_latch_wait_mutex_edge(THD *, SHOW_VAR *var,
+                                                char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      sched_ext::latch_wait_edge_count(sched_ext::Latch_kind::Mutex));
+  return 0;
+}
+
+static int show_coroutine_latch_wait_rw(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      sched_ext::latch_wait_count(sched_ext::Latch_kind::RwLock));
+  return 0;
+}
+
+static int show_coroutine_latch_wait_rw_edge(THD *, SHOW_VAR *var,
+                                             char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      sched_ext::latch_wait_edge_count(sched_ext::Latch_kind::RwLock));
+  return 0;
+}
+
 static int show_coroutine_admission_deferred(THD *, SHOW_VAR *var,
                                               char *buff) {
   var->type = SHOW_LONG;
@@ -12011,6 +12046,16 @@ SHOW_VAR status_vars[] = {
      SHOW_SCOPE_GLOBAL},
     {"Coroutine_stmt_prio_victim_rollback",
      (char *)&show_coroutine_stmt_prio_victim_rollback, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_latch_wait_mutex", (char *)&show_coroutine_latch_wait_mutex,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Coroutine_latch_wait_mutex_edge",
+     (char *)&show_coroutine_latch_wait_mutex_edge, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_latch_wait_rw", (char *)&show_coroutine_latch_wait_rw,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Coroutine_latch_wait_rw_edge",
+     (char *)&show_coroutine_latch_wait_rw_edge, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
     {"Coroutine_submit_to_run_avg_us",
      (char *)&show_coroutine_submit_to_run_avg_us, SHOW_FUNC,

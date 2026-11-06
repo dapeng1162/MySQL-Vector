@@ -40,9 +40,11 @@
   Graceful degradation is a hard requirement:
 
     * The THD-level lock-wait graph (lock_wait_begin/end, is_lock_holder,
-      forget_thd) is pure userspace state and is ALWAYS compiled: it drives
-      the coroutine handler's high-priority queue regardless of any kernel
-      scheduler.
+      forget_thd) and the latch wait-edge mirror (latch_wait_begin/end,
+      latch_wait_holder, the Coroutine_latch_* counters) are pure
+      userspace state and are ALWAYS compiled: they drive the coroutine
+      handler's high-priority queue and the latch observability
+      regardless of any kernel scheduler.
 
     * The BPF-facing half is a compile-time no-op when built without
       HAVE_SCX_SCHEDULER (the default): the server builds, links, starts and
@@ -92,14 +94,40 @@ void thread_start();
 void thread_end();
 
 /**
-  Latch (InnoDB internal mutex/rw-lock) wait edges, published by the waiter
-  on its sync-array wait path.  owner is the latch holder's std::thread::id
-  (TTASEventMutex::peek_owner()); it is resolved to an OS tid through the
-  std::thread::id registry populated by thread_start().  Unresolvable
-  holders (threads that never called thread_start) are skipped safely.
+  Latch (InnoDB internal mutex / rw-lock) wait edges, published by the
+  waiter around its OS wait (TTASEventMutex::wait() and the rw-lock
+  sync-array waits).  Always compiled: every call maintains the
+  userspace waiter->holder mirror and the per-family wait/edge counters
+  (SHOW GLOBAL STATUS Coroutine_latch_*) even when the BPF half is a
+  no-op, so the instrumentation stays observable and testable without
+  a running sched_ext scheduler.
+
+  owner is the latch holder's std::thread::id; pass the default
+  (invalid) id when the holder cannot be identified — the wait is
+  counted, but no edge is published.  Returns whether an edge to a
+  resolved holder was recorded.  The holder id is inherently racy (the
+  holder may release right after the caller read it): the bridge
+  tolerates this because an edge lives only until the matching
+  latch_wait_end().
 */
-void latch_wait_begin(std::thread::id owner);
+enum class Latch_kind { Mutex, RwLock };
+
+bool latch_wait_begin(std::thread::id owner, Latch_kind kind);
 void latch_wait_end();
+
+/** Monotonic number of latch OS-waits instrumented, per family. */
+uint64_t latch_wait_count(Latch_kind kind);
+
+/** Monotonic number of waits that produced a wait edge (holder
+resolved), per family. */
+uint64_t latch_wait_edge_count(Latch_kind kind);
+
+/**
+  Holder recorded for @c waiter in the userspace latch-wait mirror, or
+  the default (invalid) thread id if @c waiter is not currently blocked
+  on a resolvable latch holder.  For tests and diagnostics.
+*/
+std::thread::id latch_wait_holder(std::thread::id waiter);
 
 /**
   Called from the coroutine executor pool around each THD job
@@ -201,8 +229,6 @@ inline void commit_begin() {}
 inline void commit_end() {}
 inline void thread_start() {}
 inline void thread_end() {}
-inline void latch_wait_begin(std::thread::id) {}
-inline void latch_wait_end() {}
 inline void thread_job_begin(THD *, bool) {}
 inline void thread_job_end(THD *) {}
 inline void lock_holder_add(my_thread_id) {}

@@ -1,0 +1,21 @@
+# Verify the D6 latch wait-edge observability counters are exposed and
+# readable through SHOW GLOBAL STATUS.  The semantics (which wait
+# produces which edge) are covered by gunit sync0rw.rw_lock_latch_wait_edges;
+# this test only checks the status-variable plumbing in any server mode.
+
+# Container environment: mysqld logs MY-015655 at startup on this host
+# and MTR would fail every test over it (environment issue, not ours).
+call mtr.add_suppression("Server ignores the discovered container restrictions");
+
+-- replace_column 2 #
+SHOW GLOBAL STATUS LIKE 'Coroutine_latch_wait%';
+
+# Some InnoDB activity must not break the counters (still readable,
+# monotonically non-decreasing is not asserted: values stay masked).
+CREATE TABLE t1 (a INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1), (2), (3);
+SELECT COUNT(*) FROM t1;
+DROP TABLE t1;
+
+-- replace_column 2 #
+SHOW GLOBAL STATUS LIKE 'Coroutine_latch_wait%';
