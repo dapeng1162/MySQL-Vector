@@ -52,6 +52,7 @@ void ExecutorPool::stop() {
     m_stopping = true;
   }
   m_cv.notify_all();
+  m_hp_cv.notify_all();
 }
 
 void ExecutorPool::join() {
@@ -69,41 +70,34 @@ void ExecutorPool::join() {
 void ExecutorPool::submit(Job job, bool high_priority) {
   if (!job) return;
   const auto now = std::chrono::steady_clock::now();
-  bool notify = false;
   {
     std::lock_guard<std::mutex> lock(m_mu);
     if (high_priority) {
-      notify = m_hp_queue.empty();
       m_hp_queue.push_back(QueuedJob{std::move(job), now});
     } else {
-      // A normal job can be consumed by any worker, so we must wake a
-      // worker whenever no job of either kind was queued before (an idle
-      // non-VIP worker might have gone back to sleep after being woken by
-      // a normal submission while the queue was momentarily empty).
-      notify = m_queue.empty() && m_hp_queue.empty();
       m_queue.push_back(QueuedJob{std::move(job), now});
     }
   }
-  if (notify) {
-    // Wake a single worker on the empty -> non-empty transition.  A burst
-    // of jobs is spread across workers by the cascade notify in
-    // worker_loop() (each worker wakes another while the queue holds more
-    // than one job), so we never let one worker monopolize a burst and then
-    // block on I/O with everyone else asleep — and we avoid the thundering
-    // herd of waking all N workers for every single job.
-    //
-    // NOTE: notify_one() may hand the wakeup to a VIP worker that cannot
-    // consume a normal job (its predicate fails and it goes back to
-    // sleep).  That is a lost wakeup for the normal queue.  With num_vip
-    // VIP workers and (N - num_vip) normal workers, worst case we burn
-    // num_vip spurious wakeups; if num_vip >= 1 we therefore notify
-    // num_vip + 1 times so at least one non-VIP worker is guaranteed to
-    // wake.  The cascade notify inside worker_loop() spreads any surplus.
-    size_t wakes = 1;
-    if (!high_priority && m_num_vip > 0) wakes = m_num_vip + 1;
-    for (size_t i = 0; i < wakes; ++i) {
-      m_cv.notify_one();
-    }
+  // Always wake a worker on every enqueue.  The previous empty -> non-empty
+  // gating assumed "some worker is either waiting or will re-check the
+  // queue after finishing its current job", but a condvar signal fired
+  // while no thread is blocked is simply lost (POSIX allows this), and
+  // one lost signal then poisons the pool permanently: every later
+  // submit sees a non-empty queue and never notifies again, so jobs
+  // pile up with all workers asleep (observed as a full-server stall).
+  // Unconditional notification makes the pool self-healing: the next
+  // submit after any lost signal re-wakes a worker, and worker_loop's
+  // wait_for() timeout bounds the worst case.
+  //
+  // A normal job notifies m_cv only: VIP workers wait on m_hp_cv, so the
+  // wake cannot be swallowed by a worker that cannot consume the job.
+  // A high-priority job can be consumed by any worker, so it wakes both
+  // (one of the two wakes is usually spare; HP submits are rare).
+  if (high_priority) {
+    m_hp_cv.notify_one();
+    m_cv.notify_one();
+  } else {
+    m_cv.notify_one();
   }
 }
 
@@ -197,24 +191,46 @@ void ExecutorPool::worker_loop(size_t idx) {
     Job job;
     {
       std::unique_lock<std::mutex> lock(m_mu);
-      // Drain all queued jobs before exiting on stop.
-      m_cv.wait(lock, [this, &w, vip] {
-        return m_stopping || w->stopped.load(std::memory_order_relaxed) ||
-               !m_hp_queue.empty() ||
-               (!vip && !m_queue.empty());
-      });
+      // Safety net against lost condvar signals: re-check the queues
+      // periodically even without a notification.  submit() always
+      // notifies, but a signal can still be lost while no thread is
+      // blocked (POSIX permits this); the timeout bounds such a stall
+      // instead of letting it persist forever.  N workers waking 10
+      // times per second is negligible.
+      //
+      // VIP workers wait on m_hp_cv so a normal job's wake can never be
+      // swallowed by a worker that cannot consume it; normal workers
+      // wait on m_cv and still prefer HP jobs.
+      if (vip) {
+        m_hp_cv.wait_for(lock, std::chrono::milliseconds(100),
+                         [this, &w] {
+                           return m_stopping ||
+                                  w->stopped.load(std::memory_order_relaxed) ||
+                                  !m_hp_queue.empty();
+                         });
+      } else {
+        m_cv.wait_for(lock, std::chrono::milliseconds(100),
+                      [this, &w] {
+                        return m_stopping ||
+                               w->stopped.load(std::memory_order_relaxed) ||
+                               !m_hp_queue.empty() || !m_queue.empty();
+                      });
+      }
       QueuedJob qj;
       // High-priority queue first (all workers); VIP workers stop here.
       if (!m_hp_queue.empty()) {
         // Cascade wake-up: while more than one HP job remains, wake
-        // another worker so a burst is shared across the pool.
+        // another worker so a burst is shared across the pool.  Any
+        // worker can consume an HP job, so wake both condvars.
         if (m_hp_queue.size() > 1) {
+          m_hp_cv.notify_one();
           m_cv.notify_one();
         }
         qj = std::move(m_hp_queue.front());
         m_hp_queue.pop_front();
       } else if (!vip && !m_queue.empty()) {
-        // Cascade wake-up for the normal queue.
+        // Cascade wake-up for the normal queue.  Only non-VIP workers
+        // wait on m_cv, so the wake cannot be wasted.
         if (m_queue.size() > 1) {
           m_cv.notify_one();
         }

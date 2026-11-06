@@ -293,6 +293,173 @@ TEST(ExecutorPoolTest, VipCountClamped) {
 }
 
 // ---------------------------------------------------------------------------
+// Wakeup-protocol regression tests (lost-signal self-healing)
+// ---------------------------------------------------------------------------
+
+// A job submitted while every worker is busy inside a job cannot be
+// delivered by a condvar signal (nobody is waiting, POSIX allows the
+// signal to be lost).  It must still complete as soon as a worker
+// finishes and re-checks the queue.  Regression guard for the permanent
+// stall observed when submit() stopped notifying on a non-empty queue.
+TEST(ExecutorPoolTest, JobQueuedWhileAllWorkersBusyRunsAfterRelease) {
+  constexpr size_t kNumWorkers = 3;  // 1 VIP + 2 normal
+  ExecutorPool pool(kNumWorkers, static_cast<size_t>(-1), 1);
+
+  std::mutex mu;
+  std::condition_variable cv;
+  std::atomic<int> blocked{0};
+  std::atomic<bool> release{false};
+  std::atomic<bool> queued_job_done{false};
+
+  pool.start();
+
+  // Occupy both normal workers with blocking jobs (the VIP worker cannot
+  // consume normal jobs, so it stays idle for them).
+  for (size_t i = 0; i < kNumWorkers - 1; ++i) {
+    pool.submit([&] {
+      blocked.fetch_add(1);
+      std::unique_lock<std::mutex> lock(mu);
+      cv.wait(lock, [&] { return release.load(); });
+    });
+  }
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (blocked.load() < static_cast<int>(kNumWorkers - 1) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_EQ(blocked.load(), static_cast<int>(kNumWorkers - 1));
+
+  // Both normal workers are inside their jobs, so this submit's signal
+  // necessarily finds no waiter and is lost.  The job must still run
+  // once the blockers finish and the workers re-check the queue.
+  pool.submit([&] { queued_job_done.store(true); });
+
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release.store(true);
+  }
+  cv.notify_all();
+
+  deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!queued_job_done.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+
+  pool.stop();
+  pool.join();
+
+  EXPECT_TRUE(queued_job_done.load());
+}
+
+// When the VIP worker is busy inside an HP job, a further HP job must be
+// picked up by a normal worker (HP submits wake both condvars).
+TEST(ExecutorPoolTest, HpJobRunsWhenVipWorkerBusy) {
+  constexpr size_t kNumWorkers = 3;  // 1 VIP + 2 normal
+  ExecutorPool pool(kNumWorkers, static_cast<size_t>(-1), 1);
+
+  std::mutex mu;
+  std::condition_variable cv;
+  std::atomic<bool> vip_blocker_entered{false};
+  std::atomic<bool> release{false};
+  std::atomic<bool> second_hp_done{false};
+
+  pool.start();
+
+  // Occupy the VIP worker with a blocking HP job.
+  pool.submit(
+      [&] {
+        vip_blocker_entered.store(true);
+        std::unique_lock<std::mutex> lock(mu);
+        cv.wait(lock, [&] { return release.load(); });
+      },
+      /*high_priority=*/true);
+
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!vip_blocker_entered.load() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(vip_blocker_entered.load());
+
+  // A second HP job while the VIP is busy: a normal worker must take it.
+  pool.submit(
+      [&] {
+        second_hp_done.store(true);
+        {
+          std::lock_guard<std::mutex> lock(mu);
+          release.store(true);
+        }
+        cv.notify_all();
+      },
+      /*high_priority=*/true);
+
+  deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!second_hp_done.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+
+  pool.stop();
+  pool.join();
+
+  EXPECT_TRUE(second_hp_done.load());
+}
+
+// Soak test for the wakeup protocol: concurrent submitters push a mix of
+// normal and HP jobs while other jobs periodically block the workers.
+// Every job must complete.  This gives probabilistic coverage of the
+// lost-signal / stranded-job class of bugs that the deterministic tests
+// above cannot inject.
+TEST(ExecutorPoolTest, MixedSubmitSoakAllJobsComplete) {
+  constexpr size_t kNumWorkers = 8;  // 1 VIP + 7 normal
+  constexpr int kNumJobs = 2000;
+  constexpr int kNumSubmitters = 4;
+  ExecutorPool pool(kNumWorkers, static_cast<size_t>(-1), 1);
+
+  std::atomic<int> completed{0};
+  std::atomic<int> hp_completed{0};
+
+  pool.start();
+
+  std::vector<std::thread> submitters;
+  for (int t = 0; t < kNumSubmitters; ++t) {
+    submitters.emplace_back([&pool, &completed, &hp_completed, t] {
+      for (int i = 0; i < kNumJobs / kNumSubmitters; ++i) {
+        if ((i + t) % 50 == 0) {
+          // Occasionally stall the taker so wakeups interleave with
+          // workers transitioning between running and waiting.
+          pool.submit([] { std::this_thread::sleep_for(std::chrono::milliseconds(2)); });
+        }
+        if ((i + t) % 7 == 0) {
+          pool.submit(
+              [&hp_completed, &completed] {
+                hp_completed.fetch_add(1, std::memory_order_relaxed);
+                completed.fetch_add(1, std::memory_order_relaxed);
+              },
+              /*high_priority=*/true);
+        } else {
+          pool.submit([&completed] {
+            completed.fetch_add(1, std::memory_order_relaxed);
+          });
+        }
+      }
+    });
+  }
+  for (auto &th : submitters) th.join();
+
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (completed.load() < kNumJobs &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+
+  pool.stop();
+  pool.join();
+
+  EXPECT_EQ(completed.load(), kNumJobs);
+  EXPECT_GT(hp_completed.load(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // CPU pinning tests
 // ---------------------------------------------------------------------------
 

@@ -149,7 +149,8 @@ class ExecutorPool {
 
   // Shared task queues (both guarded by m_mu; high-priority first).
   mutable std::mutex m_mu;
-  std::condition_variable m_cv;
+  std::condition_variable m_cv;     // normal workers
+  std::condition_variable m_hp_cv;  // VIP workers (and HP-job cascade)
   std::deque<QueuedJob> m_queue;
   std::deque<QueuedJob> m_hp_queue;
   bool m_stopping{false};
