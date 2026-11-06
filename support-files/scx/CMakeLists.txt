@@ -52,11 +52,48 @@ IF(NOT SCX_BPFTOOL)
     "WITH_SCX_SCHEDULER requires bpftool to generate BPF skeletons.")
 ENDIF()
 
-# Check that the scx/common.bpf.h header is reachable (from the kernel
-# source tree under /root/src/kernel, or from another location the user
-# provides via SCX_INCLUDE_DIR).
+# bpftool >= 7.4 generates skeletons whose struct_ops maps live in a
+# dedicated skel->struct_ops section; the loader then uses the
+# SCX_OPS_OPEN/SCX_OPS_LOAD/SCX_OPS_ATTACH convenience macros. Older
+# bpftool (e.g. 7.2) puts the ops map in skel->maps.__ops, and the
+# loader falls back to open()/load() with manual rodata setup, which is
+# selected at compile time via SCX_SKEL_HAS_STRUCT_OPS.
+EXECUTE_PROCESS(
+  COMMAND ${SCX_BPFTOOL} version
+  OUTPUT_VARIABLE SCX_BPFTOOL_VERSION_OUT
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  RESULT_VARIABLE SCX_BPFTOOL_VERSION_RC
+)
+SET(SCX_BPFTOOL_VERSION "0.0")
+IF(SCX_BPFTOOL_VERSION_RC EQUAL 0)
+  STRING(REGEX MATCH "bpftool v?([0-9]+\\.[0-9]+)" _SCX_VER_MATCH
+         "${SCX_BPFTOOL_VERSION_OUT}")
+  IF(_SCX_VER_MATCH)
+    SET(SCX_BPFTOOL_VERSION "${CMAKE_MATCH_1}")
+  ENDIF()
+ENDIF()
+IF(SCX_BPFTOOL_VERSION VERSION_GREATER_EQUAL "7.4")
+  SET(SCX_SKEL_HAS_STRUCT_OPS ON)
+ELSE()
+  SET(SCX_SKEL_HAS_STRUCT_OPS OFF)
+  MESSAGE(STATUS
+    "bpftool ${SCX_BPFTOOL_VERSION} < 7.4: building the scx_db_sched "
+    "loader with the legacy skeleton layout (maps.__ops).")
+ENDIF()
+
+# Check that the scx/common.bpf.h header is reachable. The header set must
+# come from a kernel/tools tree of v6.12 or newer, or from the sched_ext
+# (scx) repository: scx_db_sched.bpf.c uses the newer compat helpers
+# (e.g. the two-argument scx_bpf_dsq_move_to_local wrapper), which are
+# missing from the early sched_ext development trees.
 IF(NOT SCX_INCLUDE_DIR)
   SET(SCX_INCLUDE_DIR "/root/src/kernel/tools/sched_ext/include")
+  MESSAGE(WARNING
+    "SCX_INCLUDE_DIR defaults to the local kernel tree at "
+    "${SCX_INCLUDE_DIR}, whose scx headers predate v6.12 and are NOT "
+    "compatible with scx_db_sched.bpf.c. Point SCX_INCLUDE_DIR at a "
+    "v6.12+ kernel's tools/sched_ext/include, or at the sched_ext repo's "
+    "scheds/include directory.")
 ENDIF()
 IF(NOT EXISTS "${SCX_INCLUDE_DIR}/scx/common.bpf.h")
   MESSAGE(WARNING
@@ -68,10 +105,13 @@ ENDIF()
 # Check for vmlinux.h (needed by scx/common.bpf.h).  The user may point
 # SCX_VMLINUX_H at a vmlinux.h generated from a kernel with sched_ext.
 # If not provided, bpftool can generate it from /sys/kernel/btf/vmlinux
-# (but that only works on a sched_ext-capable kernel).
+# (but that only works on a sched_ext-capable kernel).  A prebuilt one
+# can be fetched from the sched_ext repo, e.g. for arm64:
+#   https://raw.githubusercontent.com/sched-ext/scx/main/scheds/vmlinux/arch/arm64/vmlinux-v7.3-rc5-g6ebdea0d0fb8.h
 IF(NOT SCX_VMLINUX_H)
   SET(SCX_VMLINUX_H "${CMAKE_CURRENT_BINARY_DIR}/vmlinux.h")
 ENDIF()
+GET_FILENAME_COMPONENT(SCX_VMLINUX_DIR "${SCX_VMLINUX_H}" DIRECTORY)
 
 # -- Build targets ---------------------------------------------------------
 
@@ -106,6 +146,7 @@ SET(SCX_BPF_CFLAGS
   -D__TARGET_ARCH_${SCX_TARGET_ARCH}
   -mlittle-endian
   -I${SCX_INCLUDE_DIR}
+  -I${SCX_VMLINUX_DIR}
   -I${SCX_BIN_DIR}
   -Wall
   -Wno-compare-distinct-pointer-types
@@ -167,7 +208,11 @@ ADD_EXECUTABLE(scx_db_sched
 TARGET_INCLUDE_DIRECTORIES(scx_db_sched
   PRIVATE ${SCX_BIN_DIR}
   PRIVATE ${SCX_INCLUDE_DIR}
+  PRIVATE ${SCX_VMLINUX_DIR}
 )
+IF(SCX_SKEL_HAS_STRUCT_OPS)
+  TARGET_COMPILE_DEFINITIONS(scx_db_sched PRIVATE SCX_SKEL_HAS_STRUCT_OPS=1)
+ENDIF()
 TARGET_LINK_LIBRARIES(scx_db_sched
   bpf
   elf

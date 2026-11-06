@@ -27,6 +27,17 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+/*
+ * Skeleton layout compat: bpftool >= 7.4 emits struct_ops maps as a
+ * dedicated skel->struct_ops.<name> section pointing at the ops value,
+ * which the SCX_OPS_OPEN()/SCX_OPS_LOAD() macros expect.  Older
+ * bpftool emits struct_ops maps as plain maps, and the ops struct is
+ * not reachable in a layout-portable way.  On that path we open/load
+ * the skeleton directly: ops->hotplug_seq stays 0 (the kernel
+ * documents "if 0, no detection occurs") and the UEI dump keeps its
+ * default size.  SCX_SKEL_HAS_STRUCT_OPS is defined by the CMake
+ * bpftool version probe.
+ */
 #include <bpf/bpf.h>
 #include <scx/common.h>
 
@@ -187,7 +198,12 @@ int main(int argc, char **argv) {
   if (check_sched_ext_available() != 0) return 1;
 
 restart:
+#ifdef SCX_SKEL_HAS_STRUCT_OPS
   skel = SCX_OPS_OPEN(db_sched_ops, scx_db_sched);
+#else
+  skel = scx_db_sched__open();
+  SCX_BUG_ON(!skel, "Could not open scx_db_sched");
+#endif
 
   while ((opt = getopt_long(argc, argv, "dvh", long_options, NULL)) != -1) {
     switch (opt) {
@@ -203,7 +219,16 @@ restart:
     }
   }
 
+#ifdef SCX_SKEL_HAS_STRUCT_OPS
   SCX_OPS_LOAD(skel, db_sched_ops, scx_db_sched, uei);
+#else
+  /* UEI_SET_SIZE() reaches ops->exit_dump_len through the struct_ops
+   * skeleton section; on the old layout it is 0 anyway, so apply the
+   * default dump size directly. */
+  skel->rodata->uei_dump_len = UEI_DUMP_DFL_LEN;
+  RESIZE_ARRAY(skel, data, uei_dump, UEI_DUMP_DFL_LEN);
+  SCX_BUG_ON(scx_db_sched__load(skel), "Failed to load skel");
+#endif
 
   if (pin_maps(skel) != 0) {
     fprintf(stderr, "scx_db_sched: map pinning failed, continuing anyway\n");

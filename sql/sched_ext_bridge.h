@@ -67,8 +67,8 @@ class THD;
 /**
   DB-aware sched_ext bridge namespace.
 
-  Unless HAVE_SCX_SCHEDULER is defined at compile time, all of the
-  following functions are static inline no-ops, so including this header
+  Unless HAVE_SCX_SCHEDULER is defined at compile time, the BPF-facing
+  functions below are static inline no-ops, so including this header
   anywhere in the server is always safe and side-effect free.
 */
 namespace sched_ext {

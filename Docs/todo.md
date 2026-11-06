@@ -76,7 +76,7 @@
 - DDL/DML、显式 COMMIT/ROLLBACK、连续多语句结果正确；回滚行未残留。
 - 同一连接语法错误后 `SELECT 42` 成功；TLS、压缩协议和 COM_PING 回退正常；12 个顺序新连接均成功。
 - 最终实例通过 SQL `SHUTDOWN` 干净退出，最后一轮无新增崩溃日志。历史调试日志中曾有模式混淆导致的空 AST 崩溃，已通过分离 `parse_only_state`/`pre_parsed` 修复。
-- BPF：尚未完成编译/加载验证，不能声称可加载；高并发、公平性和性能数字未在本轮复测。
+- BPF：编译链已在本机完整验证（见 P1 BPF 节），加载验证需专门环境（本机内核 6.6 无 SCHED_CLASS_EXT、无 BPF JIT）；高并发、公平性和性能数字未在本轮复测。
 
 标准构建：
 
@@ -143,19 +143,35 @@ build/runtime_output_directory/mysqld --no-defaults \
   - MTR：`mysql-test/t/coroutine_latch_status.test`（`main.coroutine_latch_status`，验证 4 个状态变量管道；录制与重放均通过）。
   - 回归：`task-t/netpoller-t/executor-t/stmt_priority-t`（5+6+10+9）与 `main.coroutine_stmt_prio` 均通过。
 - 性能测试（脚本已写好、未实测）：`scripts/bench/sched/run_b9_latch_edges.sh`（uniform vs 单表热点 + 插桩开销护栏 + PFS rwlock 一致性对照），见 TESTPLAN B9 行。
-- 未验证：`WITH_SCX_SCHEDULER=ON` 构建下 `scx_publish_latch_edge` 路径的编译与运行（本机无 libbpf/BTF 环境，归入下方 BPF 任务）。
+- 本地功能冒烟（2026-11-06，coroutine-epoll + reactor-parse，非 SCX 构建）：32 线程 pareto update_index、8 表 × 1 万行、30s —— `Coroutine_latch_wait_rw` 6→1583、`_rw_edge` 6→1126、`_mutex` 74→2248、`_mutex_edge` 68→618，edge ≤ waits 不变式成立，负载正常（5.5k TPS、p99 40ms）。
+- 未验证：`HAVE_SCX_SCHEDULER` 构建下 `scx_publish_latch_edge` 路径的**运行**（编译已通过，见下方 BPF 节；本机运行内核无 sched_ext，只能在专门环境验证）。
 
-### P1：BPF 编译与加载验证
+### P1：BPF 编译与加载验证（编译已全通，加载待专门环境）
 
-- 本机无 `/sys/kernel/btf`；`/root/src/kernel` defconfig 生成的 `vmlinux.h` 为空。
-- 需要启用 `CONFIG_DEBUG_INFO_BTF`、`CONFIG_SCHED_CLASS_EXT` 后重建，或取得匹配 6.12+ 的可靠 `vmlinux.h`。
-- `pahole` 不存在，`dnf install -y dwarves` 之前超时失败。
-- clang18：`/opt/openEuler/llvm-toolset-18/root/usr/bin/clang`；bpftool：`/usr/sbin/bpftool`。
-- GitHub 直连不通时使用 `https://ghfast.top/` 前缀代理；api.github.com 不在该代理支持范围。
+- **已修复的编译问题**：
+  - `sql/sched_ext_bridge.cc`：`scx_publish_latch_edge/scx_clear_latch_edge/latch_owner_tid` 原定义在 `namespace sched_ext` 直接命名空间，与匿名命名空间声明不匹配（"declared static but never defined"，链接必失败）；已移入 SCX 半区匿名命名空间块。用 `build/compile_commands.json` 提取的命令加 `-DHAVE_SCX_SCHEDULER` 单独编译验证通过，默认构建 `cmake --build . --target sql_main mysqld -j6` 通过。
+  - `scx_db_sched.bpf.c`：`scx_bpf_dsq_move_to_local(EEVDF_DSQ)` 需补第二个 enq_flags 参数（当前 compat 宏签名）。
+- **BPF 侧编译链（本机已通，零警告，产物 938KB）**：
+  - vmlinux.h：scx repo 预生成版，如 arm64 用
+    `https://ghfast.top/https://raw.githubusercontent.com/sched-ext/scx/main/scheds/vmlinux/arch/arm64/vmlinux-v7.3-rc5-g6ebdea0d0fb8.h`
+    （4.8MB；`scheds/vmlinux/vmlinux.h` 和 `arch/arm64/vmlinux.h` 只是指针文件，不要用）。
+  - BPF 侧头用 **scx main 分支** `scheds/include/scx/*.h` + `scheds/include/bpf_arena_common.bpf.h`（注意后者在 scheds/include/ 下，不在 scx/ 下）。**不能用本机 `/root/src/kernel/tools/sched_ext/include`（6.6 补丁集）**：缺 `scx_bpf_dsq_move_to_local` 两参兼容宏。
+  - 编译：`clang -g -D__TARGET_ARCH_arm64 -mlittle-endian -I<headers> -I<vmlinux-dir> -Wall -Wno-compare-distinct-pointer-types -O2 -mcpu=v3 -target bpf -c ...`（clang18 在 `/opt/openEuler/llvm-toolset-18/root/usr/bin/clang`）。
+  - skeleton：`bpftool gen object` 三步 + diff + `gen skeleton ... name scx_db_sched`。
+- **loader 双路径**（`scx_db_sched_main.c`）：本机 bpftool 7.2 < 7.4，旧 skeleton 无 `skel->struct_ops` 段——`#ifdef SCX_SKEL_HAS_STRUCT_OPS` 走 `SCX_OPS_OPEN/SCX_OPS_LOAD` 宏，`#else` 走 `scx_db_sched__open()` + 手动 `rodata->uei_dump_len = UEI_DUMP_DFL_LEN; RESIZE_ARRAY(skel, data, uei_dump, ...)` + `scx_db_sched__load()`（内核文档明确 hotplug_seq=0 跳过热插拔检测；两种布局 `SCX_OPS_ATTACH` 都走 `maps.__ops_name`）。CMake 已加 bpftool 版本探测，≥7.4 自动定义 `SCX_SKEL_HAS_STRUCT_OPS=1`。
+  - loader 用户态头用 **torvalds/linux v6.12 的 tools/sched_ext/include/scx**（v6.12 的 `SCX_OPS_LOAD/ATTACH` 兼容旧 skeleton，且其 `user_exit_info.h` 要求 -I 路径里有 vmlinux.h）。已知无害警告：v6.12 `common.h` 的 `RESIZE_ARRAY` 有 `-Wdiscarded-qualifiers`（main 分支头已修）。
+  - loader 已本机编译链接通过，`--help` 正常，运行时正确报 "sched_ext is not available"（符合预期）。
+- **剩余（专门环境，如云端 kernel 7.0.0-31 Ubuntu）**：
+  - 实际加载：`bpftool` 7.2 环境跑 legacy 路径；≥7.4 环境跑 struct_ops 路径（新路径分支本机无法验证，代码与 upstream 宏一致，风险低）。
+  - 正式 CMake 构建：`WITH_SCX_SCHEDULER=ON` + 指向一套新头（BPF/loader 同源即可），CMakeLists 的版本探测与 WARNING 已就位（standalone configure 冒烟通过）。
+  - 加载后跑 B5 自死锁回归（SCX 构建下首次行锁等待）与 B8/B9/C 系列实测。
+- 已否决路线（勿重试）：`pahole -J` 离线转 BTF（6.6 补丁集树 DWARF 不完整）；全量 vmlinux.h include 进 loader（glibc 类型冲突）；repo 内找新版 bpftool（最高 7.2）。
+- GitHub 直连不通时使用 `https://ghfast.top/` 前缀代理；只支持 raw.githubusercontent.com，api.github.com 与 github.com 页面不行。
 
 ### P2：文档与完整测试矩阵
 
 - 将 v4 design/paper/html 中 D1–D4、D3 的状态从“设计”改成真实的“已实现且已验证”或“实现实验性、默认关闭”；不要只改一份。
+- 负向测试脚本已全部写好（`scripts/bench/sched/`，语法检查通过、未实测）：B8（D5 语句提权风暴）、B9（D6 latch 边）、C1（执行线程耗竭）、C2（热点争用扫描）、C3（死锁雪崩）、C4（高连接 + churn）、C5（过载膝点爬坡）、C6（争用 soak + 泄漏检查）；D6 计数器已做本地功能冒烟。实测按 TESTPLAN 落地计划在专门环境执行。
 - 跑 TPCC、sysbench OLTP，以及文档 N1–N12 负向测试：锁风暴、外部干扰、突发、重试、悬崖点、恢复、fairness/debt 等。
 - 历史数字只能引用 `Docs/coroutine-sched-design.md` 中已有实测；v4 新机制没有新 benchmark 前不得写性能提升结论。
 

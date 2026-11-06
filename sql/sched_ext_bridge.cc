@@ -437,26 +437,6 @@ void scx_clear_wait_edge(THD *waiter, THD *holder) {
   }
 }
 
-}  // namespace
-
-// -----------------------------------------------------------------------
-// Public API (BPF half)
-// -----------------------------------------------------------------------
-
-bool connected() { return s_connected; }
-
-void thread_start() {
-  std::lock_guard<std::mutex> lock(s_registry_mu);
-  s_tid_registry[my_thread_self()] = current_tid();
-  s_std_tid_registry[std::this_thread::get_id()] = current_tid();
-}
-
-void thread_end() {
-  std::lock_guard<std::mutex> lock(s_registry_mu);
-  s_tid_registry.erase(my_thread_self());
-  s_std_tid_registry.erase(std::this_thread::get_id());
-}
-
 /* Resolve a latch holder's std::thread::id to its OS tid, or -1. */
 static int32_t latch_owner_tid(std::thread::id owner) {
   std::lock_guard<std::mutex> lock(s_registry_mu);
@@ -500,6 +480,26 @@ void scx_clear_latch_edge() {
       bpf_map_delete_elem(s_fd_lock_holder, &holder_tid);
     }
   }
+}
+
+}  // namespace
+
+// -----------------------------------------------------------------------
+// Public API (BPF half)
+// -----------------------------------------------------------------------
+
+bool connected() { return s_connected; }
+
+void thread_start() {
+  std::lock_guard<std::mutex> lock(s_registry_mu);
+  s_tid_registry[my_thread_self()] = current_tid();
+  s_std_tid_registry[std::this_thread::get_id()] = current_tid();
+}
+
+void thread_end() {
+  std::lock_guard<std::mutex> lock(s_registry_mu);
+  s_tid_registry.erase(my_thread_self());
+  s_std_tid_registry.erase(std::this_thread::get_id());
 }
 
 void thread_job_begin(THD *thd, bool time_sensitive) {

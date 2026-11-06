@@ -316,7 +316,9 @@ inherit_publish:
  * ----------------------------------------------------------------------- */
 void BPF_STRUCT_OPS(db_sched_dispatch, s32 cpu, struct task_struct *prev)
 {
-  scx_bpf_dsq_move_to_local(EEVDF_DSQ);
+  /* enq_flags 0: plain move, no re-enqueue side effects.  The compat
+   * macro resolves to scx_bpf_consume() on pre-6.12 kernels. */
+  scx_bpf_dsq_move_to_local(EEVDF_DSQ, 0);
 }
 
 /* -----------------------------------------------------------------------
