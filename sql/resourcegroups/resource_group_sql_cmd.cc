@@ -564,7 +564,14 @@ static inline bool check_and_apply_resource_grp(
       resourcegroups::Resource_group_mgr::instance()->get_resource_group(
           std::string(pfs_thread_attr.m_groupname));
 
-  if (resource_group->controller()->apply_control(
+  /* Coroutine mode: user sessions run on shared worker threads; applying
+   * controls to the OS thread backing a user session would affect other
+   * sessions' jobs.  Record the assignment on the target THD only. */
+  const bool apply_thread_control =
+      pfs_thread_attr.m_system_thread ||
+      !resourcegroups::coroutine_scheduler_active();
+  if (apply_thread_control &&
+      resource_group->controller()->apply_control(
           pfs_thread_attr.m_thread_os_id)) {
     if (error)
       my_error(ER_RESOURCE_GROUP_BIND_FAILED, MYF(0),
@@ -684,13 +691,18 @@ bool resourcegroups::Sql_cmd_set_resource_group::execute(THD *thd) {
     thd->resource_group_ctx()->m_cur_resource_group = resource_group;
     mysql_mutex_unlock(&thd->LOCK_thd_data);
 
-    if (cur_res_grp != nullptr)
-      cur_res_grp->remove_pfs_thread_id(pfs_thread_id);
+    /* In coroutine mode the current PFS thread id belongs to a shared
+     * executor worker; recording it here would mislabel the worker and let
+     * later ALTER RESOURCE GROUP apply controls to it. */
+    if (!resourcegroups::coroutine_scheduler_active()) {
+      if (cur_res_grp != nullptr)
+        cur_res_grp->remove_pfs_thread_id(pfs_thread_id);
 
-    resourcegroups::Resource_group_mgr::instance()->set_res_grp_in_pfs(
-        resource_group->name().c_str(), resource_group->name().length(),
-        pfs_thread_id);
-    resource_group->add_pfs_thread_id(pfs_thread_id);
+      resourcegroups::Resource_group_mgr::instance()->set_res_grp_in_pfs(
+          resource_group->name().c_str(), resource_group->name().length(),
+          pfs_thread_id);
+      resource_group->add_pfs_thread_id(pfs_thread_id);
+    }
     if (ticket != nullptr)
       res_grp_mgr->release_shared_mdl_for_resource_group(thd, ticket);
   } else {

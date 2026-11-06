@@ -65,7 +65,8 @@
 #include <mutex>
 #include <unordered_map>
 
-#include "sql/sql_class.h"  // THD
+#include "mysql_sched_tier.h"  // mysql_sched_set_thread_tier (C hook)
+#include "sql/sql_class.h"     // THD
 
 namespace sched_ext {
 namespace {
@@ -191,6 +192,13 @@ void forget_thd(THD *thd) {
 
 }  // namespace sched_ext
 
+/* C hook for storage engines (InnoDB background threads) that cannot
+ * include sql/ headers.  set_thread_tier() is a compile-time no-op in
+ * default builds and a runtime no-op without a connected scheduler. */
+extern "C" void mysql_sched_set_thread_tier(int tier) {
+  sched_ext::set_thread_tier(tier);
+}
+
 // -----------------------------------------------------------------------
 // BPF map publication half (only when HAVE_SCX_SCHEDULER).  The functions
 // below still touch the always-compiled THD wait graph above (anonymous
@@ -205,6 +213,8 @@ void forget_thd(THD *thd) {
 #include <cstring>
 
 #include "my_thread.h"  // my_thread_self
+#include "sql/resourcegroups/resource_group.h"  // Resource_group
+#include "sql/resourcegroups/thread_resource_control.h"
 
 namespace sched_ext {
 namespace {
@@ -216,6 +226,7 @@ static constexpr const char *kMapCommitVIP  = "/sys/fs/bpf/scx_db_sched/commit_v
 static constexpr const char *kMapBlockedBy  = "/sys/fs/bpf/scx_db_sched/blocked_by";
 static constexpr const char *kMapLockHolder = "/sys/fs/bpf/scx_db_sched/lock_holder";
 static constexpr const char *kMapRgPrio     = "/sys/fs/bpf/scx_db_sched/rg_prio";
+static constexpr const char *kMapTaskTier   = "/sys/fs/bpf/scx_db_sched/task_tier";
 
 // -----------------------------------------------------------------------
 // Bridge state
@@ -225,6 +236,7 @@ static int s_fd_commit_vip  = -1;
 static int s_fd_blocked_by  = -1;
 static int s_fd_lock_holder = -1;
 static int s_fd_rg_prio     = -1;
+static int s_fd_task_tier   = -1;
 
 // -----------------------------------------------------------------------
 // pthread_t -> OS tid registry.
@@ -237,6 +249,8 @@ static int s_fd_rg_prio     = -1;
 // -----------------------------------------------------------------------
 static std::mutex s_registry_mu;
 static std::unordered_map<my_thread_t, int32_t> s_tid_registry;
+/* Second registry for latch wait edges: std::thread::id -> OS tid. */
+static std::unordered_map<std::thread::id, int32_t> s_std_tid_registry;
 
 /** Cached OS tid of the current thread (lazily initialised). */
 thread_local int32_t s_current_tid = -1;
@@ -250,6 +264,12 @@ thread_local int32_t s_current_tid = -1;
 struct ThreadPub {
   bool published = false;
   int32_t tid = -1;
+  /** Whether thread_job_begin published a TIER_TS task_tier entry that
+   *  thread_job_end must clear again. */
+  bool published_ts_tier = false;
+  /** Whether thread_job_begin published a resource-group-derived
+   *  task_tier entry and rg_prio entry that thread_job_end must clear. */
+  bool published_rg_tier = false;
 };
 thread_local ThreadPub s_thread_pub;
 
@@ -357,34 +377,143 @@ bool connected() { return s_connected; }
 void thread_start() {
   std::lock_guard<std::mutex> lock(s_registry_mu);
   s_tid_registry[my_thread_self()] = current_tid();
+  s_std_tid_registry[std::this_thread::get_id()] = current_tid();
 }
 
 void thread_end() {
   std::lock_guard<std::mutex> lock(s_registry_mu);
   s_tid_registry.erase(my_thread_self());
+  s_std_tid_registry.erase(std::this_thread::get_id());
 }
 
-void thread_job_begin(THD *thd) {
+/* Resolve a latch holder's std::thread::id to its OS tid, or -1. */
+static int32_t latch_owner_tid(std::thread::id owner) {
+  std::lock_guard<std::mutex> lock(s_registry_mu);
+  auto it = s_std_tid_registry.find(owner);
+  return it == s_std_tid_registry.end() ? -1 : it->second;
+}
+
+void latch_wait_begin(std::thread::id owner) {
+  if (!s_connected || owner == std::thread::id{}) return;
+
+  int32_t holder_tid = latch_owner_tid(owner);
+  if (holder_tid < 0) return;
+  int32_t waiter_tid = current_tid();
+
+  /* blocked_by[waiter] = holder */
+  bpf_map_update_elem(s_fd_blocked_by, &waiter_tid, &holder_tid, BPF_ANY);
+
+  /* lock_holder[holder] += 1 */
+  uint32_t count = 1;
+  uint32_t old = 0;
+  if (bpf_map_lookup_elem(s_fd_lock_holder, &holder_tid, &old) == 0)
+    count = old + 1;
+  bpf_map_update_elem(s_fd_lock_holder, &holder_tid, &count, BPF_ANY);
+}
+
+void latch_wait_end() {
+  if (!s_connected) return;
+
+  int32_t waiter_tid = current_tid();
+  int32_t holder_tid = 0;
+  if (bpf_map_lookup_elem(s_fd_blocked_by, &waiter_tid, &holder_tid) != 0)
+    return;
+  bpf_map_delete_elem(s_fd_blocked_by, &waiter_tid);
+
+  uint32_t count = 0;
+  if (bpf_map_lookup_elem(s_fd_lock_holder, &holder_tid, &count) == 0) {
+    if (count > 1) {
+      count--;
+      bpf_map_update_elem(s_fd_lock_holder, &holder_tid, &count, BPF_EXIST);
+    } else {
+      bpf_map_delete_elem(s_fd_lock_holder, &holder_tid);
+    }
+  }
+}
+
+void thread_job_begin(THD *thd, bool time_sensitive) {
   if (!s_connected || thd == nullptr) return;
 
-  uint32_t count = holder_wait_count(thd);
-  if (count == 0) return;
-
   int32_t tid = current_tid();
-  bpf_map_update_elem(s_fd_lock_holder, &tid, &count, BPF_ANY);
-  s_thread_pub.published = true;
-  s_thread_pub.tid = tid;
+
+  /* Resource-group tier mapping.  In the coroutine architecture the OS
+   * thread changes between a session's statements, so a group's priority
+   * (Linux: nice, 0..19 for user groups) is published per job:
+   *   priority > 0  (low urgency, e.g. a batch/analytics group) → BG tier
+   *   priority < 0  (high urgency, admin groups)               → TS tier
+   * The nice value itself is also published to the scheduler's rg_prio
+   * map, which weights vtime inside the normal tier. */
+  {
+    auto ctx = thd->resource_group_ctx();
+    resourcegroups::Resource_group *rg =
+        ctx ? ctx->m_cur_resource_group : nullptr;
+    if (rg != nullptr && rg->enabled()) {
+      int prio = rg->controller()->priority();
+      if (prio != 0) {
+        int32_t val = prio;
+        bpf_map_update_elem(s_fd_rg_prio, &tid, &val, BPF_ANY);
+        int32_t tier = (prio > 0) ? kTierBG : kTierTS;
+        bpf_map_update_elem(s_fd_task_tier, &tid, &tier, BPF_ANY);
+        s_thread_pub.published_rg_tier = true;
+      }
+    }
+  }
+
+  uint32_t count = holder_wait_count(thd);
+  if (count > 0) {
+    bpf_map_update_elem(s_fd_lock_holder, &tid, &count, BPF_ANY);
+    s_thread_pub.published = true;
+    s_thread_pub.tid = tid;
+  }
+
+  /* High-priority (lock-holder) jobs run at time-sensitive priority for
+   * their duration: the DB-level HP queue decision is propagated to the
+   * OS scheduler, so the job also preempts normal work on its CPU.
+   * This overrides a resource-group BG tier: the holder's COMMIT must
+   * drain so blocked waiters can proceed. */
+  if (time_sensitive) {
+    int32_t ts = kTierTS;
+    bpf_map_update_elem(s_fd_task_tier, &tid, &ts, BPF_ANY);
+    s_thread_pub.published_ts_tier = true;
+    s_thread_pub.tid = tid;
+  }
 }
 
 void thread_job_end(THD *thd) {
   if (!s_connected || thd == nullptr) return;
-  if (!s_thread_pub.published) return;
+  if (!s_thread_pub.published && !s_thread_pub.published_ts_tier &&
+      !s_thread_pub.published_rg_tier)
+    return;
 
   int32_t tid = s_thread_pub.tid;
-  bpf_map_delete_elem(s_fd_lock_holder, &tid);
-  s_thread_pub.published = false;
+  if (tid < 0) tid = current_tid();
+  if (s_thread_pub.published) {
+    bpf_map_delete_elem(s_fd_lock_holder, &tid);
+    s_thread_pub.published = false;
+  }
+  if (s_thread_pub.published_rg_tier) {
+    bpf_map_delete_elem(s_fd_rg_prio, &tid);
+  }
+  if (s_thread_pub.published_ts_tier || s_thread_pub.published_rg_tier) {
+    bpf_map_delete_elem(s_fd_task_tier, &tid);
+  }
+  s_thread_pub.published_ts_tier = false;
+  s_thread_pub.published_rg_tier = false;
   s_thread_pub.tid = -1;
 }
+
+void set_thread_tier(int tier) {
+  if (!s_connected) return;
+  int32_t tid = current_tid();
+  if (tier == kTierNormal) {
+    bpf_map_delete_elem(s_fd_task_tier, &tid);
+  } else {
+    int32_t val = tier;
+    bpf_map_update_elem(s_fd_task_tier, &tid, &val, BPF_ANY);
+  }
+}
+
+void clear_thread_tier() { set_thread_tier(kTierNormal); }
 
 void commit_begin() {
   if (!s_connected) return;
@@ -437,6 +566,8 @@ void init() {
   s_fd_blocked_by  = open_map(kMapBlockedBy);
   s_fd_lock_holder = open_map(kMapLockHolder);
   s_fd_rg_prio     = open_map(kMapRgPrio);
+  /* task_tier is new; tolerate its absence (older scheduler build). */
+  s_fd_task_tier   = open_map(kMapTaskTier);
 
   if (s_fd_commit_vip >= 0 && s_fd_blocked_by >= 0 &&
       s_fd_lock_holder >= 0 && s_fd_rg_prio >= 0) {
@@ -447,10 +578,12 @@ void init() {
     close_map(s_fd_blocked_by);
     close_map(s_fd_lock_holder);
     close_map(s_fd_rg_prio);
+    close_map(s_fd_task_tier);
     s_fd_commit_vip  = -1;
     s_fd_blocked_by  = -1;
     s_fd_lock_holder = -1;
     s_fd_rg_prio     = -1;
+    s_fd_task_tier   = -1;
     s_connected = false;
   }
 }

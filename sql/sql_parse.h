@@ -103,7 +103,8 @@ bool is_explainable_query(enum enum_sql_command command);
 bool is_log_table_write_query(enum enum_sql_command command);
 bool alloc_query(THD *thd, const char *packet, size_t packet_length);
 void dispatch_sql_command(THD *thd, Parser_state *parser_state,
-                          bool is_retry = false);
+                          bool is_retry = false, bool already_parsed = false,
+                          bool parse_only = false);
 void mysql_reset_thd_for_next_command(THD *thd);
 void create_table_set_open_action_and_adjust_tables(LEX *lex);
 void add_automatic_sp_privileges(THD *thd, enum_sp_type sp_type,
@@ -113,8 +114,17 @@ bool remove_automatic_sp_privileges(THD *thd, enum_sp_type sp_type,
                                     const char *sp_name);
 int mysql_execute_command(THD *thd, bool first_level = false);
 bool do_command(THD *thd);
+bool parse_com_query(THD *thd, COM_DATA *com_data,
+                     enum enum_server_command *command,
+                     Parser_state *parser_state, bool *ready);
+bool execute_parsed_command(THD *thd, const COM_DATA *com_data,
+                            enum enum_server_command command,
+                            Parser_state *parser_state);
 bool dispatch_command(THD *thd, const COM_DATA *com_data,
-                      enum enum_server_command command);
+                      enum enum_server_command command,
+                      Parser_state *pre_parsed = nullptr,
+                      Parser_state *parse_only_state = nullptr,
+                      bool *parse_completed = nullptr);
 bool prepare_index_and_data_dir_path(THD *thd, const char **data_file_name,
                                      const char **index_file_name,
                                      const char *table_name);

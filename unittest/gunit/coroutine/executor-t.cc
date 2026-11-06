@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <sched.h>
 #include <set>
 #include <thread>
 #include <vector>
@@ -289,6 +290,129 @@ TEST(ExecutorPoolTest, VipCountClamped) {
   pool.join();
 
   EXPECT_EQ(counter.load(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// CPU pinning tests
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Capture each worker's effective affinity from the on_start hook (which
+// runs at the top of every worker loop, after pinning).
+struct AffinityRecorder {
+  std::mutex mu;
+  std::vector<cpu_set_t> masks;
+
+  void record() {
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
+      std::lock_guard<std::mutex> lock(mu);
+      masks.push_back(mask);
+    }
+  }
+
+  size_t count() {
+    std::lock_guard<std::mutex> lock(mu);
+    return masks.size();
+  }
+};
+
+cpu_set_t process_allowed() {
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+    CPU_SET(0, &allowed);  // fallback; assertion below still single-CPU
+  }
+  return allowed;
+}
+
+}  // namespace
+
+// Every pinned worker must end up pinned to exactly one CPU that is part
+// of the process's allowed set.  Regression test for the old
+// cpu = cpu_offset + idx scheme, which silently failed (EINVAL) for
+// workers with idx >= n_allowed on oversubscribed pools.
+TEST(ExecutorPoolTest, PinnedWorkersStayInAllowedSet) {
+  cpu_set_t allowed = process_allowed();
+  int n_allowed = CPU_COUNT(&allowed);
+  ASSERT_GE(n_allowed, 1);
+
+  // Oversubscribe: more workers than allowed CPUs (like the 4× pool the
+  // connection handler creates).  Round-robin placement must keep every
+  // worker pinned instead of failing past n_allowed.
+  constexpr size_t kNumWorkers = 32;
+  ExecutorPool pool(kNumWorkers, 0);
+
+  AffinityRecorder recorder;
+  ExecutorPool::ThreadHooks hooks;
+  hooks.on_start = [&recorder] { recorder.record(); };
+  pool.set_thread_hooks(std::move(hooks));
+
+  pool.start();
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (recorder.count() < kNumWorkers &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  pool.stop();
+  pool.join();
+
+  ASSERT_EQ(recorder.count(), kNumWorkers);
+  for (const auto &mask : recorder.masks) {
+    EXPECT_EQ(CPU_COUNT(&mask), 1) << "worker not pinned to a single CPU";
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+      if (CPU_ISSET(cpu, &mask)) {
+        EXPECT_TRUE(CPU_ISSET(cpu, &allowed))
+            << "worker pinned to CPU " << cpu << " outside allowed set";
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Submit → run latency histogram tests
+// ---------------------------------------------------------------------------
+
+TEST(ExecutorPoolTest, LatencyHistogramRecorded) {
+  ExecutorPool pool(2, ExecutorPool::kNoPinning);
+  std::atomic<int> counter{0};
+  constexpr int kNumJobs = 50;
+
+  pool.start();
+  for (int i = 0; i < kNumJobs; ++i) {
+    pool.submit([&counter] { counter.fetch_add(1, std::memory_order_relaxed); });
+  }
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (counter.load(std::memory_order_relaxed) < kNumJobs &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  pool.stop();
+  pool.join();
+
+  EXPECT_EQ(counter.load(), kNumJobs);
+
+  // Every completed job contributed exactly one histogram sample.
+  EXPECT_EQ(pool.latency_count(), static_cast<uint64_t>(kNumJobs));
+  uint64_t bucket_sum = 0;
+  for (size_t i = 0; i < ExecutorPool::kNumLatencyBuckets; ++i) {
+    bucket_sum += pool.latency_bucket_count(i);
+  }
+  EXPECT_EQ(bucket_sum, static_cast<uint64_t>(kNumJobs));
+  // Total accumulated latency is consistent with the sample count.
+  EXPECT_LE(pool.latency_total_us() / (kNumJobs ? kNumJobs : 1), 1000000u);
+}
+
+TEST(ExecutorPoolTest, LatencyHistogramEmptyPool) {
+  ExecutorPool pool(1, ExecutorPool::kNoPinning);
+  // No jobs submitted: counters stay at zero.
+  EXPECT_EQ(pool.latency_count(), 0u);
+  EXPECT_EQ(pool.latency_total_us(), 0u);
+  for (size_t i = 0; i < ExecutorPool::kNumLatencyBuckets; ++i) {
+    EXPECT_EQ(pool.latency_bucket_count(i), 0u);
+  }
 }
 
 }  // namespace

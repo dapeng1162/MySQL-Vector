@@ -1344,7 +1344,10 @@ void bind_fields(Item *first) {
     1  request of thread shutdown (see dispatch_command() description)
 */
 
-bool do_command(THD *thd) {
+static bool do_command_impl(THD *thd, Parser_state *parser_state,
+                            COM_DATA *com_data_out,
+                            enum enum_server_command *command_out,
+                            bool *ready) {
   bool return_value;
   int rc;
   NET *net = nullptr;
@@ -1488,15 +1491,44 @@ bool do_command(THD *thd) {
 
   DEBUG_SYNC(thd, "before_command_dispatch");
 
-  return_value = dispatch_command(thd, &com_data, command);
+  return_value = dispatch_command(
+      thd, &com_data, command, /*pre_parsed=*/nullptr,
+      /*parse_only_state=*/parser_state, /*parse_completed=*/ready);
   thd->get_protocol_classic()->get_output_packet()->shrink(
       thd->variables.net_buffer_length);
 
+  if (parser_state != nullptr) {
+    if (!return_value && *ready) {
+      *com_data_out = com_data;
+      *command_out = command;
+    }
+    return return_value;
+  }
+
 out:
   /* The statement instrumentation must be closed in all cases. */
-  assert(thd->m_digest == nullptr);
-  assert(thd->m_statement_psi == nullptr);
+  if (parser_state == nullptr) {
+    assert(thd->m_digest == nullptr);
+    assert(thd->m_statement_psi == nullptr);
+  }
   return return_value;
+}
+
+bool do_command(THD *thd) {
+  return do_command_impl(thd, nullptr, nullptr, nullptr, nullptr);
+}
+
+bool parse_com_query(THD *thd, COM_DATA *com_data,
+                     enum enum_server_command *command,
+                     Parser_state *parser_state, bool *ready) {
+  *ready = false;
+  return do_command_impl(thd, parser_state, com_data, command, ready);
+}
+
+bool execute_parsed_command(THD *thd, const COM_DATA *com_data,
+                            enum enum_server_command command,
+                            Parser_state *parser_state) {
+  return dispatch_command(thd, com_data, command, parser_state);
 }
 
 /**
@@ -1750,7 +1782,12 @@ static void copy_bind_parameter_values(THD *thd, PS_PARAM *parameters,
         COM_QUIT
 */
 bool dispatch_command(THD *thd, const COM_DATA *com_data,
-                      enum enum_server_command command) {
+                      enum enum_server_command command,
+                      Parser_state *pre_parsed,
+                      Parser_state *parse_only_state,
+                      bool *parse_completed) {
+  const bool parse_only = parse_only_state != nullptr;
+  if (parse_completed != nullptr) *parse_completed = false;
   assert(thd->lex->m_IS_table_stats.is_valid() == false);
   assert(thd->lex->m_IS_tablespace_stats.is_valid() == false);
 #ifndef NDEBUG
@@ -1765,6 +1802,12 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
   DBUG_PRINT("info", ("command: %d", command));
 
   Sql_cmd_clone *clone_cmd = nullptr;
+
+  if (pre_parsed != nullptr) {
+    assert(command == COM_QUERY);
+    assert(!parse_only);
+    goto command_dispatch;
+  }
 
   /* SHOW PROFILE instrumentation, begin */
 #if defined(ENABLED_PROFILING)
@@ -1890,6 +1933,7 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
     MYSQL_NOTIFY_STATEMENT_QUERY_ATTRIBUTES(thd->m_statement_psi, false);
   }
 
+command_dispatch:
   switch (command) {
     case COM_INIT_DB: {
       LEX_STRING tmp;
@@ -2099,57 +2143,71 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
         Every execution path for COM_QUERY should call once
           MYSQL_NOTIFY_STATEMENT_QUERY_ATTRIBUTES()
       */
-      assert(thd->m_digest == nullptr);
-      thd->m_digest = &thd->m_digest_state;
-      thd->m_digest->reset(thd->m_token_array, max_digest_length);
+      Parser_state local_parser_state;
+      Parser_state &parser_state =
+          pre_parsed != nullptr
+              ? *pre_parsed
+              : (parse_only_state != nullptr ? *parse_only_state
+                                             : local_parser_state);
 
-      if (alloc_query(thd, com_data->com_query.query,
-                      com_data->com_query.length)) {
-        MYSQL_NOTIFY_STATEMENT_QUERY_ATTRIBUTES(thd->m_statement_psi, false);
-        break;  // fatal error is set
+      if (pre_parsed == nullptr) {
+        assert(thd->m_digest == nullptr);
+        thd->m_digest = &thd->m_digest_state;
+        thd->m_digest->reset(thd->m_token_array, max_digest_length);
+
+        if (alloc_query(thd, com_data->com_query.query,
+                        com_data->com_query.length)) {
+          MYSQL_NOTIFY_STATEMENT_QUERY_ATTRIBUTES(thd->m_statement_psi, false);
+          break;  // fatal error is set
+        }
+
+        if (opt_general_log_raw)
+          query_logger.general_log_write(thd, command, thd->query().str,
+                                         thd->query().length);
+
+        DBUG_PRINT("query", ("%-.4096s", thd->query().str));
+
+#if defined(ENABLED_PROFILING)
+        thd->profiling->set_query_source(thd->query().str, thd->query().length);
+#endif
+
+        if (parser_state.init(thd, thd->query().str, thd->query().length)) {
+          MYSQL_NOTIFY_STATEMENT_QUERY_ATTRIBUTES(thd->m_statement_psi, false);
+          break;
+        }
+
+        parser_state.m_input.m_has_digest = true;
+
+        // we produce digest if it's not explicitly turned off
+        // by setting maximum digest length to zero
+        if (get_max_digest_length() != 0)
+          parser_state.m_input.m_compute_digest = true;
+        /*
+          Initially, set up the statement for preparation and optimization
+          in the primary storage engine. If an eligible secondary storage
+          engine is found, the statement may be reprepared for the secondary
+          storage engine later. In addition, open_secondary_engine_tables()
+          will directly set up for the secondary storage engine if secondary
+          engine is forced.
+        */
+        thd->set_secondary_engine_optimization(
+            Secondary_engine_optimization::PRIMARY_TENTATIVELY);
+
+        copy_bind_parameter_values(thd, com_data->com_query.parameters,
+                                   com_data->com_query.parameter_count);
       }
 
       const char *packet_end = thd->query().str + thd->query().length;
-
-      if (opt_general_log_raw)
-        query_logger.general_log_write(thd, command, thd->query().str,
-                                       thd->query().length);
-
-      DBUG_PRINT("query", ("%-.4096s", thd->query().str));
-
-#if defined(ENABLED_PROFILING)
-      thd->profiling->set_query_source(thd->query().str, thd->query().length);
-#endif
-
       const LEX_CSTRING orig_query = thd->query();
 
-      Parser_state parser_state;
-      if (parser_state.init(thd, thd->query().str, thd->query().length)) {
-        MYSQL_NOTIFY_STATEMENT_QUERY_ATTRIBUTES(thd->m_statement_psi, false);
-        break;
-      }
-
-      parser_state.m_input.m_has_digest = true;
-
-      // we produce digest if it's not explicitly turned off
-      // by setting maximum digest length to zero
-      if (get_max_digest_length() != 0)
-        parser_state.m_input.m_compute_digest = true;
-      /*
-        Initially, set up the statement for preparation and optimization
-        in the primary storage engine. If an eligible secondary storage engine
-        is found, the statement may be reprepared for the secondary storage
-        engine later. In addition, open_secondary_engine_tables() will directly
-        set up for the secondary storage engine if secondary engine is forced.
-      */
-      thd->set_secondary_engine_optimization(
-          Secondary_engine_optimization::PRIMARY_TENTATIVELY);
-
-      copy_bind_parameter_values(thd, com_data->com_query.parameters,
-                                 com_data->com_query.parameter_count);
-
       /* This will call MYSQL_NOTIFY_STATEMENT_QUERY_ATTRIBUTES() */
-      dispatch_sql_command(thd, &parser_state);
+      dispatch_sql_command(thd, &parser_state, /*is_retry=*/false,
+                           /*already_parsed=*/pre_parsed != nullptr,
+                           parse_only);
+      if (parse_only) {
+        if (parse_completed != nullptr) *parse_completed = true;
+        return false;
+      }
 
       // If statement failed, possibly restart it in another storage engine.
       if (thd->is_error()) {
@@ -5304,50 +5362,54 @@ void statement_id_to_session(THD *thd) {
                       already logged in the first round.
 */
 
-void dispatch_sql_command(THD *thd, Parser_state *parser_state, bool is_retry) {
+void dispatch_sql_command(THD *thd, Parser_state *parser_state, bool is_retry,
+                          bool already_parsed, bool parse_only) {
   DBUG_TRACE;
   DBUG_PRINT("dispatch_sql_command", ("query: '%s'", thd->query().str));
-  statement_id_to_session(thd);
-  DBUG_EXECUTE_IF("parser_debug", turn_parser_debug_on(););
-
-  mysql_reset_thd_for_next_command(thd);
-  // It is possible that rewritten query may not be empty (in case of
-  // multiqueries). So reset it.
-  thd->reset_rewritten_query();
-  lex_start(thd);
-
-  thd->m_parser_state = parser_state;
-  invoke_pre_parse_rewrite_plugins(thd);
-  thd->m_parser_state = nullptr;
-
-  // we produce digest if it's not explicitly turned off
-  // by setting maximum digest length to zero
-  if (get_max_digest_length() != 0)
-    parser_state->m_input.m_compute_digest = true;
 
   LEX *lex = thd->lex;
   const char *found_semicolon = nullptr;
-
   bool err = thd->get_stmt_da()->is_error();
   size_t qlen = 0;
 
-  if (!err) {
-    err = parse_sql(thd, parser_state, nullptr);
-    if (!err) err = invoke_post_parse_rewrite_plugins(thd, false);
+  if (!already_parsed) {
+    statement_id_to_session(thd);
+    DBUG_EXECUTE_IF("parser_debug", turn_parser_debug_on(););
 
-    found_semicolon = parser_state->m_lip.found_semicolon;
-    qlen = found_semicolon ? (found_semicolon - thd->query().str)
-                           : thd->query().length;
-    /*
-      We set thd->query_length correctly to not log several queries, when we
-      execute only first. We set it to not see the ';' otherwise it would get
-      into binlog and Query_log_event::print() would give ';;' output.
-    */
+    mysql_reset_thd_for_next_command(thd);
+    // It is possible that rewritten query may not be empty (in case of
+    // multiqueries). So reset it.
+    thd->reset_rewritten_query();
+    lex_start(thd);
 
-    if (!thd->is_error() && found_semicolon && (ulong)(qlen)) {
-      thd->set_query(thd->query().str, qlen - 1);
+    thd->m_parser_state = parser_state;
+    invoke_pre_parse_rewrite_plugins(thd);
+    thd->m_parser_state = nullptr;
+
+    // we produce digest if it's not explicitly turned off
+    // by setting maximum digest length to zero
+    if (get_max_digest_length() != 0)
+      parser_state->m_input.m_compute_digest = true;
+
+    if (!err) {
+      err = parse_sql(thd, parser_state, nullptr);
+      if (!err) err = invoke_post_parse_rewrite_plugins(thd, false);
     }
   }
+
+  found_semicolon = parser_state->m_lip.found_semicolon;
+  qlen = found_semicolon ? (found_semicolon - thd->query().str)
+                         : thd->query().length;
+  /*
+    We set thd->query_length correctly to not log several queries, when we
+    execute only first. We set it to not see the ';' otherwise it would get
+    into binlog and Query_log_event::print() would give ';;' output.
+  */
+  if (!parse_only && !thd->is_error() && found_semicolon && (ulong)(qlen)) {
+    thd->set_query(thd->query().str, qlen - 1);
+  }
+
+  if (parse_only) return;
 
   DEBUG_SYNC_C("sql_parse_before_rewrite");
 

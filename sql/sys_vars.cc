@@ -105,6 +105,7 @@
 #include "sql/clone_handler.h"
 #include "sql/conn_handler/connection_handler_impl.h"  // Per_thread_connection_handler
 #include "sql/conn_handler/connection_handler_manager.h"  // Connection_handler_manager
+#include "sql/conn_handler/coroutine_connection_handler.h"  // coroutine_executor_threads / coroutine_executor_vip_workers
 #include "sql/conn_handler/socket_connection.h"  // MY_BIND_ALL_ADDRESSES
 #include "sql/derror.h"                          // read_texts
 #include "sql/discrete_interval.h"
@@ -3926,6 +3927,51 @@ static Sys_var_enum Sys_thread_handling(
     "one-thread-per-connection, no-threads, loaded-dynamically",
     READ_ONLY GLOBAL_VAR(Connection_handler_manager::thread_handling),
     CMD_LINE(REQUIRED_ARG), thread_handling_names, DEFAULT(0));
+
+static Sys_var_ulong Sys_coroutine_executor_threads(
+    "coroutine_executor_threads",
+    "Number of executor worker threads for thread_handling=coroutine-epoll. "
+    "0 = auto (max(4 * hardware_concurrency, 16)). "
+    "Takes effect at server startup.",
+    READ_ONLY GLOBAL_VAR(coroutine_executor_threads),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 4096), DEFAULT(0), BLOCK_SIZE(1));
+
+static Sys_var_ulong Sys_coroutine_executor_vip_workers(
+    "coroutine_executor_vip_workers",
+    "Number of VIP workers consuming only the high-priority queue "
+    "(lock-holder COMMIT/ROLLBACK jobs) in coroutine-epoll mode. "
+    "Clamped to coroutine_executor_threads - 1. "
+    "Takes effect at server startup.",
+    READ_ONLY GLOBAL_VAR(coroutine_executor_vip_workers),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 64), DEFAULT(1), BLOCK_SIZE(1));
+
+static Sys_var_ulong Sys_coroutine_reactor_threads(
+    "coroutine_reactor_threads",
+    "Number of reactor threads (sharded epoll frontends) for "
+    "thread_handling=coroutine-epoll. Each connection is pinned to one "
+    "reactor for its lifetime (fd % coroutine_reactor_threads). "
+    "Takes effect at server startup.",
+    READ_ONLY GLOBAL_VAR(coroutine_reactor_threads),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 64), DEFAULT(1), BLOCK_SIZE(1));
+
+static Sys_var_bool Sys_coroutine_reactor_parse(
+    "coroutine_reactor_parse",
+    "Parse complete, uncompressed COM_QUERY packets on the owning reactor "
+    "before handing the parsed statement to an executor worker. Incomplete, "
+    "TLS, compressed, and non-COM_QUERY packets use the normal worker path. "
+    "Takes effect immediately.",
+    GLOBAL_VAR(coroutine_reactor_parse), CMD_LINE(OPT_ARG), DEFAULT(false));
+
+static Sys_var_ulong Sys_coroutine_admission_queue_time_us(
+    "coroutine_admission_queue_time_us",
+    "Admission control for coroutine-epoll: target maximum submit-to-run "
+    "queue time in microseconds. When the measured queue time exceeds it, "
+    "admission credits shrink multiplicatively; new commands wait in the "
+    "reactor instead of flooding the executor pool. 0 disables admission "
+    "control. Takes effect immediately.",
+    GLOBAL_VAR(coroutine_admission_queue_time_us),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 1000000000), DEFAULT(2000),
+    BLOCK_SIZE(1));
 
 static Sys_var_charptr Sys_secure_file_priv(
     "secure_file_priv",

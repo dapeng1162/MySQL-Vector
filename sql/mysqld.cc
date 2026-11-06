@@ -8615,12 +8615,26 @@ static int init_server_components() {
   delete_optimizer_cost_module();
 
   LEX_CSTRING plugin_name = {STRING_WITH_LEN("thread_pool")};
-  if (Connection_handler_manager::thread_handling !=
-          Connection_handler_manager::SCHEDULER_ONE_THREAD_PER_CONNECTION ||
+  /* Resource groups are supported with dedicated per-connection threads and
+   * with the coroutine scheduler.  In coroutine mode the group assignment is
+   * tracked per THD only and propagated to the OS scheduler through the
+   * sched_ext bridge (see coroutine_scheduler_active()); thread controls are
+   * never applied to the shared executor workers. */
+  const ulong active_thread_handling =
+      Connection_handler_manager::thread_handling;
+  const bool rg_compatible_handling =
+      active_thread_handling ==
+              Connection_handler_manager::SCHEDULER_ONE_THREAD_PER_CONNECTION ||
+      active_thread_handling ==
+          Connection_handler_manager::SCHEDULER_COROUTINE_EPOLL;
+  if (!rg_compatible_handling ||
       plugin_is_ready(plugin_name, MYSQL_DAEMON_PLUGIN)) {
     auto res_grp_mgr = resourcegroups::Resource_group_mgr::instance();
     res_grp_mgr->disable_resource_group();
-    res_grp_mgr->set_unsupport_reason("Thread pool plugin enabled");
+    res_grp_mgr->set_unsupport_reason(
+        plugin_is_ready(plugin_name, MYSQL_DAEMON_PLUGIN)
+            ? "Thread pool plugin enabled"
+            : "Unsupported thread handling");
   }
 
   /*
@@ -11391,12 +11405,112 @@ static int show_coroutine_hp_jobs_submitted(THD *, SHOW_VAR *var,
   return 0;
 }
 
+static int show_coroutine_admission_deferred(THD *, SHOW_VAR *var,
+                                              char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) =
+      static_cast<long>(Coroutine_connection_handler::admission_deferred());
+  return 0;
+}
+
+static int show_coroutine_reactor_parsed(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) =
+      static_cast<long>(Coroutine_connection_handler::reactor_parsed());
+  return 0;
+}
+
 static int show_coroutine_hp_jobs_executed(THD *, SHOW_VAR *var,
                                             char *buff) {
   var->type = SHOW_LONG;
   var->value = buff;
   *reinterpret_cast<long *>(buff) =
       static_cast<long>(Coroutine_connection_handler::hp_jobs_executed());
+  return 0;
+}
+
+static int show_coroutine_submit_to_run_avg_us(THD *, SHOW_VAR *var,
+                                               char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) =
+      static_cast<long>(Coroutine_connection_handler::submit_to_run_avg_us());
+  return 0;
+}
+
+static int show_coroutine_submit_to_run_total(THD *, SHOW_VAR *var,
+                                              char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) =
+      static_cast<long>(Coroutine_connection_handler::submit_to_run_total());
+  return 0;
+}
+
+// Submit → run latency histogram buckets.  Edges in µs:
+// (0,5] (5,10] (10,25] (25,50] (50,100] (100,500] (500,∞).
+static int show_coroutine_submit_to_run_bucket_0(THD *, SHOW_VAR *var,
+                                                 char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      Coroutine_connection_handler::submit_to_run_bucket(0));
+  return 0;
+}
+
+static int show_coroutine_submit_to_run_bucket_1(THD *, SHOW_VAR *var,
+                                                 char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      Coroutine_connection_handler::submit_to_run_bucket(1));
+  return 0;
+}
+
+static int show_coroutine_submit_to_run_bucket_2(THD *, SHOW_VAR *var,
+                                                 char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      Coroutine_connection_handler::submit_to_run_bucket(2));
+  return 0;
+}
+
+static int show_coroutine_submit_to_run_bucket_3(THD *, SHOW_VAR *var,
+                                                 char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      Coroutine_connection_handler::submit_to_run_bucket(3));
+  return 0;
+}
+
+static int show_coroutine_submit_to_run_bucket_4(THD *, SHOW_VAR *var,
+                                                 char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      Coroutine_connection_handler::submit_to_run_bucket(4));
+  return 0;
+}
+
+static int show_coroutine_submit_to_run_bucket_5(THD *, SHOW_VAR *var,
+                                                 char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      Coroutine_connection_handler::submit_to_run_bucket(5));
+  return 0;
+}
+
+static int show_coroutine_submit_to_run_bucket_6(THD *, SHOW_VAR *var,
+                                                 char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      Coroutine_connection_handler::submit_to_run_bucket(6));
   return 0;
 }
 
@@ -11835,6 +11949,9 @@ SHOW_VAR status_vars[] = {
      SHOW_SCOPE_GLOBAL},
     {"Coroutine_executor_threads", (char *)&show_coroutine_executor_threads,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Coroutine_admission_deferred",
+     (char *)&show_coroutine_admission_deferred, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
     {"Coroutine_hp_jobs_executed",
      (char *)&show_coroutine_hp_jobs_executed, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
@@ -11846,6 +11963,35 @@ SHOW_VAR status_vars[] = {
      SHOW_SCOPE_GLOBAL},
     {"Coroutine_reactor_events", (char *)&show_coroutine_reactor_events,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Coroutine_reactor_parsed", (char *)&show_coroutine_reactor_parsed,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Coroutine_submit_to_run_avg_us",
+     (char *)&show_coroutine_submit_to_run_avg_us, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_submit_to_run_bucket_0_5us",
+     (char *)&show_coroutine_submit_to_run_bucket_0, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_submit_to_run_bucket_5_10us",
+     (char *)&show_coroutine_submit_to_run_bucket_1, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_submit_to_run_bucket_10_25us",
+     (char *)&show_coroutine_submit_to_run_bucket_2, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_submit_to_run_bucket_25_50us",
+     (char *)&show_coroutine_submit_to_run_bucket_3, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_submit_to_run_bucket_50_100us",
+     (char *)&show_coroutine_submit_to_run_bucket_4, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_submit_to_run_bucket_100_500us",
+     (char *)&show_coroutine_submit_to_run_bucket_5, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_submit_to_run_bucket_gt_500us",
+     (char *)&show_coroutine_submit_to_run_bucket_6, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_submit_to_run_total",
+     (char *)&show_coroutine_submit_to_run_total, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
     {"Count_hit_query_past_connection_memory_status_limit",
      (char *)&show_count_hit_query_past_conn_mem_status_limit, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},

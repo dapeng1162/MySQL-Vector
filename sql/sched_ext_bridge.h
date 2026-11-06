@@ -58,6 +58,7 @@
 #define SQL_SCHED_EXT_BRIDGE_INCLUDED
 
 #include "my_thread_local.h"  // my_thread_id
+#include <thread>  // std::thread::id for latch wait edges
 
 class THD;
 
@@ -91,6 +92,16 @@ void thread_start();
 void thread_end();
 
 /**
+  Latch (InnoDB internal mutex/rw-lock) wait edges, published by the waiter
+  on its sync-array wait path.  owner is the latch holder's std::thread::id
+  (TTASEventMutex::peek_owner()); it is resolved to an OS tid through the
+  std::thread::id registry populated by thread_start().  Unresolvable
+  holders (threads that never called thread_start) are skipped safely.
+*/
+void latch_wait_begin(std::thread::id owner);
+void latch_wait_end();
+
+/**
   Called from the coroutine executor pool around each THD job
   (do_command / auth), on the executor thread running the job, after
   store_globals() / before restore_globals().
@@ -104,10 +115,13 @@ void thread_end();
 
   thread_job_begin(thd): if other transactions are waiting on locks held by
   @c thd, publish lock_holder[current_tid] = wait_count (and blocked_by for
-  waiters currently running).
+  waiters currently running).  When @c time_sensitive is true (high-priority
+  queue jobs, e.g. a lock holder's COMMIT), additionally publish
+  task_tier[current_tid] = TIER_TS for the duration of the job so the
+  scheduler applies its bounded virtual-deadline bonus.
   thread_job_end(thd): remove whatever this thread published for @c thd.
 */
-void thread_job_begin(THD *thd);
+void thread_job_begin(THD *thd, bool time_sensitive = false);
 void thread_job_end(THD *thd);
 
 /**
@@ -138,6 +152,26 @@ void lock_wait_end(THD *waiter);
 void lock_holder_add(my_thread_id holder_tid);
 void lock_holder_remove(my_thread_id holder_tid);
 
+/**
+  Set the current thread's scheduling tier in the task_tier BPF map.
+  Tier values (must match scx_db_sched.bpf.c):
+    0 = TIER_TS     time-sensitive: bounded virtual-deadline bonus
+    1 = TIER_NORMAL default
+    2 = TIER_BG     lower weight, subject to the same fairness accounting
+  Called once from a thread's entry point (reactor, InnoDB background
+  threads) or around a high-priority job's execution on an executor
+  worker.  No-op when the bridge is not connected.
+*/
+void set_thread_tier(int tier);
+
+/** Clear the current thread's tier entry (back to NORMAL). */
+void clear_thread_tier();
+
+/** Tier constants for set_thread_tier(). */
+constexpr int kTierTS = 0;
+constexpr int kTierNormal = 1;
+constexpr int kTierBG = 2;
+
 /** Set the current thread's resource-group priority (nice-like, lower =
  *  higher priority). */
 void set_priority(int nice);
@@ -167,10 +201,14 @@ inline void commit_begin() {}
 inline void commit_end() {}
 inline void thread_start() {}
 inline void thread_end() {}
-inline void thread_job_begin(THD *) {}
+inline void latch_wait_begin(std::thread::id) {}
+inline void latch_wait_end() {}
+inline void thread_job_begin(THD *, bool) {}
 inline void thread_job_end(THD *) {}
 inline void lock_holder_add(my_thread_id) {}
 inline void lock_holder_remove(my_thread_id) {}
+inline void set_thread_tier(int) {}
+inline void clear_thread_tier() {}
 inline void set_priority(int) {}
 inline void init() {}
 }  // namespace sched_ext

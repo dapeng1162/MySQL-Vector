@@ -289,6 +289,125 @@ VIP 不饿死普通任务、num_vip 钳制）。
 由云端验证捕获。锁序约束：`s_wait_mu` 为叶子锁，**任何 BPF map 写入必须在
 释放它之后进行**（`lock_wait_begin/end` 均为 scoped lock + 释放后发布）。
 
+### v3：三层任务模型（TS / Normal / BG）——对 UFS 论文双重调度问题的回答
+
+**背景**：v2 解决了"持锁者活性"，但 OS 与 DB 两层调度器仍然互不知情。以
+UFS 论文（arXiv 2605.02377，分层 sched_ext 调度）的视角检视本架构：网络 IO
+协程（reactor 线程）与执行线程共享同一组 CPU，DB 层无法把自己的优先级意图
+传达给 CFS；反向，CFS 的公平份额会把 InnoDB 后台任务（purge、dict stats、
+FTS）与前台事务一视同仁地调度。实测两类证据（本地 aarch64 10 核，C2 配置）：
+
+- `Coroutine_submit_to_run` 延迟直方图：队列深度为 0 时仍有 33% 的 job 落在
+  100-500µs 桶、8k+ 个 >500µs——**worker 线程被 OS 抢走/迁移**，而非排队；
+- 外部 CPU 噪声（B7）下 open-loop 点查 p99 0.59ms → 7.84ms（13×）、max 到
+  96ms——OS 层无保护，DB 层 HP 队列管不到 CPU。
+
+**v3 设计：DB 意图 → OS 调度器的单向发布 + 内核侧 tier 模型**
+
+1. **用户态三级 tier**（`mysql_sched_tier.h`，C 接口）：
+   `TIER_TS=0`（time-sensitive：reactor 线程、HP/锁持有 job、COMMIT 路径）、
+   `TIER_NORMAL=1`（默认）、`TIER_BG=2`（purge/dict stats/FTS/monitor 等后台
+   线程 + 低优先级 resource group 的会话）。
+2. **发布通道**：`sched_ext_bridge::thread_job_begin(thd, time_sensitive)` 在
+   job 粒度把 tier 写入 `task_tier` BPF map（key=执行 tid）；后台线程入口一次性
+   `mysql_sched_set_thread_tier(MYSQL_SCHED_TIER_BG)`；resource group 映射
+   （`m_cur_resource_group` 的 `priority`：<0 → TS、>0 → BG，同时写 `rg_prio`）。
+3. **内核侧**（`scx_db_sched.bpf.c`）：三层 DSQ 模型
+   `COMMIT_VIP_DSQ（TS）→ SHARED_DSQ（Normal, vtime）→ BG_DSQ（vtime）`；
+   TS 入队即 `scx_bpf_kick_cpu(SCX_KICK_PREEMPT)` 抢占当前 CPU；BG 仅在
+   SHARED 空或超过 `BG_GUARANTEE_NS=100ms` 保底窗口时放行（防饿死，benchmark
+   中监控 history list length 确认 purge 没有被饿出问题）。
+4. **coroutine 模式下的 resource group 修复**（前置条件）：上游在
+   `mysqld.cc` 对所有非 one-thread-per-connection 模式禁用 resource group。
+   v3 放开 coroutine-epoll（`coroutine_scheduler_active()`），但**跳过**
+   `Thread_resource_control::apply_control()` 的线程级应用（nice/绑核会泄漏
+   到共享 worker，污染其他连接的 job——实测切换 RG 前后 worker nice 分布
+   不变，验证豁免生效）；PFS 记账（`add_pfs_thread_id`）同样跳过，避免
+   `ALTER RESOURCE GROUP` 把控制应用到错标的 worker。组信息只落在 THD
+   （`m_cur_resource_group`），由 bridge 逐 job 翻译成 tier。
+5. **观测**：`Coroutine_submit_to_run_avg_us/_total/_bucket_0_5us..gt_500us`
+   7 桶延迟直方图（executor 队列侧）+ scx loader `--dump`（内核侧 map 快照）。
+
+**验证矩阵**（详见 `scripts/bench/sched/README.md`；方法学取自 TailBench
+open-loop、UFS 混合负载场景、Shore-MT 伸缩、Willit Scale 式噪声注入、
+CH-benCHmark 混合 OLTP/AP）：C1 = one-thread-per-connection（OS-only 基线）、
+C2 = coroutine 无 SCX（v2）、C4 = coroutine + scx v3 tier。关键预期：
+C4 在 B7 外部 CPU 噪声下把 p99/max 拉回 C2-无噪声水平；B1 minmax 场景
+bursty TPS 恢复到 solo 的 90%+。
+
+### v3 基准结果（阿里云 ecs.c9i.4xlarge，16 vCPU）
+
+环境：db 节点与压测节点分离（同可用区内网），sysbench 1.0.20，32 表 ×10 万行。
+配置：C1 = one-thread-per-connection（OS-only 基线）、C2 = coroutine-epoll（v2，
+内核 EEVDF）、C4 = coroutine + scx v3 tier。数据文件：`scripts/bench/sched/results/cloud-db2/`。
+
+**B7 决定性实验——db 节点上的外部 CPU 抢占**（stress-ng --cpu 16 直接压在
+db 节点，模拟"OS 层来了 DB 不认识的负载"；loadgen open-loop 10k rate 点查，
+每轮 30s）：
+
+| 配置 | 基线 p99 | +噪声 p99 | 劣化 | 基线 max | +噪声 max |
+| --- | --- | --- | --- | --- | --- |
+| C2（EEVDF） | 0.395ms | **3.02ms** | **7.6×** | 1.8ms | 18.1ms |
+| C4（v3 tier） | 0.44ms | **0.60–0.74ms** | 1.4–1.7× | 3.2ms | ~22ms |
+
+这正是 UFS 论文描述的双重调度问题：C2 下 16 个外部抢占者与 reactor/executor
+共享 CPU，OS 无从知道哪些线程对尾延迟敏感，p99 劣化 7.6 倍。C4 把 DB 的
+tier 意图发布给内核调度器后，同样的噪声下 p99 仅劣化 1.4–1.7 倍，绝对值
+（0.60–0.74ms）比 C2（3.02ms）好 **4–5 倍**。注意两点诚实记录：C4 首轮出现
+一次 217ms 的 max 离群（噪声进程启动过渡期），后续 3 轮复测均为 21–22ms，
+不可复现；C4 的 max（~22ms）并不优于 C2（18ms）——tier 保护作用于 p99 分位，
+个别极端样本仍受抢占影响。
+
+**B1 UFS 混合负载**（前台 TPS × BG 会话 8，median TPS / p99 ms）：
+
+| 配置 | solo | minmax | 5050 |
+| --- | --- | --- | --- |
+| C1 | 3842 / 104.8 | 4058 / 89.2 | 4099 / 87.6 |
+| C2 | 3795 / 101.1 | 4007 / 87.6 | 4248 / 80.0 |
+| C4 | 3818 / 97.6 | 4094 / **75.8** | 4237 / **73.1** |
+
+C4 的 minmax 场景中 BG 会话经 `rg_bg` resource group（THREAD_PRIORITY=19）
+落入 BG tier，前台 p99 从 87.6ms 降至 75.8ms（-13%）。C1/C2 的 minmax 与
+5050 几乎等价——没有 OS 层协调时，两种 mix 对 DB 内部排队同构，这与本地
+结论一致；只有 C4 能区分（75.8 vs 73.1）。
+
+**B2 优先级反转**：三配置 waiter 均 ~4007ms（= 4s 锁等待 + 提交），无差异——
+v2 的 HP 队列已保证持锁者活性，tier 不再改变结果。
+
+**B4 open-loop 内部噪声**（DB 内 `BENCHMARK()` 循环，rate 40k）：
+C1 none/cpu p99 0.14/0.28ms，C2 0.16/0.30ms，C4 0.15/0.32ms。内部噪声
+（走 SHARED_DSQ 的 Normal tier）三配置表现一致；C4 的 cpu 场景 max 出现
+~40ms 离群（多轮 median 仍在），疑为 SCX 下单次抢占风暴，未定位到根因。
+
+**B5 伸缩**（点查 QPS / p99，2 轮 median）：
+
+| 亲和核数 × 线程 | C2 QPS | C4 QPS | C2 p99 | C4 p99 |
+| --- | --- | --- | --- | --- |
+| 16c × t16 | 140k | 133k | 0.15ms | 0.18ms |
+| 16c × t64 | 175k | 164k | 0.43ms | 0.46ms |
+| 16c × t256 | 170k | 159k | 1.61ms | 1.73ms |
+| 8c × t64 | 138k | 140k | — | — |
+| 4c × t256（过饱和） | 83k | **100k（+20%）** | 3.4ms | 6.0ms |
+
+正常负载下 SCX 有 ~5% 吞吐开销（EEVDF 的 CFS 快路径 vs BPF 程序开销）；
+但过饱和（4 核 256 线程）时 C4 吞吐反超 20%——BG tier 与债务机制防止了
+饿死与公平份额误分配，代价是 p99 更高（SCX 的公平性倾向 vs EEVDF）。
+
+**方法学教训**（对"负向 benchmark"的使用）：
+1. 噪声必须注入在 db 节点而非压测节点——早期 B7 在 loadgen 上压
+   stress-ng，三配置 p99 几乎相同（~1.14ms），只测到了客户端争用，实验无效；
+2. `submit_to_run_avg_us` 列在云端采集到 0，status 变量提取在远端脚本路径
+   下静默失败（lib.sh 容错吞掉了错误），直方图数据以本地 aarch64 实验为准；
+3. 首轮数据须至少 2 轮 median 并检查 max 离群（C4 的 217ms 单次离群即由
+   复测排除）。
+
+**结论**：v3 回答了"网络 IO 线程与执行线程是否互相干扰"——在 OS-only
+（C1）和 v2（C2）下会：外部抢占者使 p99 劣化 7.6 倍，且 DB 层排队数据
+（本地直方图 33% 落 100-500µs）表明 worker 被抢走而非排队。单向发布 tier
+意图（C4）后 p99 保护达到 4–5 倍改善，代价是正常负载 ~5% 吞吐与过饱和时
+更高的尾延迟。这一权衡与 UFS 论文结论一致：DB-informed 调度换来的是可预期
+的尾延迟，而非吞吐。
+
 ### v1 限制
 
 1. **执行线程耗竭风险**：`do_command` 中行锁等待/IO 等待在 executor 线程上原地阻塞。4× 系数在实测 128 并发连接下未触发耗竭（仅 ~13/40 线程活跃、队列深度 0）。但若单事务内多语句长事务大量同时进入阻塞等待，仍有可能耗竭；根治需要"锁等待时 THD 挂起归还线程"（执行侧协程化），列为远期阶段。

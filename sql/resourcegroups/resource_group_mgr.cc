@@ -48,6 +48,7 @@
 #include "pfs_thread_provider.h"
 #include "sql/auth/auth_acls.h"  // SUPER_ACL
 #include "sql/auth/sql_security_ctx.h"
+#include "sql/conn_handler/connection_handler_manager.h"
 #include "sql/current_thd.h"                 // current_thd
 #include "sql/dd/cache/dictionary_client.h"  // Dictionary_client
 #include "sql/dd/dd_resource_group.h"        // dd::create_resource_group
@@ -67,6 +68,11 @@
 namespace resourcegroups {
 const char *SYS_DEFAULT_RESOURCE_GROUP_NAME = "SYS_default";
 const char *USR_DEFAULT_RESOURCE_GROUP_NAME = "USR_default";
+
+bool coroutine_scheduler_active() {
+  return Connection_handler_manager::thread_handling ==
+         Connection_handler_manager::SCHEDULER_COROUTINE_EPOLL;
+}
 
 Resource_group_mgr *Resource_group_mgr::m_instance = nullptr;
 
@@ -426,6 +432,11 @@ bool Resource_group_mgr::move_resource_group(Resource_group *from_res_grp,
   if (to_res_grp == nullptr) to_res_grp = m_usr_default_resource_group;
 
   if (from_res_grp == to_res_grp) return false;
+
+  /* In coroutine mode the calling OS thread is a shared executor worker;
+   * thread controls are propagated via the sched_ext bridge (task tier)
+   * instead of being applied to the worker itself. */
+  if (coroutine_scheduler_active()) return true;
 
   if (to_res_grp->controller()->apply_control()) {
     LogErr(WARNING_LEVEL, ER_FAILED_TO_APPLY_RESOURCE_GROUP_CONTROLLER,

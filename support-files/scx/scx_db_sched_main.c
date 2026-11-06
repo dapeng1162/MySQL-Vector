@@ -127,6 +127,7 @@ static int pin_maps(struct scx_db_sched *skel) {
       {"blocked_by", skel->maps.blocked_by},
       {"lock_holder", skel->maps.lock_holder},
       {"rg_prio", skel->maps.rg_prio},
+      {"task_tier", skel->maps.task_tier},
   };
   size_t i;
   char path[256];
@@ -162,6 +163,7 @@ static void dump_maps_all(struct scx_db_sched *skel) {
   dump_map_entries("blocked_by", skel->maps.blocked_by, 4, "u32");
   dump_map_entries("lock_holder", skel->maps.lock_holder, 4, "u32");
   dump_map_entries("rg_prio", skel->maps.rg_prio, 4, "i32");
+  dump_map_entries("task_tier", skel->maps.task_tier, 4, "i32");
   printf("=== end dump ===\n");
   fflush(stdout);
 }

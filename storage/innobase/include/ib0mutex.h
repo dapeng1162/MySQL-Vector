@@ -36,6 +36,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "os0atomic.h"
 #include "os0event.h"
+#include "sql/sched_ext_bridge.h"  // latch wait-edge publication
 #include "sync0policy.h"
 #include "ut0rnd.h"
 #include "ut0ut.h"
@@ -539,12 +540,14 @@ struct TTASEventMutex {
       above. Otherwise we could have simply done the extra
       spin above. */
 
-      if (wait(filename, line, 4)) {
+      sched_ext::latch_wait_begin(peek_owner());
+      bool latch_acquired = wait(filename, line, 4);
+      sched_ext::latch_wait_end();
+      if (latch_acquired) {
         n_spins += 4;
 
         break;
-      }
-    }
+      }    }
 
     /* Waits and yields will be the same number in our
     mutex design */

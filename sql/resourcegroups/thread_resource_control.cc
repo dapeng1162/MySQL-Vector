@@ -75,6 +75,12 @@ bool Thread_resource_control::validate(const Type &type) const {
 bool Thread_resource_control::apply_control() {
   DBUG_TRACE;
 
+  /* Coroutine mode: user statements run on shared executor workers, so
+   * controls (affinity/nice) must not be applied to the current OS thread.
+   * The group assignment is recorded on the THD and translated into
+   * scheduler tiers per job by the sched_ext bridge. */
+  if (coroutine_scheduler_active()) return false;
+
   bool ret = false;
   std::vector<resourcegroups::platform::cpu_id_t> cpu_ids;
   if (!m_vcpu_vector.empty()) {

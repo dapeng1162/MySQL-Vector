@@ -62,6 +62,18 @@ extern const char *SYS_DEFAULT_RESOURCE_GROUP_NAME;
 extern const char *USR_DEFAULT_RESOURCE_GROUP_NAME;
 
 /**
+  True when the coroutine connection handler is the active scheduler.
+  In that mode user statements run on shared executor worker threads, so
+  resource-group thread controls (CPU affinity, nice value) must NOT be
+  applied to the underlying OS thread: they would leak to whichever
+  worker happens to execute the statement.  The group assignment is
+  still recorded on the THD (Resource_group_ctx::m_cur_resource_group)
+  and is propagated to the OS scheduler through the sched_ext bridge
+  (task tier) instead.
+*/
+bool coroutine_scheduler_active();
+
+/**
   This is a singleton class that provides various functionalities related to
   Resource group management, more importantly the managing and the mapping of
   resource group names to the corresponding in-memory resource group object.

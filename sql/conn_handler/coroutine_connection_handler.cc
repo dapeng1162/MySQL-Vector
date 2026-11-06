@@ -26,7 +26,9 @@
 #include "sql/conn_handler/coroutine_connection_handler.h"
 
 #include "coroutine/task.h"
+#include <sys/ioctl.h>
 #include <sys/poll.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <atomic>
 #include <chrono>
@@ -53,6 +55,7 @@
 #include "sql/protocol_classic.h"     // get_vio
 #include "sql/sql_class.h"            // THD
 #include "sql/sql_connect.h"          // thd_prepare_connection, close_connection
+#include "sql/sql_lex.h"              // Parser_state
 #include "sql/sql_parse.h"            // do_command
 #include "sql/sql_thd_internal_api.h" // thd_set_thread_stack
 #include "sql/sched_ext_bridge.h"     // sched_ext::init
@@ -62,9 +65,16 @@
 // Static members
 // -------------------------------------------------------------------
 
-coroutine::Netpoller *Coroutine_connection_handler::s_netpoller = nullptr;
-std::thread *Coroutine_connection_handler::s_reactor_thread = nullptr;
+coroutine::Netpoller **Coroutine_connection_handler::s_netpollers = nullptr;
+std::thread **Coroutine_connection_handler::s_reactor_threads = nullptr;
+size_t Coroutine_connection_handler::s_num_reactors = 0;
 coroutine::ExecutorPool *Coroutine_connection_handler::s_executor = nullptr;
+
+ulong coroutine_executor_threads = 0;
+ulong coroutine_executor_vip_workers = 1;
+ulong coroutine_reactor_threads = 1;
+bool coroutine_reactor_parse = false;
+ulong coroutine_admission_queue_time_us = 2000;
 bool Coroutine_connection_handler::s_initialized = false;
 
 // -------------------------------------------------------------------
@@ -77,6 +87,10 @@ namespace {
 struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
   THD *thd{nullptr};
   int client_fd{-1};
+  // Owning reactor for this connection's whole lifetime (fd sharding).
+  coroutine::Netpoller *np{nullptr};
+  // Set at submit time for admission queue-time sampling.
+  std::chrono::steady_clock::time_point enqueued_at{};
 
   // Set once when the connection closes (avoids double-cleanup).
   std::atomic<bool> connection_closed{false};
@@ -135,7 +149,7 @@ static bool coroutine_vio_pre_close(Vio *vio) {
     if (it != g_fd_registry.end()) owner = it->second.owner;
   }
   if (owner == nullptr) return false;
-  coroutine::Netpoller *np = Coroutine_connection_handler::netpoller();
+  coroutine::Netpoller *np = owner->np;
   if (np == nullptr) return false;
   // Wake any coroutine waiting on this fd; it will observe thd->killed
   // and run teardown(), which performs the actual close.
@@ -184,6 +198,64 @@ std::atomic<long long> g_connections_closed{0};   // connections torn down
 std::atomic<long long> g_active_coroutines{0};    // live frontend coroutines
 std::atomic<long long> g_hp_jobs_submitted{0};    // jobs submitted to the HP queue
 std::atomic<long long> g_hp_jobs_executed{0};     // HP jobs that finished
+std::atomic<long long> g_reactor_parsed{0};       // queries parsed on reactors
+
+// -------------------------------------------------------------------
+// Admission control (queue-time credit)
+//
+// Signal: EWMA of per-job submit→run latency (includes both the userspace
+// queue wait and the OS run-queue wait, so it cannot go blind the way a
+// pure queue-depth signal can).  Credits shrink multiplicatively when the
+// EWMA exceeds coroutine_admission_queue_time_us and grow additively when
+// it falls below 1/4 of the target.  Deferred commands wait in the
+// frontend coroutine (never blocking a reactor thread), so overload shows
+// up as queueing delay, not as executor-pool exhaustion or client errors.
+// -------------------------------------------------------------------
+
+std::mutex g_adm_mu;
+long long g_adm_credits = 64;
+long long g_adm_outstanding = 0;
+double g_adm_ewma_us = 0.0;
+std::atomic<long long> g_admission_deferred{0};
+
+static void admission_sample(uint64_t latency_us) {
+  std::lock_guard<std::mutex> lk(g_adm_mu);
+  g_adm_ewma_us = 0.875 * g_adm_ewma_us + 0.125 * (double)latency_us;
+}
+
+static void admission_job_done() {
+  std::lock_guard<std::mutex> lk(g_adm_mu);
+  if (g_adm_outstanding > 0) g_adm_outstanding--;
+  if (coroutine_admission_queue_time_us == 0) return;
+  const double hi = (double)coroutine_admission_queue_time_us;
+  const double lo = hi / 4.0;
+  if (g_adm_ewma_us > hi) {
+    g_adm_credits = std::max(1LL, (long long)(g_adm_credits * 0.9));
+  } else if (g_adm_ewma_us < lo) {
+    g_adm_credits = std::min(1LL << 20, g_adm_credits + 1);
+  }
+}
+
+// Awaiter form of the admission gate: await_ready() tries to take one
+// credit; when none is available the caller sleeps briefly and retries.
+// Used as:  while (!(co_await AdmissionReady{self.get()})) { sleep; }
+struct AdmissionReady {
+  ConnectionState *self;
+  bool admitted{false};
+
+  bool await_ready() {
+    std::lock_guard<std::mutex> lk(g_adm_mu);
+    if (coroutine_admission_queue_time_us == 0 ||
+        g_adm_outstanding < g_adm_credits) {
+      g_adm_outstanding++;
+      admitted = true;
+      return true;
+    }
+    return false;
+  }
+  bool await_suspend(std::coroutine_handle<>) { return false; }
+  bool await_resume() { return admitted; }
+};
 
 // -------------------------------------------------------------------
 // Executor job helpers
@@ -193,14 +265,20 @@ std::atomic<long long> g_hp_jobs_executed{0};     // HP jobs that finished
 /// Sets up thread-local globals and stack, then signals the frontend
 /// coroutine when done.
 static void run_thd_job(std::shared_ptr<ConnectionState> self,
-                         std::function<void(THD *)> fn) {
+                         std::function<void(THD *)> fn,
+                         bool time_sensitive = false) {
+  admission_sample((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - self->enqueued_at)
+                       .count());
   THD *thd = self->thd;
   thd_set_thread_stack(thd, reinterpret_cast<const char *>(&thd));
   thd->store_globals();
   /* Publish the holder's wait count to the sched_ext scheduler while this
    * job (which may hold row locks others are waiting on) runs on this OS
-   * thread.  No-op when not connected / not a lock holder. */
-  sched_ext::thread_job_begin(thd);
+   * thread.  High-priority jobs additionally run at time-sensitive tier
+   * for their duration (preempting normal work on this CPU).  No-op when
+   * not connected / not a lock holder. */
+  sched_ext::thread_job_begin(thd, time_sensitive);
   try {
     fn(thd);
   } catch (...) {
@@ -214,6 +292,7 @@ static void run_thd_job(std::shared_ptr<ConnectionState> self,
   }
   sched_ext::thread_job_end(thd);
   thd->restore_globals();
+  admission_job_done();
   signal_command_done(std::move(self));
 }
 
@@ -224,11 +303,12 @@ static void run_thd_job(std::shared_ptr<ConnectionState> self,
 static void submit_thd_job(std::shared_ptr<ConnectionState> self,
                             std::function<void(THD *)> fn,
                             bool high_priority = false) {
+  self->enqueued_at = std::chrono::steady_clock::now();
   if (high_priority) {
     g_hp_jobs_submitted.fetch_add(1, std::memory_order_relaxed);
     Coroutine_connection_handler::executor()->submit(
         [self = std::move(self), fn = std::move(fn)]() mutable {
-          run_thd_job(std::move(self), std::move(fn));
+          run_thd_job(std::move(self), std::move(fn), /*time_sensitive=*/true);
         },
         /*high_priority=*/true);
     return;
@@ -264,9 +344,8 @@ static void signal_command_done(std::shared_ptr<ConnectionState> self) {
     self->cmd_waiting = nullptr;
   }
   if (h) {
-    // Resume on the reactor thread.
-    Coroutine_connection_handler::netpoller()->post(
-        [h]() { h.resume(); });
+    // Resume on the connection's owning reactor thread.
+    self->np->post([h]() { h.resume(); });
   }
 }
 
@@ -279,14 +358,61 @@ static void ensure_nonblocking(const std::shared_ptr<ConnectionState> &self) {
   }
 }
 
-/// Check whether data is available on the socket without blocking.
-[[maybe_unused]] static bool data_available(int fd) {
-  struct pollfd pfd;
-  pfd.fd = fd;
-  pfd.events = POLLIN;
-  pfd.revents = 0;
-  int rc = poll(&pfd, 1, 0);
-  return (rc > 0) && (pfd.revents & (POLLIN | POLLHUP | POLLERR));
+static bool has_buffered_input(THD *thd) {
+  NET *net = thd->get_protocol_classic()->get_net();
+  Vio *vio = thd->get_protocol_classic()->get_vio();
+  return net->remain_in_buf != 0 ||
+         (vio != nullptr && vio->read_pos != vio->read_end);
+}
+
+static bool can_parse_on_reactor(
+    const std::shared_ptr<ConnectionState> &self) {
+  if (!coroutine_reactor_parse) return false;
+  THD *thd = self->thd;
+  NET *net = thd->get_protocol_classic()->get_net();
+  Vio *vio = thd->get_protocol_classic()->get_vio();
+  if (vio == nullptr || vio->ssl_arg != nullptr || net->compress ||
+      has_buffered_input(thd)) {
+    return false;
+  }
+
+  uchar header[NET_HEADER_SIZE + 1];
+  const ssize_t n = mysql_socket_recv(
+      vio->mysql_socket, reinterpret_cast<SOCKBUF_T *>(header), sizeof(header),
+      MSG_PEEK | MSG_DONTWAIT);
+  if (n != static_cast<ssize_t>(sizeof(header))) return false;
+  const size_t packet_length = uint3korr(header);
+  if (packet_length < 1 || packet_length >= MAX_PACKET_LENGTH ||
+      header[NET_HEADER_SIZE] != COM_QUERY) {
+    return false;
+  }
+
+  int available = 0;
+  if (ioctl(self->client_fd, FIONREAD, &available) < 0) return false;
+  return available >= 0 &&
+         static_cast<size_t>(available) >= NET_HEADER_SIZE + packet_length;
+}
+
+static bool parse_on_reactor(const std::shared_ptr<ConnectionState> &self,
+                             COM_DATA *com_data,
+                             enum enum_server_command *command,
+                             Parser_state *parser_state, bool *ready) {
+  THD *thd = self->thd;
+  thd_set_thread_stack(thd, reinterpret_cast<const char *>(&thd));
+  thd->store_globals();
+  bool close_connection = true;
+  try {
+    mysql_socket_set_thread_owner(
+        thd->get_protocol_classic()->get_vio()->mysql_socket);
+    close_connection =
+        parse_com_query(thd, com_data, command, parser_state, ready);
+  } catch (...) {
+    LogErr(ERROR_LEVEL, ER_INTERNAL_ERROR,
+           "coroutine reactor: uncaught exception while parsing COM_QUERY");
+    self->job_threw = true;
+  }
+  thd->restore_globals();
+  return close_connection;
 }
 
 /// Clean up THD, VIO, globals, fd, and decrement the connection count.
@@ -303,14 +429,13 @@ static void teardown(std::shared_ptr<ConnectionState> self) {
   // guards against cancelling a waiter that belongs to a different
   // connection which recycled this fd number.
   if (self->client_fd >= 0) {
-    Coroutine_connection_handler::netpoller()->cancel_fd(self->client_fd,
-                                                         self.get());
+    self->np->cancel_fd(self->client_fd, self.get());
   }
 
-  // Teardown runs on the reactor thread (not a pool thread), so set up
-  // thread-local state for this THD.  The reactor is single-threaded and
-  // teardown is synchronous, so this cannot interfere with other
-  // connections.
+  // Teardown runs on the connection's owning reactor thread (not a pool
+  // thread), so set up thread-local state for this THD.  Each connection
+  // is pinned to one reactor and teardown is synchronous, so this cannot
+  // interfere with other connections on that reactor.
   thd_set_thread_stack(thd, reinterpret_cast<const char *>(&thd));
   thd->store_globals();
 
@@ -381,6 +506,15 @@ coroutine::DetachedTask ConnectionState::run() {
       self->cmd_done.store(false, std::memory_order_relaxed);
       self->cmd_waiting = nullptr;
     }
+    for (;;) {
+      if (co_await AdmissionReady{self.get()}) break;
+      g_admission_deferred.fetch_add(1, std::memory_order_relaxed);
+      co_await self->np->sleep_for(std::chrono::milliseconds(1));
+      if (should_close(self)) {
+        teardown(std::move(self));
+        co_return;
+      }
+    }
     bool auth_ok = false;
     submit_thd_job(self, [self, &auth_ok](THD *thd) {
       const MYSQL_SOCKET sock =
@@ -408,12 +542,13 @@ coroutine::DetachedTask ConnectionState::run() {
   for (;;) {
     if (should_close(self)) break;
 
-    // Wait (via epoll, not polling) for the next command packet to
-    // arrive before submitting to the executor pool.  This keeps an
-    // executor thread from blocking inside do_command() → my_net_read()
-    // while the client is idle, and avoids the latency of a polling loop.
-    bool readable = co_await Coroutine_connection_handler::netpoller()
-                        ->wait_readable(self->client_fd, self.get());
+    // Authentication and the previous my_net_read() may have read the next
+    // command into NET/VIO buffers.  Waiting on the kernel fd in that case
+    // would deadlock: the bytes are no longer visible to epoll.
+    bool readable = true;
+    if (!has_buffered_input(self->thd)) {
+      readable = co_await self->np->wait_readable(self->client_fd, self.get());
+    }
     if (!readable || should_close(self)) break;
 
     // The socket may have been set to blocking by my_net_read during
@@ -428,11 +563,49 @@ coroutine::DetachedTask ConnectionState::run() {
       self->cmd_done.store(false, std::memory_order_relaxed);
       self->cmd_waiting = nullptr;
     }
+    bool admitted = false;
+    for (;;) {
+      if (co_await AdmissionReady{self.get()}) {
+        admitted = true;
+        break;
+      }
+      g_admission_deferred.fetch_add(1, std::memory_order_relaxed);
+      co_await self->np->sleep_for(std::chrono::milliseconds(1));
+      if (should_close(self)) break;
+    }
+    if (should_close(self)) {
+      if (admitted) admission_job_done();
+      break;
+    }
+
+    COM_DATA com_data;
+    enum enum_server_command command = COM_SLEEP;
+    Parser_state parser_state;
+    bool parsed = false;
+    if (can_parse_on_reactor(self)) {
+      const bool close = parse_on_reactor(self, &com_data, &command,
+                                          &parser_state, &parsed);
+      if (!parsed) admission_job_done();
+      if (close || self->job_threw) break;
+      if (!parsed) continue;
+      g_reactor_parsed.fetch_add(1, std::memory_order_relaxed);
+    }
+
     bool cmd_result = false;
-    const bool hp = sched_ext::is_lock_holder(thd);
-    submit_thd_job(self, [&cmd_result](THD *thd) {
-      cmd_result = do_command(thd);
-    }, hp);
+    const bool hp = sched_ext::is_lock_holder(self->thd);
+    if (parsed) {
+      submit_thd_job(
+          self,
+          [&cmd_result, &com_data, command, &parser_state](THD *thd) {
+            cmd_result =
+                execute_parsed_command(thd, &com_data, command, &parser_state);
+          },
+          hp);
+    } else {
+      submit_thd_job(self, [&cmd_result](THD *thd) {
+        cmd_result = do_command(thd);
+      }, hp);
+    }
     co_await CommandDone(self.get());
 
     if (hp) g_hp_jobs_executed.fetch_add(1, std::memory_order_relaxed);
@@ -470,19 +643,55 @@ void Coroutine_connection_handler::init() {
    * no-op and the server keeps working normally. */
   sched_ext::init();
   try {
-    s_netpoller = new (std::nothrow) coroutine::Netpoller();
-    if (s_netpoller == nullptr) return;
+    size_t n_reactors = coroutine_reactor_threads ? coroutine_reactor_threads : 1;
+    if (n_reactors > 64) n_reactors = 64;
+    s_netpollers = new (std::nothrow) coroutine::Netpoller *[n_reactors]();
+    s_reactor_threads = new (std::nothrow) std::thread *[n_reactors]();
+    if (s_netpollers == nullptr || s_reactor_threads == nullptr) {
+      delete[] s_netpollers;
+      s_netpollers = nullptr;
+      delete[] s_reactor_threads;
+      s_reactor_threads = nullptr;
+      return;
+    }
+    s_num_reactors = n_reactors;
+    for (size_t i = 0; i < n_reactors; i++) {
+      s_netpollers[i] = new (std::nothrow) coroutine::Netpoller();
+      if (s_netpollers[i] == nullptr) {
+        for (size_t j = 0; j < i; j++) delete s_netpollers[j];
+        delete[] s_netpollers;
+        s_netpollers = nullptr;
+        delete[] s_reactor_threads;
+        s_reactor_threads = nullptr;
+        s_num_reactors = 0;
+        return;
+      }
+    }
 
     size_t n = std::thread::hardware_concurrency();
     if (n == 0) n = 4;
-    // Scale the executor pool by 4× so that I/O-blocked threads (inside
-    // do_command → my_net_read → vio_io_wait) do not exhaust the pool
-    // and starve new connection authentication.
-    size_t pool_size = std::max(n * 4, size_t{16});
-    s_executor = new (std::nothrow) coroutine::ExecutorPool(pool_size, 0);
+    // The auto pool size leaves room for I/O-blocked workers; an explicit
+    // coroutine_executor_threads value is used without a 4× multiplier.
+    size_t pool_size = coroutine_executor_threads
+                           ? (size_t)coroutine_executor_threads
+                           : std::max(n * 4, size_t{16});
+    size_t num_vip = (size_t)coroutine_executor_vip_workers;
+    // When a DB-aware sched_ext scheduler is connected it owns placement
+    // (workers are placed by tier/vtime policy); otherwise pin workers
+    // round-robin over the allowed CPUs as a fallback.
+    size_t cpu_offset = sched_ext::connected()
+                            ? coroutine::ExecutorPool::kNoPinning
+                            : 0;
+    s_executor = new (std::nothrow) coroutine::ExecutorPool(pool_size,
+                                                            cpu_offset,
+                                                            num_vip);
     if (s_executor == nullptr) {
-      delete s_netpoller;
-      s_netpoller = nullptr;
+      for (size_t i = 0; i < s_num_reactors; i++) delete s_netpollers[i];
+      delete[] s_netpollers;
+      s_netpollers = nullptr;
+      delete[] s_reactor_threads;
+      s_reactor_threads = nullptr;
+      s_num_reactors = 0;
       return;
     }
 
@@ -506,21 +715,41 @@ void Coroutine_connection_handler::init() {
     s_executor->set_thread_hooks(std::move(hooks));
     s_executor->start();
 
-    s_reactor_thread = new (std::nothrow) std::thread([]() {
-      my_thread_init();
-      sched_ext::thread_start();
-      if (s_netpoller) s_netpoller->run();
-      sched_ext::thread_end();
-      my_thread_end();
-    });
-    if (s_reactor_thread == nullptr) {
-      s_executor->stop();
-      s_executor->join();
-      delete s_executor;
-      s_executor = nullptr;
-      delete s_netpoller;
-      s_netpoller = nullptr;
-      return;
+    for (size_t i = 0; i < n_reactors; i++) {
+      s_reactor_threads[i] = new (std::nothrow) std::thread([i]() {
+        my_thread_init();
+        sched_ext::thread_start();
+        /* Each reactor is a latency-critical dispatch point (epoll +
+         * handoff + result writeback): mark it time-sensitive so the
+         * DB-aware scheduler preempts executor and background work for it
+         * instead of giving it a fair share of a busy CPU.  No-op without
+         * a connected sched_ext scheduler. */
+        sched_ext::set_thread_tier(sched_ext::kTierTS);
+        if (s_netpollers[i]) s_netpollers[i]->run();
+        sched_ext::clear_thread_tier();
+        sched_ext::thread_end();
+        my_thread_end();
+      });
+      if (s_reactor_threads[i] == nullptr) {
+        s_executor->stop();
+        s_executor->join();
+        delete s_executor;
+        s_executor = nullptr;
+        for (size_t j = 0; j < s_num_reactors; j++) {
+          if (s_netpollers[j]) s_netpollers[j]->stop();
+        }
+        for (size_t j = 0; j < i; j++) {
+          if (s_reactor_threads[j]->joinable()) s_reactor_threads[j]->join();
+          delete s_reactor_threads[j];
+        }
+        for (size_t j = 0; j < s_num_reactors; j++) delete s_netpollers[j];
+        delete[] s_netpollers;
+        s_netpollers = nullptr;
+        delete[] s_reactor_threads;
+        s_reactor_threads = nullptr;
+        s_num_reactors = 0;
+        return;
+      }
     }
 
     // Install the vio pre-close hook so that vio_shutdown() (e.g. from
@@ -538,10 +767,21 @@ void Coroutine_connection_handler::init() {
       delete s_executor;
       s_executor = nullptr;
     }
-    if (s_netpoller) {
-      delete s_netpoller;
-      s_netpoller = nullptr;
+    for (size_t i = 0; i < s_num_reactors; i++) {
+      if (s_netpollers && s_netpollers[i]) s_netpollers[i]->stop();
     }
+    for (size_t i = 0; i < s_num_reactors; i++) {
+      if (s_reactor_threads && s_reactor_threads[i]) {
+        if (s_reactor_threads[i]->joinable()) s_reactor_threads[i]->join();
+        delete s_reactor_threads[i];
+      }
+      if (s_netpollers && s_netpollers[i]) delete s_netpollers[i];
+    }
+    delete[] s_netpollers;
+    s_netpollers = nullptr;
+    delete[] s_reactor_threads;
+    s_reactor_threads = nullptr;
+    s_num_reactors = 0;
     s_initialized = false;
   }
 }
@@ -554,7 +794,7 @@ void Coroutine_connection_handler::destroy() {
   // closed directly by vio_shutdown() again.
   vio_pre_close_hook = nullptr;
 
-  // Stop the executor first so it stops posting to the netpoller.
+  // Stop the executor first so it stops posting to the netpollers.
   if (s_executor) {
     s_executor->stop();
     s_executor->join();
@@ -562,17 +802,22 @@ void Coroutine_connection_handler::destroy() {
     s_executor = nullptr;
   }
 
-  // Stop the reactor and join the reactor thread.
-  if (s_netpoller) {
-    s_netpoller->stop();
-    if (s_reactor_thread) {
-      if (s_reactor_thread->joinable()) s_reactor_thread->join();
-      delete s_reactor_thread;
-      s_reactor_thread = nullptr;
-    }
-    delete s_netpoller;
-    s_netpoller = nullptr;
+  // Stop every reactor and join every reactor thread.
+  for (size_t i = 0; i < s_num_reactors; i++) {
+    if (s_netpollers && s_netpollers[i]) s_netpollers[i]->stop();
   }
+  for (size_t i = 0; i < s_num_reactors; i++) {
+    if (s_reactor_threads && s_reactor_threads[i]) {
+      if (s_reactor_threads[i]->joinable()) s_reactor_threads[i]->join();
+      delete s_reactor_threads[i];
+    }
+    if (s_netpollers && s_netpollers[i]) delete s_netpollers[i];
+  }
+  delete[] s_netpollers;
+  s_netpollers = nullptr;
+  delete[] s_reactor_threads;
+  s_reactor_threads = nullptr;
+  s_num_reactors = 0;
 }
 
 bool Coroutine_connection_handler::add_connection(
@@ -617,6 +862,12 @@ bool Coroutine_connection_handler::add_connection(
   auto state = std::make_shared<ConnectionState>();
   state->thd = thd;
   state->client_fd = fd;
+  state->np = netpoller_for_fd(fd);
+  if (state->np == nullptr) {
+    Connection_handler_manager::dec_connection_count();
+    delete thd;
+    return true;
+  }
 
   // Register the fd before the THD becomes visible to KILL: the vio
   // pre-close hook looks it up here to defer the close to teardown().
@@ -627,8 +878,8 @@ bool Coroutine_connection_handler::add_connection(
 
   Global_THD_manager::get_instance()->add_thd(thd);
 
-  // Spawn the connection coroutine on the reactor thread.
-  s_netpoller->post([state]() { state->run(); });
+  // Spawn the connection coroutine on its owning reactor thread.
+  state->np->post([state]() { state->run(); });
 
   g_active_coroutines.fetch_add(1, std::memory_order_relaxed);
 
@@ -654,8 +905,12 @@ long long Coroutine_connection_handler::handoff_queue_depth() {
 }
 
 long long Coroutine_connection_handler::reactor_events() {
-  if (s_netpoller == nullptr) return 0;
-  return s_netpoller->events_processed();
+  long long total = 0;
+  for (size_t i = 0; i < s_num_reactors; i++) {
+    if (s_netpollers && s_netpollers[i])
+      total += s_netpollers[i]->events_processed();
+  }
+  return total;
 }
 
 long long Coroutine_connection_handler::executor_threads() {
@@ -681,4 +936,30 @@ long long Coroutine_connection_handler::hp_jobs_submitted() {
 
 long long Coroutine_connection_handler::hp_jobs_executed() {
   return g_hp_jobs_executed.load(std::memory_order_relaxed);
+}
+
+long long Coroutine_connection_handler::admission_deferred() {
+  return g_admission_deferred.load(std::memory_order_relaxed);
+}
+
+long long Coroutine_connection_handler::reactor_parsed() {
+  return g_reactor_parsed.load(std::memory_order_relaxed);
+}
+
+long long Coroutine_connection_handler::submit_to_run_avg_us() {
+  if (s_executor == nullptr) return 0;
+  uint64_t count = s_executor->latency_count();
+  if (count == 0) return 0;
+  return static_cast<long long>(s_executor->latency_total_us() / count);
+}
+
+long long Coroutine_connection_handler::submit_to_run_total() {
+  if (s_executor == nullptr) return 0;
+  return static_cast<long long>(s_executor->latency_count());
+}
+
+long long Coroutine_connection_handler::submit_to_run_bucket(size_t i) {
+  if (s_executor == nullptr) return 0;
+  if (i >= coroutine::ExecutorPool::kNumLatencyBuckets) return 0;
+  return static_cast<long long>(s_executor->latency_bucket_count(i));
 }
