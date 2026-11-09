@@ -44,6 +44,7 @@ class Coroutine_connection_handler : public Connection_handler {
   static long long hp_jobs_submitted();
   static long long hp_jobs_executed();
   static long long admission_deferred();
+  static long long admission_credits();
   static long long reactor_parsed();
   static long long reactor_exec();
   static long long reactor_exec_slow();

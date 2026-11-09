@@ -217,9 +217,13 @@ std::atomic<long long> g_reactor_exec_slow{0};    // inline executions over budg
 // queue wait and the OS run-queue wait, so it cannot go blind the way a
 // pure queue-depth signal can).  Credits shrink multiplicatively when the
 // EWMA exceeds coroutine_admission_queue_time_us and grow additively when
-// it falls below 1/4 of the target.  Deferred commands wait in the
-// frontend coroutine (never blocking a reactor thread), so overload shows
-// up as queueing delay, not as executor-pool exhaustion or client errors.
+// it falls below 1/4 of the target.  Shrink is floored at the executor
+// worker count: below it the userspace queue is empty (every admitted job
+// gets an idle worker), so the gate would only idle the pool — the EWMA at
+// that point measures OS run-queue wait the gate cannot control.  Deferred
+// commands wait in the frontend coroutine (never blocking a reactor
+// thread), so overload shows up as queueing delay, not as executor-pool
+// exhaustion or client errors.
 //
 // Lock-freedom: the gate is taken once per command on the reactor and
 // returned once on a worker, so at high QPS a global mutex on that path
@@ -236,6 +240,20 @@ std::atomic<long long> g_adm_credits{64};
 std::atomic<long long> g_adm_outstanding{0};
 double g_adm_ewma_us = 0.0;  // guarded by g_adm_mu
 std::atomic<long long> g_admission_deferred{0};
+
+// Lower bound for credit shrink.  With credits <= executor workers every
+// admitted job starts immediately on an idle worker: the userspace queue is
+// empty, so throttling below this point cannot reduce queue wait — the
+// remaining latency is OS run-queue time the gate does not control.  It only
+// idles workers and collapses throughput (measured 2026-11-09: 256-conn
+// oltp_read_write dropped to 978 TPS with the gate active vs 6748 disabled
+// after the multiplicative shrink drove credits to 1 and the controller
+// entered a low-throughput limit cycle).
+static long long admission_credit_floor() {
+  const coroutine::ExecutorPool *pool =
+      Coroutine_connection_handler::executor();
+  return pool ? (long long)pool->num_workers() : 1;
+}
 
 static void admission_sample(uint64_t latency_us) {
   if (coroutine_admission_queue_time_us == 0) return;
@@ -255,8 +273,9 @@ static void admission_job_done() {
   const double lo = hi / 4.0;
   const long long credits = g_adm_credits.load(std::memory_order_relaxed);
   if (g_adm_ewma_us > hi) {
-    g_adm_credits.store(std::max(1LL, (long long)(credits * 0.9)),
-                        std::memory_order_relaxed);
+    g_adm_credits.store(
+        std::max(admission_credit_floor(), (long long)(credits * 0.9)),
+        std::memory_order_relaxed);
   } else if (g_adm_ewma_us < lo) {
     g_adm_credits.store(std::min(1LL << 20, credits + 1),
                         std::memory_order_relaxed);
@@ -896,6 +915,11 @@ void Coroutine_connection_handler::init() {
       return;
     }
 
+    // Start the admission budget at service capacity: with credits equal to
+    // the worker count, admitted jobs never queue behind each other.  The
+    // floor in admission_job_done() keeps shrink from going below this.
+    g_adm_credits.store((long long)pool_size);
+
     // NOTE: we intentionally do NOT set a notify_reactor callback.  The
     // reactor is already woken by signal_command_done(), which posts the
     // coroutine resume callback for every completed job; a per-job empty
@@ -1141,6 +1165,10 @@ long long Coroutine_connection_handler::hp_jobs_executed() {
 
 long long Coroutine_connection_handler::admission_deferred() {
   return g_admission_deferred.load(std::memory_order_relaxed);
+}
+
+long long Coroutine_connection_handler::admission_credits() {
+  return g_adm_credits.load(std::memory_order_relaxed);
 }
 
 long long Coroutine_connection_handler::reactor_parsed() {

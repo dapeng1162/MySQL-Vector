@@ -11485,6 +11485,15 @@ static int show_coroutine_admission_deferred(THD *, SHOW_VAR *var,
   return 0;
 }
 
+static int show_coroutine_admission_credits(THD *, SHOW_VAR *var,
+                                             char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) =
+      static_cast<long>(Coroutine_connection_handler::admission_credits());
+  return 0;
+}
+
 static int show_coroutine_reactor_parsed(THD *, SHOW_VAR *var, char *buff) {
   var->type = SHOW_LONG;
   var->value = buff;
@@ -12039,6 +12048,9 @@ SHOW_VAR status_vars[] = {
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Coroutine_admission_deferred",
      (char *)&show_coroutine_admission_deferred, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_admission_credits",
+     (char *)&show_coroutine_admission_credits, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
     {"Coroutine_hp_jobs_executed",
      (char *)&show_coroutine_hp_jobs_executed, SHOW_FUNC,
