@@ -175,7 +175,67 @@ build/runtime_output_directory/mysqld --no-defaults \
 - 跑 TPCC、sysbench OLTP，以及文档 N1–N12 负向测试：锁风暴、外部干扰、突发、重试、悬崖点、恢复、fairness/debt 等。
 - 历史数字只能引用 `Docs/coroutine-sched-design.md` 中已有实测；v4 新机制没有新 benchmark 前不得写性能提升结论。
 
+## 4.5 perf2 轮（2026-11-09，已提交 8953c8145..78c7e21f1，已 push github/coroutine-dev2）
+
+C2 vs C1 点查差距的归因（每查询 2 次跨线程交接 + ~4 次 epoll_ctl + 2 次 g_adm_mu 全局锁）
+落地为三个独立 commit，本地验证全过：
+
+1. `02694b9b3` netpoller 常驻 interest：m_fds 条目连接生命周期内常驻，事件到达只清
+   waiter，重臂走 EPOLL_CTL_MOD（syscall 减半），取消结果经 bool*（指向挂起协程帧）
+   传递，去掉每次等待的 shared_ptr 堆分配。gunit netpoller-t 8/8（新增 2 个：条目
+   常驻 + cancel 后重等）。
+2. `a06ce9c90` reactor 内联执行（D5b）：`coroutine_reactor_exec`（动态，默认 OFF）+
+   `coroutine_reactor_exec_budget_us`（默认 500µs，超预算该连接冷却 1s 回 executor
+   路径）。分类器 `parsed_select_is_reactor_safe`：SQLCOM_SELECT、表锁 ∈ {TL_IGNORE,
+   TL_READ_DEFAULT, TL_READ}（**注意：parse 期普通 SELECT 是 TL_READ_DEFAULT，不是
+   TL_READ**——首版写成 TL_READ 导致表查询全被拒绝，mtr 录制结果全 0 才发现；
+   FOR UPDATE 在 contextualization 期改写为 TL_WRITE 被排除）、顶层 select list 排除
+   get_lock/sleep/benchmark/release_lock/release_all_locks。计数器
+   `Coroutine_reactor_exec/_slow`。mtr `coroutine_reactor_exec`（精确 delta 断言）。
+   **admission credit 在 parse 前已取，内联后必须 admission_job_done() 归还**。
+3. `78c7e21f1` admission 无锁化：outstanding/credits 原子化，await_ready 纯 CAS，
+   EWMA/credits 重算每线程 1/8 采样锁一次。
+
+**关键发现（本轮最重要的结论）**：sysbench 1.0 oltp_* 默认走**预处理语句协议**
+（COM_STMT_EXECUTE=0x16），`can_parse_on_reactor` 只接受 COM_QUERY，因此 reactor
+parse/exec 在标准 sysbench 负载下从未触发（2790 万命令只 parse 了 25.8 万、exec 3 次；
+单线程 3.9 万查询同样只有 3 次）。strace 证实 PEEK 每查询都成功返回 5 字节、
+FIONREAD 一次未到——失败点在 command 字节判定。验证用 `--db-ps-mode=disable` 强制
+文本协议（run_perf.sh 已加 PS_MODE 变量）。
+
+**后续 P1（重要）**：reactor 路径支持 COM_STMT_EXECUTE——按 com_data 里的 stmt_id 查
+prepared statement 的 LEX 做分类，执行仍需复用 execute_parsed_command 语义（二进制
+协议参数绑定在 sql_prepare.cc 深处，需要把 execute/read-param 与 dispatch 解耦）。
+生产驱动（JDBC prepared、代理、多数 ORM）以 PS 为主，不支持它则内联优化对真实
+负载无效。
+
+已知问题（预先存在，与上述 commit 无关，未修）：启动错误导致 unireg_abort 时
+`Coroutine_connection_handler::destroy()` → `ExecutorPool::join()` 在 pthread_join 内
+段错误（正常 SHUTDOWN/kill TERM 不触发；本地用 `--user=root` 缺失或残留 socket lock
+可复现，栈见 results/perf-20261106 各 FATAL log）。建议在 destroy() 对 join 失败做
+防御或排查 worker 线程早期退出路径。
+
+perf2 环境：16c c9i.4xlarge（db, i-0jl0bdgs2kmerj7729ul）+ 8c c9i.2xlarge（loadgen,
+i-0jlhposud13890bffudm）双 spot，alinux4；结果目录 `results/perf-20261106/`
+（C1/C2v3r1/C2v3r8 为 PS 协议，C1text/C2v3r1text/C2v3r8text 为文本协议）。
+教训：alinux4 loadgen 的 sysbench 必须链接 mysql-devel 的 libmysqlclient（mariadb
+强制 TLS 报 2026；mysql_config 冲突需先 dnf remove mariadb-devel）。
+
+perf2 最终结果（详见 results/perf-20261106/summary-perf2.md）：
+
+- **点查（文本协议 + r=8 + parse + 内联 exec）追平并超过 one-thread**：
+  306k QPS vs C1text 292k，p99 0.14–0.16ms 持平。perf1 的 158–201k 差距消除。
+  计数器：100% 查询 reactor parse，89% 内联执行，slow 0.005%。
+- r=1 + parse/exec 是回退（53–58k，单 reactor 串行 ~17µs/查询）——
+  `coroutine_reactor_parse=ON` 必须配 ≥4 reactor，属配置约束。
+- rw（文本协议 r=8）2768–3354 TPS，比 PS 协议 C2v3r8（2136–2160）提升 30–55%，
+  但仍落后 C1text（4505–5344）25–40%：DML 全部下放 executor，submit→run
+  avg 12µs→101µs。**后续方向：DML reactor 判定放宽（单行 PK UPDATE 内联）
+  或交接路径削减**。
+- PS 协议下三项优化不触发亦无回退（与 perf1 持平）。
+
 ## 5. 已知边界与注意事项
+
 
 - D3 让 slow-query 起点和 `thread_running` 覆盖 reactor→worker 排队时间，这是有意的语义变化，需在测试中确认。
 - 当前 runtime 初始化早于 daemonize fork，不能用 `--daemonize` 运行 coroutine 模式；后续若需要支持，应将 runtime 启动移到 fork 之后，而不是只隐藏问题。
