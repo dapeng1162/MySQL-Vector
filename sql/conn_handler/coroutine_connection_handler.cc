@@ -777,7 +777,16 @@ coroutine::DetachedTask ConnectionState::run() {
         parsed_select_is_reactor_safe(self->thd)) {
       THD *thd = self->thd;
       const auto t0 = std::chrono::steady_clock::now();
-      thd_set_thread_stack(thd, reinterpret_cast<const char *>(&thd));
+      /* Do NOT call thd_set_thread_stack() here: this code lives in a
+       * stackless-coroutine body, so &thd is a heap coroutine-frame
+       * address, not an OS-stack address -- check_stack_overrun() would
+       * compute an ASLR-dependent garbage difference and can falsely
+       * report error 1436 (or miss real overruns).  parse_on_reactor()
+       * already set thd->thread_stack on this reactor thread's real OS
+       * stack earlier in this same iteration (inline execution requires
+       * parsed == true, which only parse_on_reactor sets), and this block
+       * runs on that same stack a few frames deeper, so the margin it
+       * left is still valid. */
       thd->store_globals();
       bool close_conn = true;
       try {
