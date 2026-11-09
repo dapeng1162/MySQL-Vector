@@ -279,8 +279,50 @@ ENVIRONMENT.md §3 与本轮 summary §3）：本地 6.6 内核树头缺两参
 124.70.231.8 与 36.28.77.68 间摆动，两个 /32 均已入安全组
 sg-0jlis1x48amzqvro5ciz。
 
-## 5. 已知边界与注意事项
+## 4.7 paper64 轮（2026-11-09，论文 §6.4 三基准全量，资源仍保留中）
 
+论文 §6.4（HTAP 行已删）的三项基准全量完成，对比 V97 / C2 / C4，全部文本
+协议（`--db-ps-mode=disable`，reactor parse/exec 全程生效）。脚本
+`aliyun/mysql-sched-bench/run_paper64.sh`（rwscaling/ratescan）与
+`run_paper64_tpcc.sh`（TPC-C load/run）。结果：
+`aliyun/mysql-sched-bench/results/paper64-20261109/summary-paper64.md`，
+论文 §6.4 已写入 v4 实测数字。
+
+核心结果：
+
+- **rw 伸缩**：C2/C4 吞吐为 V97 的 85–96%，但 t128 时 p95 反超（49.2 vs
+  61.1ms），t256 时 C4 p95 持平（84.5ms）。
+- **点查速率阶梯（open-loop 25k–300k）**：三配置全部精确线性跟踪至 300k/s
+  未触膝点；300k 档 p95：C2 0.25 < V97 0.30 < C4 3.49ms（scx 在无锁点查上
+  只见成本，符合消融预期）。
+- **TPC-C**（BenchBase 32 仓库 64 terminals RC 180s）：C2 2214 vs V97 2228
+  req/s（-0.6% 打平），p99 352.6 vs 371.5ms 略优；C4 2121（-4.8%，与 §6.6
+  的 scx ~5% 开销结论一致）。三配置 abort 率相近、无 SQL 错误。
+
+本轮暴露并修复两个缺陷（用户要求：测试中遇到问题直接修复、每个修复独立
+commit 写清背景）：
+
+1. **准入收缩下界自饿死**（`b10d64916`，已 push）：t256 下 C2 从 6748 崩至
+   978 TPS（admission_deferred 1330 万次）。收缩下界为 0，长事务阻塞 credit
+   回收时反复收缩到远低于池容量。修复：下界 = executor 池大小；新增
+   `Coroutine_admission_credits` 状态变量。修复后 t256=6672，与关准入对照
+   （6748）差 <1.2%。
+2. **协程帧地址误设 thread_stack**（`7bffa3131`，已 push）：内联执行块在无栈
+   协程体内以 `&thd`（堆协程帧）设 `thread_stack`，check_stack_overrun 得到
+   ASLR 垃圾差值，t256 假报 error 1436（"95MB 栈用量"）。潜伏 bug：每次启动
+   是否触发看布局运气，反向布局还会漏检真实溢出。修复：删除该调用，依赖同
+   迭代 parse_on_reactor 在 reactor OS 栈上的正确设置（内联块只深数帧）。
+
+两个修复均通过本地 gunit（netpoller-t 8 / executor-t 13 / task-t 5 /
+stmt_priority-t 9）与 mtr（coroutine_reactor_exec / coroutine_stmt_prio /
+coroutine_latch_status），云端增量重建后复测通过。BenchBase v2023 在 loadgen
+/opt/benchbase-run 部署完成（maven 构建 + tpcc_mysql.xml 配置）。
+
+**资源仍保留（用户后续还有测试，勿释放）**：同 4.6 双节点；auto-release 兜底
+2026-11-09T15:30Z（=23:30 CST），若跨点需先推迟。当前 db 节点无 mysqld、
+loadgen 无 java 残留，处于干净空闲态。
+
+## 5. 已知边界与注意事项
 
 - D3 让 slow-query 起点和 `thread_running` 覆盖 reactor→worker 排队时间，这是有意的语义变化，需在测试中确认。
 - 当前 runtime 初始化早于 daemonize fork，不能用 `--daemonize` 运行 coroutine 模式；后续若需要支持，应将 runtime 启动移到 fork 之后，而不是只隐藏问题。

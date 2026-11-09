@@ -606,9 +606,40 @@
 <tr><td>sysbench <code>oltp_read_write</code></td><td>封闭环 32/64/128/256 线程伸缩</td><td>锁争用下吞吐与 p95 不退化；干净开销 ≤5%（C3）</td></tr>
 <tr><td>sysbench <code>oltp_point_select</code></td><td>封闭环 32 线程 + open-loop rate 扫描</td><td>分离每命令交接税；报告与 OTPC 的差距构成</td></tr>
 <tr><td>TPC-C（BenchBase）</td><td>多仓库，封闭环吞吐 + open-loop 尾延迟；交互式 vs 存储过程两种模型</td><td>与文献可比的通用 OLTP 参照；分离通信开销 [28]</td></tr>
-<tr><td>CH-benCHmark（TPC-C + TPC-H 并发）[34]</td><td>TP 与 AP 并发执行</td><td>HTAP 混合下 TP goodput 与 AP 完成时间双侧不退化</td></tr>
 </table>
 <p>历史基线【实测，v1】：oltp_read_write 32 线程 3176 TPS（128 线程无执行线程耗竭），oltp_point_select 67,320 TPS（p95 0.68ms）。这些数字仅作回归锚点，不构成 v4 结果。</p>
+
+<p><strong>v4 全量结果【实测，2026-11-09】。</strong>环境：双 ECS spot（db 16c / loadgen 8c，Ubuntu 26.04，内核 7.0 sched_ext 可用），同一 datadir 轮流启动三个配置：原生 9.7（<code>008e09c283</code>，one-thread-per-connection）、C2（reactor 8 + worker 64，reactor parse/exec ON）、C4（C2 + <code>scx_db_sched</code>）。文本协议（<code>--db-ps-mode=disable</code>）使 reactor parse/exec 路径全程生效。本轮包含两个由基准暴露并修复的缺陷（见下文），全部 C2/C4 数字为修复后二进制（<code>b10d64916</code> + <code>7bffa3131</code>）。</p>
+
+<p><strong>B1：oltp_read_write 伸缩</strong>（60s/档，p95 括注 ms）：</p>
+<table>
+<tr><th>threads</th><th>原生 9.7</th><th>C2</th><th>C4</th></tr>
+<tr><td class="num">32</td><td class="num">5869（13.5）</td><td class="num">5370（13.0）</td><td class="num">5346（13.7）</td></tr>
+<tr><td class="num">64</td><td class="num">7448（34.3）</td><td class="num">6440（38.9）</td><td class="num">6232（41.9）</td></tr>
+<tr><td class="num">128</td><td class="num">7621（61.1）</td><td class="num">7294（<strong>49.2</strong>）</td><td class="num">7234（<strong>49.2</strong>）</td></tr>
+<tr><td class="num">256</td><td class="num">7551（84.5）</td><td class="num">6672（90.8）</td><td class="num">6918（84.5）</td></tr>
+</table>
+<p>中高并发下 C2/C4 吞吐为基线的 85–96%，但 128 线程时 p95 反超基线约 20%（49.2 vs 61.1ms），256 线程时 C4 p95 持平——吞吐让位于排队形态的改善，与 §2.3“执行池边界重排等待”的分析一致。</p>
+
+<p><strong>B2：oltp_point_select 开放环速率阶梯</strong>（64 线程，25k–300k 七档，30s/档）：三配置全部精确线性跟踪到 300k/s（实际与目标偏差 &lt;0.05%），未触及膝点，容量 ≥300k/s 受限于测试上限。300k 档 p95：C2 0.25ms &lt; 基线 0.30ms &lt; C4 3.49ms；250k 档分别为 0.18 / 0.17 / 0.29ms。C4 的 p95 随速率抬升更陡——scx_db_sched 的发布回调在无锁点查负载上只见成本不见收益，属预期消融结果（§6.7 第 5 项将做借入量联合扫描）。</p>
+
+<p><strong>B3：TPC-C</strong>（BenchBase v2023，32 仓库，64 terminals，READ_COMMITTED，180s，JDBC <code>rewriteBatchedStatements</code>）：</p>
+<table>
+<tr><th>指标</th><th>原生 9.7</th><th>C2</th><th>C4</th></tr>
+<tr><td>Throughput (req/s)</td><td class="num">2227.96</td><td class="num">2213.97</td><td class="num">2121.18</td></tr>
+<tr><td>Goodput (req/s)</td><td class="num">2208.47</td><td class="num">2195.17</td><td class="num">2102.59</td></tr>
+<tr><td>p50 (ms)</td><td class="num">6.97</td><td class="num">8.45</td><td class="num">8.48</td></tr>
+<tr><td>p95 (ms)</td><td class="num">105.9</td><td class="num">106.3</td><td class="num">111.4</td></tr>
+<tr><td>p99 (ms)</td><td class="num">371.5</td><td class="num"><strong>352.6</strong></td><td class="num">517.5</td></tr>
+<tr><td>max (ms)</td><td class="num">1875</td><td class="num">1590</td><td class="num">1567</td></tr>
+</table>
+<p>C2 与基线吞吐打平（-0.6%）、p99 略优；C4 吞吐 -4.8%，与 §6.6 记录的语义发布约 5% 干净开销一致——32 仓库 64 terminals 的中等争用不足以让锁持有者提权收益覆盖 BPF 发布成本。三配置 goodput 缺口均约 19 req/s（abort 率相近），无 SQL 错误、无 unknown-status 事务。</p>
+
+<p><strong>本轮基准暴露并修复的两个缺陷</strong>（每项独立 commit，均含本地 gunit/mtr 验证与云端复测）：</p>
+<ol>
+<li><strong>准入收缩下界过低导致自饿死</strong>（<code>b10d64916</code>）：256 线程下准入 credit 收缩下界为 0，长事务阻塞 credit 回收时系统反复收缩到远低于执行池容量，C2 从 6748 崩至 978 TPS（admission_deferred 1330 万次）。修复：收缩下界 = 执行池大小，并新增 <code>Coroutine_admission_credits</code> 状态变量。修复后 t256 = 6672 TPS，与关准入对照（6748）差距 &lt;1.2%——该缺陷正是 §6.7 N8 要求的“崖点归因”的实例：崩点由自身准入 bug 而非饱和引起，必须先归因再计入结果。</li>
+<li><strong>协程帧地址误设 thread_stack</strong>（<code>7bffa3131</code>）：内联执行块在无栈协程体内以 <code>&amp;thd</code>（堆上协程帧）设置 <code>thread_stack</code>，<code>check_stack_overrun()</code> 得到由 ASLR 布局决定的垃圾差值，256 线程下假报 error 1436（“95MB 栈用量”）。这是每次启动都可能触发的潜伏 bug，反向布局时还会漏检真实溢出。修复：删除该调用——同一迭代内 <code>parse_on_reactor()</code> 已在 reactor 的真实 OS 栈上正确设置，内联执行只深数帧，边界仍有效。</li>
+</ol>
 
 <h3>6.5 负向稳定性矩阵（主验收）</h3>
 <table>
