@@ -45,6 +45,8 @@ class Coroutine_connection_handler : public Connection_handler {
   static long long hp_jobs_executed();
   static long long admission_deferred();
   static long long reactor_parsed();
+  static long long reactor_exec();
+  static long long reactor_exec_slow();
 
   // Submit → run latency of executor jobs (userspace queue wait plus the
   // OS run-queue wait of the woken worker).
@@ -80,6 +82,13 @@ extern ulong coroutine_executor_vip_workers;
 extern ulong coroutine_reactor_threads;
 /** Parse complete plain COM_QUERY packets on the reactor before execution. */
 extern bool coroutine_reactor_parse;
+/** Execute reactor-safe statements (plain non-locking SELECTs) inline on
+ *  the reactor thread, skipping the executor handoff.  Requires
+ *  coroutine_reactor_parse. */
+extern bool coroutine_reactor_exec;
+/** Inline-execution time budget in µs; exceeding it routes the connection
+ *  back to the executor pool for one second. */
+extern ulong coroutine_reactor_exec_budget_us;
 /** Admission control: max allowed submit→run queue time in µs (0 = off). */
 extern ulong coroutine_admission_queue_time_us;
 

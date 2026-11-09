@@ -1,0 +1,60 @@
+call mtr.add_suppression("Server ignores the discovered container restrictions");
+CREATE TABLE t1 (id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1, 10), (2, 20);
+# 1. Plain SELECTs are executed inline on the reactor (2 statements -> +3)
+SELECT v FROM t1 WHERE id = 1;
+v
+10
+SELECT v FROM t1 WHERE id = 2;
+v
+20
+SELECT 12 - 9 AS inline_delta;
+inline_delta
+3
+# 2. SELECT SLEEP() is not inlined (0 statements -> +1)
+SELECT SLEEP(0) AS slept;
+slept
+0
+SELECT 15 - 14 AS inline_delta;
+inline_delta
+1
+# 3. SELECT ... FOR UPDATE and transaction control are not inlined (+1)
+BEGIN;
+SELECT v FROM t1 WHERE id = 1 FOR UPDATE;
+v
+10
+COMMIT;
+SELECT 18 - 17 AS inline_delta;
+inline_delta
+1
+# 4. DML is not inlined (+1)
+UPDATE t1 SET v = v + 1 WHERE id = 1;
+INSERT INTO t1 VALUES (3, 30);
+DELETE FROM t1 WHERE id = 3;
+SELECT 21 - 20 AS inline_delta;
+inline_delta
+1
+# 5. Nothing exceeded the inline budget (no cooldown engaged)
+SELECT 0 AS slow_inline;
+slow_inline
+0
+# 6. Inline execution keeps working (aggregates too: 1 statement -> +2)
+SELECT COUNT(*) AS rows_left FROM t1;
+rows_left
+2
+SELECT 27 - 25 AS inline_delta;
+inline_delta
+2
+DROP TABLE t1;
+# 7. Dynamic toggle: OFF stops inlining immediately
+SET GLOBAL coroutine_reactor_exec = OFF;
+SELECT 42 AS answer;
+answer
+42
+SELECT 43 AS answer;
+answer
+43
+SELECT 29 - 29 AS inline_delta;
+inline_delta
+0
+SET GLOBAL coroutine_reactor_exec = ON;

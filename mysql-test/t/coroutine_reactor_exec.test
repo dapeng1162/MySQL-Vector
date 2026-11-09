@@ -1,0 +1,68 @@
+# Reactor-side inline execution (D5b) under the coroutine connection
+# handler, verified via the Coroutine_reactor_exec counters:
+#   - plain SELECTs are executed inline on the reactor
+#   - SELECT SLEEP() is NOT inlined (classifier excludes unbounded /
+#     advisory-lock functions)
+#   - SELECT ... FOR UPDATE is NOT inlined (TL_WRITE takes locks)
+#   - DML and transaction control statements are NOT inlined
+#
+# The counter snapshots are read with plain SELECTs, which are themselves
+# inlined: a snapshot reports the exec count BEFORE its own increment,
+# so each delta below equals (inlined statements between the snapshots)
+# + 1 for the leading snapshot's own inline execution.  The recorded
+# values therefore prove per-statement classification exactly.
+
+call mtr.add_suppression("Server ignores the discovered container restrictions");
+
+CREATE TABLE t1 (id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1, 10), (2, 20);
+
+--echo # 1. Plain SELECTs are executed inline on the reactor (2 statements -> +3)
+let $exec_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+SELECT v FROM t1 WHERE id = 1;
+SELECT v FROM t1 WHERE id = 2;
+let $exec_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+eval SELECT $exec_after - $exec_before AS inline_delta;
+
+--echo # 2. SELECT SLEEP() is not inlined (0 statements -> +1)
+let $exec_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+SELECT SLEEP(0) AS slept;
+let $exec_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+eval SELECT $exec_after - $exec_before AS inline_delta;
+
+--echo # 3. SELECT ... FOR UPDATE and transaction control are not inlined (+1)
+let $exec_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+BEGIN;
+SELECT v FROM t1 WHERE id = 1 FOR UPDATE;
+COMMIT;
+let $exec_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+eval SELECT $exec_after - $exec_before AS inline_delta;
+
+--echo # 4. DML is not inlined (+1)
+let $exec_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+UPDATE t1 SET v = v + 1 WHERE id = 1;
+INSERT INTO t1 VALUES (3, 30);
+DELETE FROM t1 WHERE id = 3;
+let $exec_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+eval SELECT $exec_after - $exec_before AS inline_delta;
+
+--echo # 5. Nothing exceeded the inline budget (no cooldown engaged)
+let $slow = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec_slow'`;
+eval SELECT $slow AS slow_inline;
+
+--echo # 6. Inline execution keeps working (aggregates too: 1 statement -> +2)
+let $exec_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+SELECT COUNT(*) AS rows_left FROM t1;
+let $exec_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+eval SELECT $exec_after - $exec_before AS inline_delta;
+
+DROP TABLE t1;
+
+--echo # 7. Dynamic toggle: OFF stops inlining immediately
+SET GLOBAL coroutine_reactor_exec = OFF;
+let $exec_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+SELECT 42 AS answer;
+SELECT 43 AS answer;
+let $exec_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+eval SELECT $exec_after - $exec_before AS inline_delta;
+SET GLOBAL coroutine_reactor_exec = ON;

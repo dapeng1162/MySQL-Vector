@@ -60,6 +60,7 @@
 #include "sql/sql_thd_internal_api.h" // thd_set_thread_stack
 #include "sql/sched_ext_bridge.h"     // sched_ext::init
 #include "sql/stmt_priority.h"        // stmt_priority::classify
+#include "sql/table.h"                // Table_ref
 #include "violite.h"                  // vio_is_blocking, vio_set_blocking_flag
 
 // -------------------------------------------------------------------
@@ -75,6 +76,8 @@ ulong coroutine_executor_threads = 0;
 ulong coroutine_executor_vip_workers = 1;
 ulong coroutine_reactor_threads = 1;
 bool coroutine_reactor_parse = false;
+bool coroutine_reactor_exec = false;
+ulong coroutine_reactor_exec_budget_us = 500;
 ulong coroutine_admission_queue_time_us = 2000;
 bool Coroutine_connection_handler::s_initialized = false;
 
@@ -107,6 +110,10 @@ struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
   // Set when a THD job threw an exception on the executor thread; the
   // frontend tears the connection down instead of continuing.
   bool job_threw{false};
+
+  // While now() < reactor_exec_cooldown_until, skip inline execution for
+  // this connection (a previous inline statement exceeded the budget).
+  std::chrono::steady_clock::time_point reactor_exec_cooldown_until{};
 
   // The main connection coroutine.
   coroutine::DetachedTask run();
@@ -200,6 +207,8 @@ std::atomic<long long> g_active_coroutines{0};    // live frontend coroutines
 std::atomic<long long> g_hp_jobs_submitted{0};    // jobs submitted to the HP queue
 std::atomic<long long> g_hp_jobs_executed{0};     // HP jobs that finished
 std::atomic<long long> g_reactor_parsed{0};       // queries parsed on reactors
+std::atomic<long long> g_reactor_exec{0};         // queries executed inline on reactors
+std::atomic<long long> g_reactor_exec_slow{0};    // inline executions over budget
 
 // -------------------------------------------------------------------
 // Admission control (queue-time credit)
@@ -441,6 +450,49 @@ static bool parsed_select_releases_user_lock(const THD *thd) {
   return false;
 }
 
+/// Whether the just-parsed statement is safe to execute inline on the
+/// reactor thread (D5b): a single plain SELECT that only takes plain read
+/// locks (no FOR UPDATE / LOCK IN SHARE MODE) and whose top-level select
+/// list contains no function with user-visible side effects or unbounded
+/// runtime.  Anything else — DML, locks, stored programs, advisory-lock
+/// functions — goes through the executor pool as before.  Deeply nested
+/// or expensive expressions are not detected here; the runtime budget
+/// (coroutine_reactor_exec_budget_us) plus per-connection cooldown bounds
+/// their cost.
+static bool parsed_select_is_reactor_safe(const THD *thd) {
+  const LEX *lex = thd->lex;
+  if (lex->sql_command != SQLCOM_SELECT) return false;
+  const Query_block *qb = lex->query_block;
+  if (qb == nullptr) return false;
+
+  // Only plain table reads.  At parse time a plain SELECT's tables carry
+  // the parser-only TL_READ_DEFAULT (resolved to TL_READ / TL_READ_NO_
+  // INSERTS at open_tables(), both read locks).  FOR UPDATE rewrites the
+  // descriptor to TL_WRITE and LOCK IN SHARE MODE to TL_READ_WITH_SHARED_
+  // LOCKS during contextualization, so both are excluded here and run on
+  // executors (they can block and hold locks others wait on).
+  for (Table_ref *tr = lex->query_tables; tr != nullptr;
+       tr = tr->next_global) {
+    const thr_lock_type lt = tr->lock_descriptor().type;
+    if (lt != TL_IGNORE && lt != TL_READ_DEFAULT && lt != TL_READ)
+      return false;
+  }
+
+  // Exclude advisory-lock / sleeping / unbounded functions in the
+  // top-level select list (same scope as the RELEASE_LOCK heuristic).
+  for (const Item *item : qb->fields) {
+    if (item == nullptr || item->type() != Item::FUNC_ITEM) continue;
+    const Item_func *func = down_cast<const Item_func *>(item);
+    const char *name = func->func_name();
+    if (strcmp(name, "get_lock") == 0 || strcmp(name, "sleep") == 0 ||
+        strcmp(name, "benchmark") == 0 || strcmp(name, "release_lock") == 0 ||
+        strcmp(name, "release_all_locks") == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /// Adapt a reactor-parsed statement into the pure classifier input
 /// (sql/stmt_priority.h).  Runs on the reactor thread after
 /// parse_on_reactor() and before the job is submitted, i.e. while this
@@ -665,6 +717,52 @@ coroutine::DetachedTask ConnectionState::run() {
     }
     const bool hp = stmt_prio != stmt_priority::Reason::None ||
                     sched_ext::is_lock_holder(self->thd);
+
+    // Inline execution on the reactor thread (D5b): a reactor-safe
+    // SELECT skips the executor handoff entirely (two cross-thread
+    // wakeups, epoll re-arming) and runs right here while the packet is
+    // hot in cache.  Plain TL_READ tables may still wait on MDL, so a
+    // statement that exceeds coroutine_reactor_exec_budget_us puts this
+    // connection on a 1s cooldown back to the executor path.  Requires
+    // coroutine_reactor_parse; OFF by default.
+    if (parsed && coroutine_reactor_exec &&
+        stmt_prio == stmt_priority::Reason::None &&
+        std::chrono::steady_clock::now() >=
+            self->reactor_exec_cooldown_until &&
+        parsed_select_is_reactor_safe(self->thd)) {
+      THD *thd = self->thd;
+      const auto t0 = std::chrono::steady_clock::now();
+      thd_set_thread_stack(thd, reinterpret_cast<const char *>(&thd));
+      thd->store_globals();
+      bool close_conn = true;
+      try {
+        close_conn =
+            execute_parsed_command(thd, &com_data, command, &parser_state);
+      } catch (...) {
+        LogErr(ERROR_LEVEL, ER_INTERNAL_ERROR,
+               "coroutine reactor: uncaught exception in inline execution");
+        self->job_threw = true;
+      }
+      thd->restore_globals();
+      const auto took =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - t0)
+              .count();
+      if ((ulonglong)took > coroutine_reactor_exec_budget_us) {
+        self->reactor_exec_cooldown_until =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        g_reactor_exec_slow.fetch_add(1, std::memory_order_relaxed);
+      }
+      // The admission credit was taken before parse; return it.
+      admission_job_done();
+      lock_conflict_victim = is_lock_conflict_victim(self->thd);
+      g_reactor_exec.fetch_add(1, std::memory_order_relaxed);
+      g_commands_completed.fetch_add(1, std::memory_order_relaxed);
+      if (self->connection_closed.load() || self->job_threw || close_conn)
+        break;
+      continue;
+    }
+
     if (parsed) {
       submit_thd_job(
           self,
@@ -1021,6 +1119,14 @@ long long Coroutine_connection_handler::admission_deferred() {
 
 long long Coroutine_connection_handler::reactor_parsed() {
   return g_reactor_parsed.load(std::memory_order_relaxed);
+}
+
+long long Coroutine_connection_handler::reactor_exec() {
+  return g_reactor_exec.load(std::memory_order_relaxed);
+}
+
+long long Coroutine_connection_handler::reactor_exec_slow() {
+  return g_reactor_exec_slow.load(std::memory_order_relaxed);
 }
 
 long long Coroutine_connection_handler::submit_to_run_avg_us() {

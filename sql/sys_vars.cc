@@ -3962,6 +3962,25 @@ static Sys_var_bool Sys_coroutine_reactor_parse(
     "Takes effect immediately.",
     GLOBAL_VAR(coroutine_reactor_parse), CMD_LINE(OPT_ARG), DEFAULT(false));
 
+static Sys_var_bool Sys_coroutine_reactor_exec(
+    "coroutine_reactor_exec",
+    "Execute reactor-safe statements (plain non-locking SELECTs without "
+    "advisory-lock or sleeping functions) inline on the reactor thread, "
+    "skipping the executor handoff. Requires coroutine_reactor_parse=ON. "
+    "Statements that run longer than coroutine_reactor_exec_budget_us put "
+    "their connection on a 1s cooldown back to the executor path. "
+    "Takes effect immediately.",
+    GLOBAL_VAR(coroutine_reactor_exec), CMD_LINE(OPT_ARG), DEFAULT(false));
+
+static Sys_var_ulong Sys_coroutine_reactor_exec_budget_us(
+    "coroutine_reactor_exec_budget_us",
+    "Time budget in microseconds for coroutine_reactor_exec: an inline "
+    "statement exceeding it routes its connection back to the executor "
+    "pool for one second. Takes effect immediately.",
+    GLOBAL_VAR(coroutine_reactor_exec_budget_us),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 1000000), DEFAULT(500),
+    BLOCK_SIZE(1));
+
 static Sys_var_ulong Sys_coroutine_admission_queue_time_us(
     "coroutine_admission_queue_time_us",
     "Admission control for coroutine-epoll: target maximum submit-to-run "

@@ -11493,6 +11493,23 @@ static int show_coroutine_reactor_parsed(THD *, SHOW_VAR *var, char *buff) {
   return 0;
 }
 
+static int show_coroutine_reactor_exec(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) =
+      static_cast<long>(Coroutine_connection_handler::reactor_exec());
+  return 0;
+}
+
+static int show_coroutine_reactor_exec_slow(THD *, SHOW_VAR *var,
+                                            char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) =
+      static_cast<long>(Coroutine_connection_handler::reactor_exec_slow());
+  return 0;
+}
+
 static int show_coroutine_hp_jobs_executed(THD *, SHOW_VAR *var,
                                             char *buff) {
   var->type = SHOW_LONG;
@@ -12036,6 +12053,11 @@ SHOW_VAR status_vars[] = {
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Coroutine_reactor_parsed", (char *)&show_coroutine_reactor_parsed,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Coroutine_reactor_exec", (char *)&show_coroutine_reactor_exec,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Coroutine_reactor_exec_slow",
+     (char *)&show_coroutine_reactor_exec_slow, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
     {"Coroutine_stmt_prio_kill", (char *)&show_coroutine_stmt_prio_kill,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Coroutine_stmt_prio_release_lock",
