@@ -220,46 +220,72 @@ std::atomic<long long> g_reactor_exec_slow{0};    // inline executions over budg
 // it falls below 1/4 of the target.  Deferred commands wait in the
 // frontend coroutine (never blocking a reactor thread), so overload shows
 // up as queueing delay, not as executor-pool exhaustion or client errors.
+//
+// Lock-freedom: the gate is taken once per command on the reactor and
+// returned once on a worker, so at high QPS a global mutex on that path
+// is real cacheline traffic.  g_adm_outstanding and g_adm_credits are
+// atomics; AdmissionReady::await_ready() is fully lock-free (CAS), the
+// credit return is an atomic fetch_sub, and the EWMA/credit
+// recalculation takes the mutex only on every 8th call per thread
+// (sampling: the EWMA is a smoothed average, and 1-in-8 samples at
+// hundreds of kQPS is still tens of thousands of samples per second).
 // -------------------------------------------------------------------
 
-std::mutex g_adm_mu;
-long long g_adm_credits = 64;
-long long g_adm_outstanding = 0;
-double g_adm_ewma_us = 0.0;
+std::mutex g_adm_mu;  // guards g_adm_ewma_us and credit recalculation only
+std::atomic<long long> g_adm_credits{64};
+std::atomic<long long> g_adm_outstanding{0};
+double g_adm_ewma_us = 0.0;  // guarded by g_adm_mu
 std::atomic<long long> g_admission_deferred{0};
 
 static void admission_sample(uint64_t latency_us) {
+  if (coroutine_admission_queue_time_us == 0) return;
+  thread_local uint64_t n = 0;
+  if ((++n & 7) != 0) return;  // sample 1 in 8
   std::lock_guard<std::mutex> lk(g_adm_mu);
   g_adm_ewma_us = 0.875 * g_adm_ewma_us + 0.125 * (double)latency_us;
 }
 
 static void admission_job_done() {
-  std::lock_guard<std::mutex> lk(g_adm_mu);
-  if (g_adm_outstanding > 0) g_adm_outstanding--;
+  g_adm_outstanding.fetch_sub(1, std::memory_order_relaxed);
   if (coroutine_admission_queue_time_us == 0) return;
+  thread_local uint64_t n = 0;
+  if ((++n & 7) != 0) return;  // adjust credits on 1 in 8 completions
+  std::lock_guard<std::mutex> lk(g_adm_mu);
   const double hi = (double)coroutine_admission_queue_time_us;
   const double lo = hi / 4.0;
+  const long long credits = g_adm_credits.load(std::memory_order_relaxed);
   if (g_adm_ewma_us > hi) {
-    g_adm_credits = std::max(1LL, (long long)(g_adm_credits * 0.9));
+    g_adm_credits.store(std::max(1LL, (long long)(credits * 0.9)),
+                        std::memory_order_relaxed);
   } else if (g_adm_ewma_us < lo) {
-    g_adm_credits = std::min(1LL << 20, g_adm_credits + 1);
+    g_adm_credits.store(std::min(1LL << 20, credits + 1),
+                        std::memory_order_relaxed);
   }
 }
 
 // Awaiter form of the admission gate: await_ready() tries to take one
-// credit; when none is available the caller sleeps briefly and retries.
-// Used as:  while (!(co_await AdmissionReady{self.get()})) { sleep; }
+// credit via CAS; when none is available the caller sleeps briefly and
+// retries.  Used as:  while (!(co_await AdmissionReady{self.get()})) {
+// sleep; }
 struct AdmissionReady {
   ConnectionState *self;
   bool admitted{false};
 
   bool await_ready() {
-    std::lock_guard<std::mutex> lk(g_adm_mu);
-    if (coroutine_admission_queue_time_us == 0 ||
-        g_adm_outstanding < g_adm_credits) {
-      g_adm_outstanding++;
-      admitted = true;
-      return true;
+    // With admission control disabled the credit ceiling is effectively
+    // unlimited (outstanding is still tracked for observability).
+    const long long credits =
+        coroutine_admission_queue_time_us == 0
+            ? (1LL << 30)
+            : g_adm_credits.load(std::memory_order_relaxed);
+    long long out = g_adm_outstanding.load(std::memory_order_relaxed);
+    while (out < credits) {
+      if (g_adm_outstanding.compare_exchange_weak(out, out + 1,
+                                                  std::memory_order_relaxed)) {
+        admitted = true;
+        return true;
+      }
+      // CAS failed: `out` now holds the current value; loop re-checks.
     }
     return false;
   }
