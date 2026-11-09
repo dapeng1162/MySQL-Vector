@@ -165,6 +165,121 @@ TEST_F(ReactorTest, RepeatedReadWrite) {
 }
 
 // ===================================================================
+// PersistentEntryStaysAfterEvent — after an event fires and the waiter
+// is cleared, the fd map entry must stay registered (disarmed ONESHOT)
+// so the next wait is a single MOD re-arm.
+// ===================================================================
+
+struct PersistentEntryTest {
+  Netpoller *poller{nullptr};
+  int fd{-1};
+  std::atomic<bool> done{false};
+  std::atomic<size_t> fd_count_mid{999};
+
+  DetachedTask run() {
+    bool ok = co_await poller->wait_readable(fd);
+    EXPECT_TRUE(ok);
+    char buf[8];
+    EXPECT_EQ(3, read(fd, buf, sizeof(buf)));
+    // Entry must still exist while the fd is idle (no waiter).
+    fd_count_mid.store(poller->fd_count());
+    done.store(true);
+  }
+};
+
+TEST_F(ReactorTest, PersistentEntryStaysAfterEvent) {
+  int fds[2];
+  ASSERT_EQ(0, make_socketpair(fds));
+
+  auto t = std::make_shared<PersistentEntryTest>();
+  t->poller = &m_poller;
+  t->fd = fds[0];
+  m_poller.post([t] { t->run(); });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  ASSERT_EQ(3, write(fds[1], "abc", 3));
+
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!t->done.load() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_TRUE(t->done.load());
+  // Entry persisted through the event: exactly one registration, and it
+  // is still there after the waiter was cleared.
+  EXPECT_EQ(1u, t->fd_count_mid.load());
+  EXPECT_EQ(1u, m_poller.fd_count());
+
+  // Teardown removes it.
+  m_poller.post([this, fds] { m_poller.cancel_fd(fds[0]); });
+  deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (m_poller.fd_count() > 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_EQ(0u, m_poller.fd_count());
+
+  close(fds[0]);
+  close(fds[1]);
+}
+
+// ===================================================================
+// RewaitAfterCancel — cancel() tears the entry down; a new wait on the
+// same fd must work (fresh ADD path, not a MOD on a stale entry).
+// ===================================================================
+
+struct RewaitAfterCancelTest {
+  Netpoller *poller{nullptr};
+  int fd{-1};
+  std::atomic<bool> phase1_done{false};
+  std::atomic<bool> done{false};
+  bool first_result{true};
+  bool second_result{false};
+
+  DetachedTask run() {
+    first_result = co_await poller->wait_readable(fd);
+    phase1_done.store(true);
+    // Second wait on the same fd after the entry was cancelled.
+    second_result = co_await poller->wait_readable(fd);
+    done.store(true);
+  }
+};
+
+TEST_F(ReactorTest, RewaitAfterCancel) {
+  int fds[2];
+  ASSERT_EQ(0, make_socketpair(fds));
+
+  auto t = std::make_shared<RewaitAfterCancelTest>();
+  t->poller = &m_poller;
+  t->fd = fds[0];
+  m_poller.post([t] { t->run(); });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  m_poller.post([this, fds] { m_poller.cancel_fd(fds[0]); });
+
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!t->phase1_done.load() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_TRUE(t->phase1_done.load());
+  EXPECT_FALSE(t->first_result);
+
+  // New wait must fire when data arrives on the re-registered fd.
+  ASSERT_EQ(3, write(fds[1], "xyz", 3));
+  deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!t->done.load() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_TRUE(t->done.load());
+  EXPECT_TRUE(t->second_result);
+
+  close(fds[0]);
+  close(fds[1]);
+}
+
+// ===================================================================
 // TimerSleep
 // ===================================================================
 

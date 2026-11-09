@@ -136,10 +136,12 @@ class Netpoller {
     // against these to ignore stale cancellations after fd recycling.
     const void *read_token{nullptr};
     const void *write_token{nullptr};
-    // Shared cancellation flag for each direction.  Set by cancel_fd()
-    // before resuming the waiter so the awaiter can report the result.
-    std::shared_ptr<bool> read_cancelled;
-    std::shared_ptr<bool> write_cancelled;
+    // Result flag of each waiter's awaiter (lives in the suspended
+    // coroutine's frame; the netpoller writes through it just before
+    // resuming and then clears the pointer).  Non-null iff the
+    // corresponding waiter is registered.
+    bool *read_result{nullptr};
+    bool *write_result{nullptr};
   };
 
   // ------------------------------------------------------------------
@@ -148,12 +150,16 @@ class Netpoller {
 
   /** Register interest in events on an fd and store the coroutine handle
    *  to resume when the event fires.  fd must not already have a waiter
-   *  for the same direction.  Returns false when the epoll registration
-   *  failed (e.g. the fd was closed by another thread); in that case the
-   *  waiter is completed with a cancellation result instead of being
+   *  for the same direction.  Map entries are persistent: once created
+   *  they stay registered in epoll (EPOLLONESHOT-disarmed while idle)
+   *  until cancel_fd() tears the connection down, so a re-wait is a
+   *  single EPOLL_CTL_MOD re-arm with no allocation and no map churn.
+   *  Returns false when the epoll registration failed (e.g. the fd was
+   *  closed by another thread); in that case *result is set to false so
+   *  the awaiter completes with a cancellation result instead of being
    *  left registered (and suspended) forever. */
   bool add_interest(int fd, uint32_t events, std::coroutine_handle<> h,
-                    std::shared_ptr<bool> cancelled, const void *token);
+                    bool *result, const void *token);
 
   /** Apply the current epoll events mask to the epoll fd.
    *  Returns false when both ADD and MOD failed. */
@@ -199,25 +205,22 @@ class Netpoller::ReadableAwaiter {
   bool await_ready() const noexcept { return false; }
 
   bool await_suspend(std::coroutine_handle<> h) {
-    m_cancelled = std::make_shared<bool>(false);
-    // A failed registration marks the waiter cancelled; returning false
+    // A failed registration leaves m_result false; returning false
     // resumes the coroutine immediately with an error result.
     return m_poller->add_interest(m_fd, EPOLLIN | EPOLLET | EPOLLONESHOT, h,
-                                  m_cancelled, m_token);
+                                  &m_result, m_token);
   }
 
   /** Returns true if the fd is readable, false if cancelled/timed out
    *  or if the epoll registration failed. */
-  bool await_resume() const noexcept {
-    return !(m_cancelled && *m_cancelled);
-  }
+  bool await_resume() const noexcept { return m_result; }
 
  private:
   friend class Netpoller;
   Netpoller *m_poller;
   int m_fd;
   const void *m_token;
-  std::shared_ptr<bool> m_cancelled;
+  bool m_result{false};
 };
 
 class Netpoller::WritableAwaiter {
@@ -228,21 +231,18 @@ class Netpoller::WritableAwaiter {
   bool await_ready() const noexcept { return false; }
 
   bool await_suspend(std::coroutine_handle<> h) {
-    m_cancelled = std::make_shared<bool>(false);
     return m_poller->add_interest(m_fd, EPOLLOUT | EPOLLET | EPOLLONESHOT, h,
-                                  m_cancelled, m_token);
+                                  &m_result, m_token);
   }
 
-  bool await_resume() const noexcept {
-    return !(m_cancelled && *m_cancelled);
-  }
+  bool await_resume() const noexcept { return m_result; }
 
  private:
   friend class Netpoller;
   Netpoller *m_poller;
   int m_fd;
   const void *m_token;
-  std::shared_ptr<bool> m_cancelled;
+  bool m_result{false};
 };
 
 class Netpoller::SleepAwaiter {

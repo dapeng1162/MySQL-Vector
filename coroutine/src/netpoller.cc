@@ -92,8 +92,12 @@ void Netpoller::run() {
         continue;
       }
 
-      // Snapshot waiters before any resume, then clear the map entry
-      // so that re-entrant add_interest() / cancel_fd() are safe.
+      // Snapshot waiters before any resume, then detach them from the
+      // entry so that re-entrant add_interest() / cancel_fd() are safe.
+      // The map entry itself stays registered: EPOLLONESHOT has disarmed
+      // the fd, and the next wait on this fd re-arms it with a single
+      // EPOLL_CTL_MOD (no DEL/ADD pair, no map insert/erase, no
+      // allocation).  Entries are removed only by cancel_fd().
       auto it = m_fds.find(fd);
       if (it == m_fds.end()) continue;
 
@@ -107,17 +111,15 @@ void Netpoller::run() {
       std::coroutine_handle<> read_h, write_h;
       if (want_read) {
         read_h = it->second.read_waiter;
+        if (it->second.read_result) *it->second.read_result = true;
         it->second.read_waiter = nullptr;
+        it->second.read_result = nullptr;
       }
       if (want_write) {
         write_h = it->second.write_waiter;
+        if (it->second.write_result) *it->second.write_result = true;
         it->second.write_waiter = nullptr;
-      }
-
-      // Erase the map entry if no waiters remain (before any resume).
-      if (!it->second.read_waiter && !it->second.write_waiter) {
-        epoll_ctl(m_epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
-        m_fds.erase(it);
+        it->second.write_result = nullptr;
       }
 
       // Now resume (safe: map state is already cleaned up).
@@ -200,11 +202,16 @@ void Netpoller::cancel_fd_entry(
   int fd = it->first;
   auto read_h = it->second.read_waiter;
   auto write_h = it->second.write_waiter;
-  auto read_cancelled = it->second.read_cancelled;
-  auto write_cancelled = it->second.write_cancelled;
-
-  if (read_cancelled) *read_cancelled = true;
-  if (write_cancelled) *write_cancelled = true;
+  if (it->second.read_result) {
+    *it->second.read_result = false;
+    it->second.read_result = nullptr;
+  }
+  if (it->second.write_result) {
+    *it->second.write_result = false;
+    it->second.write_result = nullptr;
+  }
+  it->second.read_waiter = nullptr;
+  it->second.write_waiter = nullptr;
 
   m_fds.erase(it);
   epoll_ctl(m_epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
@@ -218,8 +225,7 @@ void Netpoller::cancel_fd_entry(
 // -------------------------------------------------------------------
 
 bool Netpoller::add_interest(int fd, uint32_t events,
-                             std::coroutine_handle<> h,
-                             std::shared_ptr<bool> cancelled,
+                             std::coroutine_handle<> h, bool *result,
                              const void *token) {
   auto &fi = m_fds[fd];
   if (events & (EPOLLIN | EPOLLRDHUP)) {
@@ -227,26 +233,37 @@ bool Netpoller::add_interest(int fd, uint32_t events,
            "A read waiter is already registered for this fd");
     fi.read_waiter = h;
     fi.read_token = token;
-    fi.read_cancelled = std::move(cancelled);
+    fi.read_result = result;
   }
   if (events & EPOLLOUT) {
     assert(!fi.write_waiter &&
            "A write waiter is already registered for this fd");
     fi.write_waiter = h;
     fi.write_token = token;
-    fi.write_cancelled = std::move(cancelled);
+    fi.write_result = result;
   }
 
   // Always apply with EPOLLET | EPOLLONESHOT.  The caller is expected
-  // to set events flags without these; we add them here.
+  // to set events flags without these; we add them here.  A persistent
+  // entry is still registered (disarmed) in epoll, so re-arming takes
+  // the EEXIST -> MOD path in apply_epoll().
   uint32_t new_events = events | EPOLLET | EPOLLONESHOT;
   if (!apply_epoll(fd, new_events, 0)) {
     // The fd is already dead (e.g. closed by a peer thread): complete
-    // the waiter with a cancellation result instead of leaving it
-    // registered (and the coroutine suspended) forever.
-    if (fi.read_cancelled) *fi.read_cancelled = true;
-    if (fi.write_cancelled) *fi.write_cancelled = true;
+    // the waiters with a cancellation result instead of leaving them
+    // registered (and the coroutines suspended) forever.  The waiter
+    // being added resumes via await_suspend() returning false; any
+    // opposite-direction waiter is resumed here.
+    if (fi.read_result) *fi.read_result = false;
+    if (fi.write_result) *fi.write_result = false;
+    std::coroutine_handle<> other =
+        (events & EPOLLOUT) ? fi.read_waiter : fi.write_waiter;
+    fi.read_waiter = nullptr;
+    fi.write_waiter = nullptr;
+    fi.read_result = nullptr;
+    fi.write_result = nullptr;
     m_fds.erase(fd);
+    if (other) other.resume();
     return false;
   }
   return true;
@@ -254,10 +271,10 @@ bool Netpoller::add_interest(int fd, uint32_t events,
 
 bool Netpoller::apply_epoll(int fd, uint32_t new_events,
                             uint32_t) {
-  // Try ADD first; if the fd is already in epoll, fall back to MOD.
-  // This is safe because we only register interest for fds that are
-  // either newly added or have been removed from epoll by the event
-  // handler.
+  // Try ADD first; a persistent entry that was already registered (its
+  // EPOLLONESHOT mask disarmed after the last event) re-arms via MOD.
+  // Both paths are hit on the reactor thread only, so there is no
+  // registration race.
 
   epoll_event ev{};
   ev.events = new_events;
