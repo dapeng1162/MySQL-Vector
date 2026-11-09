@@ -1,6 +1,6 @@
 # coroutine / sched_ext 协同调度：工作交接
 
-> 更新时间：2026-11-06。本文是后续 agent 的入口，记录真实代码状态，不把设计目标当作已验证结果。
+> 更新时间：2026-11-09（§4.5 perf2、§4.6 vs97）。本文是后续 agent 的入口，记录真实代码状态，不把设计目标当作已验证结果。
 
 ## 1. 工作背景与目标
 
@@ -233,6 +233,51 @@ perf2 最终结果（详见 results/perf-20261106/summary-perf2.md）：
   avg 12µs→101µs。**后续方向：DML reactor 判定放宽（单行 PK UPDATE 内联）
   或交接路径削减**。
 - PS 协议下三项优化不触发亦无回退（与 perf1 持平）。
+
+## 4.6 vs97 轮（2026-11-09，pristine 9.7 vs coroutine-dev2+SCX，资源保留中）
+
+用户指定的对比：pristine 9.7（008e09c28，one-thread-per-connection，即 9.7 默认
+模型，无内置线程池）vs 当前 reactor+worker（coroutine-dev2 9491fe905，
+reactor×8 + parse + inline exec）± scx_db_sched。双 mysqld（/opt/mysql-sched-97
+与 /opt/mysql-sched-scx）共用同一 datadir 轮流启动。Ubuntu 26.04 内核
+7.0.0-38（sched_ext 可用），16c db + 8c loadgen 双 spot，sysbench 32 线程
+60s×2，PS/文本协议各一遍。报告：
+`scripts/bench/sched/results/vs97-20261109/report.html`（gen_vs97_report.py），
+原始数据同目录 `<config><proto>/`，另有 aliyun 侧
+`results/vs97-20261109/summary-vs97.md`。
+
+核心结果（60s×2 均值口径见报告；区间为两轮原始值）：
+
+- **文本协议点查：C2 302k–319k vs V97 291k–304k，追平并反超**（+5%），p99
+  持平 0.16–0.20ms；100% reactor parse、87% 内联执行。perf2 结论在内核 7.0
+  复现且更优。
+- **rw：coroutine 模型全面占优**。PS 下 C2 5163–6404 vs V97 4236–4405 TPS
+  （+22%~+45%），p99 98–105ms → 27–72ms；文本协议同样领先。**与 perf2
+  （alinux4/6.6）C2 rw 落后的结论相反——内核版本是关键变量**，值得后续
+  归因（7.0 wakeup/EEVDF 对 64-executor 更友好？）。
+- **PS 协议点查：C2 202k–209k vs V97 330k（-37%）**：COM_STMT_EXECUTE 绕过
+  reactor 路径（exec=3 证实），交接成本裸露。P1（reactor 支持 PS）再次确认为
+  最高价值项。
+- **sched_ext（C4）：点查 PS -39%（209k→127k）/ 文本 -16%（319k→268k）**，
+  rw 吞吐与 C2 持平但 PS 下 p99 更稳（25–35ms）。submit→run：C4ps 41µs vs
+  C2ps 16µs；文本下均 ~7–8µs（inline exec 绕开交接）。**方向：scx 收益在
+  争用/锁等待场景，纯吞吐场景需更轻 fast path 或按负载开关。**
+
+SCX 构建坑（Ubuntu 26.04 内核 7.0.0-38，详见 mysql-sched-bench
+ENVIRONMENT.md §3 与本轮 summary §3）：本地 6.6 内核树头缺两参
+`scx_bpf_dsq_move_to_local` compat 宏不能用；节点 BTF 生成的 vmlinux.h 也
+不行（缺 `struct scx_cmask`）；正确配方 = 节点 clone sched-ext/scx 用
+`scheds/include` + 仓库预生成 `scheds/vmlinux/arch/x86/vmlinux-v7.3-rc5-*.h`
+（`-DSCX_VMLINUX_H=`）。加载/卸载冒烟干净（enabled、3 map、无害
+"member not found" 告警）。
+
+**资源保留中（用户后续还有测试，勿释放）**：db i-0jl15tmmc3uy6tdcfxl6
+（16c，10.79.14.104/8.160.179.206）、loadgen i-0jl01sye88k16xz4qspi（8c，
+10.79.14.105/8.160.113.197），双 spot，auto-release 兜底 2026-11-09T15:30Z
+（跨点需先推迟）。state：
+`/root/src/aliyun/state/mysql-sched-vs97-20261109.json`。工作站公网 IP 在
+124.70.231.8 与 36.28.77.68 间摆动，两个 /32 均已入安全组
+sg-0jlis1x48amzqvro5ciz。
 
 ## 5. 已知边界与注意事项
 
