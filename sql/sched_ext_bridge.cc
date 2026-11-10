@@ -51,12 +51,12 @@
     dependency.
 
   tid-level publication (BPF half, HAVE_SCX_SCHEDULER only):
-     thread_job_begin(thd), called by the executor pool around each THD
-     job after store_globals(), checks whether @c thd is a lock holder
-     and, if so, writes lock_holder[current_tid] = wait_count into the
-     BPF map.  The kernel scheduler then protects *this* thread from
-     preemption while it drains the lock's critical section.  The entry
-     is removed by thread_job_end().
+     thread_job_begin(thd, lock_holder, time_sensitive), called by the
+     executor pool around each THD job after store_globals(), reuses the
+     reactor's lock-holder classification and writes lock_holder[current_tid]
+     when set.  The kernel scheduler then protects *this* thread from
+     preemption while it drains the lock's critical section.  The entry is
+     removed by thread_job_end().
 
      Compatibility path: when lock_wait_begin() runs and the holder's
      real_id is currently valid (autocommit: the holder is executing on
@@ -689,7 +689,7 @@ void thread_end() {
   s_std_tid_registry.erase(std::this_thread::get_id());
 }
 
-void thread_job_begin(THD *thd, bool time_sensitive) {
+void thread_job_begin(THD *thd, bool lock_holder, bool time_sensitive) {
   if (!s_connected || thd == nullptr) return;
 
   int32_t tid = current_tid();
@@ -718,8 +718,7 @@ void thread_job_begin(THD *thd, bool time_sensitive) {
     }
   }
 
-  uint32_t count = holder_wait_count(thd);
-  if (count > 0) {
+  if (lock_holder) {
     publish_holder(tid);
     s_thread_pub.published = true;
     s_thread_pub.tid = tid;

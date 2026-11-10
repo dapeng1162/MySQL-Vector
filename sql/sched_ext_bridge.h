@@ -141,15 +141,16 @@ std::thread::id latch_wait_holder(std::thread::id waiter);
   only now — while the holder's job is actually running on a known OS thread
   — does it publish the tid-keyed lock_holder entry to the BPF scheduler.
 
-  thread_job_begin(thd): if other transactions are waiting on locks held by
-  @c thd, publish lock_holder[current_tid] = wait_count (and blocked_by for
-  waiters currently running).  When @c time_sensitive is true (high-priority
-  queue jobs, e.g. a lock holder's COMMIT), additionally publish
-  task_tier[current_tid] = TIER_TS for the duration of the job so the
-  scheduler applies its bounded virtual-deadline bonus.
+  thread_job_begin(thd, lock_holder, time_sensitive): the reactor has already
+  classified the job before queueing it.  Reuse that decision instead of
+  locking the THD wait graph a second time on the worker.  If @c lock_holder
+  is true, publish lock_holder[current_tid].  When @c time_sensitive is true
+  (any high-priority queue job), additionally publish task_tier[current_tid] =
+  TIER_TS for the duration of the job so the scheduler applies its bounded
+  virtual-deadline bonus.
   thread_job_end(thd): remove whatever this thread published for @c thd.
 */
-void thread_job_begin(THD *thd, bool time_sensitive = false);
+void thread_job_begin(THD *thd, bool lock_holder, bool time_sensitive);
 void thread_job_end(THD *thd);
 
 /**
@@ -229,7 +230,7 @@ inline void commit_begin() {}
 inline void commit_end() {}
 inline void thread_start() {}
 inline void thread_end() {}
-inline void thread_job_begin(THD *, bool) {}
+inline void thread_job_begin(THD *, bool, bool) {}
 inline void thread_job_end(THD *) {}
 inline void lock_holder_add(my_thread_id) {}
 inline void lock_holder_remove(my_thread_id) {}

@@ -37,6 +37,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 
@@ -88,6 +89,8 @@ bool Coroutine_connection_handler::s_initialized = false;
 
 namespace {
 
+enum class Command_job_kind { Authenticate, Unparsed, Parsed };
+
 struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
   THD *thd{nullptr};
   int client_fd{-1};
@@ -103,6 +106,16 @@ struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
   std::mutex cmd_mu;
   std::coroutine_handle<> cmd_waiting{nullptr};
   std::atomic<bool> cmd_done{false};
+
+  // One command is outstanding per connection.  Keeping its complete state
+  // here lets the executor lambda capture only the shared_ptr, which fits in
+  // std::function's inline storage instead of allocating on every handoff.
+  Command_job_kind job_kind{Command_job_kind::Authenticate};
+  bool job_lock_holder{false};
+  bool job_time_sensitive{false};
+  COM_DATA com_data{};
+  enum enum_server_command command{COM_SLEEP};
+  std::optional<Parser_state> parser_state;
 
   // Results from the executor jobs.
   bool auth_ok{false};
@@ -316,26 +329,35 @@ struct AdmissionReady {
 // Executor job helpers
 // -------------------------------------------------------------------
 
-/// Run a THD-bound function on an executor pool thread.
+/// Run the connection's outstanding command on an executor pool thread.
 /// Sets up thread-local globals and stack, then signals the frontend
 /// coroutine when done.
-static void run_thd_job(std::shared_ptr<ConnectionState> self,
-                         std::function<void(THD *)> fn,
-                         bool time_sensitive = false) {
+static void run_thd_job(std::shared_ptr<ConnectionState> self) {
   admission_sample((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                        std::chrono::steady_clock::now() - self->enqueued_at)
                        .count());
   THD *thd = self->thd;
   thd_set_thread_stack(thd, reinterpret_cast<const char *>(&thd));
   thd->store_globals();
-  /* Publish the holder's wait count to the sched_ext scheduler while this
-   * job (which may hold row locks others are waiting on) runs on this OS
-   * thread.  High-priority jobs additionally run at time-sensitive tier
-   * for their duration (preempting normal work on this CPU).  No-op when
-   * not connected / not a lock holder. */
-  sched_ext::thread_job_begin(thd, time_sensitive);
+  sched_ext::thread_job_begin(thd, self->job_lock_holder,
+                              self->job_time_sensitive);
   try {
-    fn(thd);
+    switch (self->job_kind) {
+      case Command_job_kind::Authenticate: {
+        const MYSQL_SOCKET sock =
+            thd->get_protocol_classic()->get_vio()->mysql_socket;
+        mysql_socket_set_thread_owner(sock);
+        self->auth_ok = !thd_prepare_connection(thd);
+        break;
+      }
+      case Command_job_kind::Unparsed:
+        self->cmd_result = do_command(thd);
+        break;
+      case Command_job_kind::Parsed:
+        self->cmd_result = execute_parsed_command(
+            thd, &self->com_data, self->command, &*self->parser_state);
+        break;
+    }
   } catch (...) {
     // Never let an exception escape the worker thread: it would skip
     // signal_command_done() (hanging the frontend coroutine forever)
@@ -356,22 +378,18 @@ static void run_thd_job(std::shared_ptr<ConnectionState> self,
 /// high-priority queue so a lock holder's next statement (notably its
 /// COMMIT) is not stuck behind every other job in the pool.
 static void submit_thd_job(std::shared_ptr<ConnectionState> self,
-                            std::function<void(THD *)> fn,
-                            bool high_priority = false) {
+                           Command_job_kind kind, bool lock_holder = false,
+                           bool time_sensitive = false) {
   self->enqueued_at = std::chrono::steady_clock::now();
-  if (high_priority) {
+  self->job_kind = kind;
+  self->job_lock_holder = lock_holder;
+  self->job_time_sensitive = time_sensitive;
+  const bool high_priority = lock_holder || time_sensitive;
+  if (high_priority)
     g_hp_jobs_submitted.fetch_add(1, std::memory_order_relaxed);
-    Coroutine_connection_handler::executor()->submit(
-        [self = std::move(self), fn = std::move(fn)]() mutable {
-          run_thd_job(std::move(self), std::move(fn), /*time_sensitive=*/true);
-        },
-        /*high_priority=*/true);
-    return;
-  }
   Coroutine_connection_handler::executor()->submit(
-      [self = std::move(self), fn = std::move(fn)]() mutable {
-        run_thd_job(std::move(self), std::move(fn));
-      });
+      [self = std::move(self)]() mutable { run_thd_job(std::move(self)); },
+      high_priority);
 }
 
 // -------------------------------------------------------------------
@@ -653,11 +671,7 @@ coroutine::DetachedTask ConnectionState::run() {
       teardown(std::move(self));
       co_return;
     }
-    {
-      std::lock_guard<std::mutex> lk(self->cmd_mu);
-      self->cmd_done.store(false, std::memory_order_relaxed);
-      self->cmd_waiting = nullptr;
-    }
+    self->cmd_done.store(false, std::memory_order_relaxed);
     for (;;) {
       if (co_await AdmissionReady{self.get()}) break;
       g_admission_deferred.fetch_add(1, std::memory_order_relaxed);
@@ -667,13 +681,7 @@ coroutine::DetachedTask ConnectionState::run() {
         co_return;
       }
     }
-    bool auth_ok = false;
-    submit_thd_job(self, [self, &auth_ok](THD *thd) {
-      const MYSQL_SOCKET sock =
-          thd->get_protocol_classic()->get_vio()->mysql_socket;
-      mysql_socket_set_thread_owner(sock);
-      auth_ok = !thd_prepare_connection(thd);
-    });
+    submit_thd_job(self, Command_job_kind::Authenticate);
     co_await CommandDone(self.get());
 
     if (self->connection_closed.load()) {
@@ -684,7 +692,7 @@ coroutine::DetachedTask ConnectionState::run() {
       teardown(std::move(self));
       co_return;
     }
-    if (!auth_ok) {
+    if (!self->auth_ok) {
       teardown(std::move(self));
       co_return;
     }
@@ -712,13 +720,13 @@ coroutine::DetachedTask ConnectionState::run() {
     // registration stays valid.
     ensure_nonblocking(self);
 
-    // Submit the command to the executor pool.  The executor thread
-    // runs do_command() and signals us when done.
-    {
-      std::lock_guard<std::mutex> lk(self->cmd_mu);
-      self->cmd_done.store(false, std::memory_order_relaxed);
-      self->cmd_waiting = nullptr;
-    }
+    // No executor owns this connection between commands, so resetting the
+    // completion flag cannot race with signal_command_done().
+    self->cmd_done.store(false, std::memory_order_relaxed);
+    self->cmd_result = false;
+    self->com_data = COM_DATA{};
+    self->command = COM_SLEEP;
+    self->parser_state.emplace();
     bool admitted = false;
     for (;;) {
       if (co_await AdmissionReady{self.get()}) {
@@ -734,20 +742,16 @@ coroutine::DetachedTask ConnectionState::run() {
       break;
     }
 
-    COM_DATA com_data;
-    enum enum_server_command command = COM_SLEEP;
-    Parser_state parser_state;
     bool parsed = false;
     if (can_parse_on_reactor(self)) {
-      const bool close = parse_on_reactor(self, &com_data, &command,
-                                          &parser_state, &parsed);
+      const bool close = parse_on_reactor(
+          self, &self->com_data, &self->command, &*self->parser_state, &parsed);
       if (!parsed) admission_job_done();
       if (close || self->job_threw) break;
       if (!parsed) continue;
       g_reactor_parsed.fetch_add(1, std::memory_order_relaxed);
     }
 
-    bool cmd_result = false;
     // Statement-priority taxonomy (D5): rare, globally beneficial
     // statements (KILL, post-lock-conflict COMMIT/ROLLBACK, UNLOCK
     // TABLES, RELEASE_LOCK) use the high-priority queue in addition to
@@ -755,13 +759,11 @@ coroutine::DetachedTask ConnectionState::run() {
     // is a no-op when coroutine_reactor_parse is OFF.
     stmt_priority::Reason stmt_prio = stmt_priority::Reason::None;
     if (parsed) {
-      stmt_prio = stmt_priority::classify(
-          stmt_priority_input(self->thd, command, lock_conflict_victim));
+      stmt_prio = stmt_priority::classify(stmt_priority_input(
+          self->thd, self->command, lock_conflict_victim));
       if (stmt_prio != stmt_priority::Reason::None)
         stmt_priority::note_prioritized(stmt_prio);
     }
-    const bool hp = stmt_prio != stmt_priority::Reason::None ||
-                    sched_ext::is_lock_holder(self->thd);
 
     // Inline execution on the reactor thread (D5b): a reactor-safe
     // SELECT skips the executor handoff entirely (two cross-thread
@@ -790,8 +792,8 @@ coroutine::DetachedTask ConnectionState::run() {
       thd->store_globals();
       bool close_conn = true;
       try {
-        close_conn =
-            execute_parsed_command(thd, &com_data, command, &parser_state);
+        close_conn = execute_parsed_command(thd, &self->com_data, self->command,
+                                            &*self->parser_state);
       } catch (...) {
         LogErr(ERROR_LEVEL, ER_INTERNAL_ERROR,
                "coroutine reactor: uncaught exception in inline execution");
@@ -817,19 +819,12 @@ coroutine::DetachedTask ConnectionState::run() {
       continue;
     }
 
-    if (parsed) {
-      submit_thd_job(
-          self,
-          [&cmd_result, &com_data, command, &parser_state](THD *thd) {
-            cmd_result =
-                execute_parsed_command(thd, &com_data, command, &parser_state);
-          },
-          hp);
-    } else {
-      submit_thd_job(self, [&cmd_result](THD *thd) {
-        cmd_result = do_command(thd);
-      }, hp);
-    }
+    const bool lock_holder = sched_ext::is_lock_holder(self->thd);
+    const bool hp = stmt_prio != stmt_priority::Reason::None || lock_holder;
+    submit_thd_job(self,
+                   parsed ? Command_job_kind::Parsed
+                          : Command_job_kind::Unparsed,
+                   lock_holder, hp);
     co_await CommandDone(self.get());
 
     // Sample the statement outcome for the victim heuristic.  The
@@ -842,7 +837,7 @@ coroutine::DetachedTask ConnectionState::run() {
 
     if (self->connection_closed.load()) break;
     if (self->job_threw) break;  // executor job threw; tear down
-    if (cmd_result) break;  // do_command requested disconnect
+    if (self->cmd_result) break;  // do_command requested disconnect
   }
 
   teardown(std::move(self));
