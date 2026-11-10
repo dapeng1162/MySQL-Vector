@@ -139,6 +139,7 @@ static int pin_maps(struct scx_db_sched *skel) {
       {"lock_holder", skel->maps.lock_holder},
       {"rg_prio", skel->maps.rg_prio},
       {"task_tier", skel->maps.task_tier},
+      {"sem_any", skel->maps.sem_any},
   };
   size_t i;
   char path[256];

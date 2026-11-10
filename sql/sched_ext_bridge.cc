@@ -281,7 +281,11 @@ extern "C" void mysql_sched_set_thread_tier(int tier) {
 #include <bpf/bpf.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <chrono>
 #include <cstring>
+#include <thread>
+#include <unordered_set>
+#include <vector>
 
 #include "my_thread.h"  // my_thread_self
 #include "sql/resourcegroups/resource_group.h"  // Resource_group
@@ -298,6 +302,7 @@ static constexpr const char *kMapBlockedBy  = "/sys/fs/bpf/scx_db_sched/blocked_
 static constexpr const char *kMapLockHolder = "/sys/fs/bpf/scx_db_sched/lock_holder";
 static constexpr const char *kMapRgPrio     = "/sys/fs/bpf/scx_db_sched/rg_prio";
 static constexpr const char *kMapTaskTier   = "/sys/fs/bpf/scx_db_sched/task_tier";
+static constexpr const char *kMapSemAny     = "/sys/fs/bpf/scx_db_sched/sem_any";
 
 // -----------------------------------------------------------------------
 // Bridge state
@@ -308,6 +313,145 @@ static int s_fd_blocked_by  = -1;
 static int s_fd_lock_holder = -1;
 static int s_fd_rg_prio     = -1;
 static int s_fd_task_tier   = -1;
+static int s_fd_sem_any     = -1;
+
+// -----------------------------------------------------------------------
+// sem_any gate refcount.
+//
+// The BPF scheduler's enqueue/stopping fast path keys off the sem_any
+// map: absent entry → per-CPU FIFO, no vtime, no global-DSQ lock.
+// Userspace keeps that gate a conservative superset of the published
+// semantic state by counting, per tid, how many semantic reasons are
+// currently live (tier != NORMAL, commit_vip, blocked_by edge,
+// lock_holder count).  add() publishes the gate BEFORE the semantic
+// entry; remove() clears it AFTER the semantic entry is gone, so the
+// scheduler never sees a gate entry with no state behind it (only the
+// harmless reverse: state without a gate would be a bug, an extra gate
+// just costs the slow path).
+// -----------------------------------------------------------------------
+static std::mutex s_gate_mu;
+static std::unordered_map<int32_t, uint32_t> s_gate_refs;
+
+static void gate_reason_add(int32_t tid) {
+  if (tid < 0 || s_fd_sem_any < 0) return;
+  bool first = false;
+  {
+    std::lock_guard<std::mutex> lock(s_gate_mu);
+    first = ++s_gate_refs[tid] == 1;
+  }
+  if (first) {
+    uint8_t one = 1;
+    bpf_map_update_elem(s_fd_sem_any, &tid, &one, BPF_ANY);
+  }
+}
+
+static void gate_reason_remove(int32_t tid) {
+  if (tid < 0 || s_fd_sem_any < 0) return;
+  bool last = false;
+  {
+    std::lock_guard<std::mutex> lock(s_gate_mu);
+    auto it = s_gate_refs.find(tid);
+    if (it == s_gate_refs.end()) return;
+    if (it->second > 1) {
+      it->second--;
+    } else {
+      s_gate_refs.erase(it);
+      last = true;
+    }
+  }
+  if (last) bpf_map_delete_elem(s_fd_sem_any, &tid);
+}
+
+// -----------------------------------------------------------------------
+// Gate sweeper (self-healing).
+//
+// The eager add/remove pairs above keep the gate tight in the common case,
+// but the publication surface has many interleaved paths (THD lock waits
+// cleared by the granter's thread, latch edges colliding with per-job
+// lock_holder entries on the same tid, connections killed mid-wait), and
+// every missed remove leaks a gate entry.  A leaked gate does not break
+// correctness — it moves the tid to the slow path permanently.  Left
+// alone, all worker tids end up gated within minutes under a contended
+// load and the two-pool design degenerates to the single-pool behaviour.
+//
+// The sweeper is the final authority: every sweep period it rebuilds the
+// wanted gate set as the union of keys of the four semantic maps (each
+// entry == one reason, by construction), reconciles sem_any against it,
+// and rebuilds s_gate_refs from the same ground truth.  Races with the
+// eager paths are bounded: a gate removed while its state is being
+// (re-)published is re-added by the next sweep, so worst case is one
+// sweep period of slow-path scheduling for that tid.
+// -----------------------------------------------------------------------
+static std::atomic<bool> s_sweeper_started{false};
+
+/** Collect the keys of a tid-keyed hash map into `out`, counting
+ *  occurrences per tid in `refs` (used to rebuild the gate refcount). */
+static void sweep_collect(int fd, std::unordered_set<int32_t> *out,
+                          std::unordered_map<int32_t, uint32_t> *refs) {
+  if (fd < 0) return;
+  int32_t key = 0, next = 0;
+  bool first = true;
+  while (true) {
+    int ret = bpf_map_get_next_key(fd, first ? nullptr : &key, &next);
+    first = false;
+    if (ret != 0) break;
+    key = next;
+    out->insert(key);
+    ++(*refs)[key];
+  }
+}
+
+static void gate_sweep_once() {
+  std::unordered_set<int32_t> wanted;
+  std::unordered_map<int32_t, uint32_t> refs;
+  sweep_collect(s_fd_task_tier, &wanted, &refs);
+  sweep_collect(s_fd_commit_vip, &wanted, &refs);
+  sweep_collect(s_fd_blocked_by, &wanted, &refs);
+  sweep_collect(s_fd_lock_holder, &wanted, &refs);
+
+  /* Remove gates with no semantic state behind them. */
+  {
+    std::vector<int32_t> current;
+    int32_t key = 0, next = 0;
+    bool first = true;
+    while (bpf_map_get_next_key(s_fd_sem_any, first ? nullptr : &key,
+                                &next) == 0) {
+      first = false;
+      key = next;
+      current.push_back(key);
+    }
+    for (int32_t tid : current)
+      if (wanted.find(tid) == wanted.end())
+        bpf_map_delete_elem(s_fd_sem_any, &tid);
+  }
+  /* Add gates that exist semantically but are missing (e.g. a racing
+   * eager remove). */
+  for (int32_t tid : wanted) {
+    uint8_t val = 0;
+    if (bpf_map_lookup_elem(s_fd_sem_any, &tid, &val) != 0) {
+      uint8_t one = 1;
+      bpf_map_update_elem(s_fd_sem_any, &tid, &one, BPF_ANY);
+    }
+  }
+
+  /* Rebuild the refcount from ground truth so the eager paths stay
+   * balanced from here on. */
+  {
+    std::lock_guard<std::mutex> lock(s_gate_mu);
+    s_gate_refs = std::move(refs);
+  }
+}
+
+static void gate_sweeper_main() {
+  /* 2s: short enough to bound gate-leak erosion of the fast path, long
+   * enough to be invisible in CPU cost (four map walks of <= 8k entries). */
+  constexpr auto kSweepPeriod = std::chrono::seconds(2);
+  while (true) {
+    std::this_thread::sleep_for(kSweepPeriod);
+    if (!s_connected || s_fd_sem_any < 0) continue;
+    gate_sweep_once();
+  }
+}
 
 // -----------------------------------------------------------------------
 // pthread_t -> OS tid registry.
@@ -403,9 +547,15 @@ void scx_publish_wait_edge(THD *waiter, THD *holder) {
   if (count == 0) return;
 
   /* blocked_by[waiter] = holder */
+  gate_reason_add(waiter_tid);
   bpf_map_update_elem(s_fd_blocked_by, &waiter_tid, &holder_tid, BPF_ANY);
 
   /* lock_holder[holder] = wait count */
+  {
+    uint32_t old = 0;
+    if (bpf_map_lookup_elem(s_fd_lock_holder, &holder_tid, &old) != 0)
+      gate_reason_add(holder_tid);
+  }
   bpf_map_update_elem(s_fd_lock_holder, &holder_tid, &count, BPF_ANY);
 }
 
@@ -431,9 +581,11 @@ void scx_clear_wait_edge(THD *waiter, THD *holder) {
         bpf_map_update_elem(s_fd_lock_holder, &holder_tid, &count, BPF_EXIST);
       } else {
         bpf_map_delete_elem(s_fd_lock_holder, &holder_tid);
+        gate_reason_remove(holder_tid);
       }
     }
     bpf_map_delete_elem(s_fd_blocked_by, &waiter_tid);
+    gate_reason_remove(waiter_tid);
   }
 }
 
@@ -452,13 +604,18 @@ void scx_publish_latch_edge(std::thread::id owner) {
   int32_t waiter_tid = current_tid();
 
   /* blocked_by[waiter] = holder */
+  gate_reason_add(waiter_tid);
   bpf_map_update_elem(s_fd_blocked_by, &waiter_tid, &holder_tid, BPF_ANY);
 
   /* lock_holder[holder] += 1 */
   uint32_t count = 1;
   uint32_t old = 0;
-  if (bpf_map_lookup_elem(s_fd_lock_holder, &holder_tid, &old) == 0)
+  if (bpf_map_lookup_elem(s_fd_lock_holder, &holder_tid, &old) == 0) {
     count = old + 1;
+  } else {
+    /* Entry created: register the gate reason for the holder. */
+    gate_reason_add(holder_tid);
+  }
   bpf_map_update_elem(s_fd_lock_holder, &holder_tid, &count, BPF_ANY);
 }
 
@@ -470,6 +627,7 @@ void scx_clear_latch_edge() {
   if (bpf_map_lookup_elem(s_fd_blocked_by, &waiter_tid, &holder_tid) != 0)
     return;
   bpf_map_delete_elem(s_fd_blocked_by, &waiter_tid);
+  gate_reason_remove(waiter_tid);
 
   uint32_t count = 0;
   if (bpf_map_lookup_elem(s_fd_lock_holder, &holder_tid, &count) == 0) {
@@ -478,6 +636,7 @@ void scx_clear_latch_edge() {
       bpf_map_update_elem(s_fd_lock_holder, &holder_tid, &count, BPF_EXIST);
     } else {
       bpf_map_delete_elem(s_fd_lock_holder, &holder_tid);
+      gate_reason_remove(holder_tid);
     }
   }
 }
@@ -524,6 +683,7 @@ void thread_job_begin(THD *thd, bool time_sensitive) {
         int32_t val = prio;
         bpf_map_update_elem(s_fd_rg_prio, &tid, &val, BPF_ANY);
         int32_t tier = (prio > 0) ? kTierBG : kTierTS;
+        gate_reason_add(tid);
         bpf_map_update_elem(s_fd_task_tier, &tid, &tier, BPF_ANY);
         s_thread_pub.published_rg_tier = true;
       }
@@ -532,6 +692,9 @@ void thread_job_begin(THD *thd, bool time_sensitive) {
 
   uint32_t count = holder_wait_count(thd);
   if (count > 0) {
+    uint32_t old = 0;
+    if (bpf_map_lookup_elem(s_fd_lock_holder, &tid, &old) != 0)
+      gate_reason_add(tid);
     bpf_map_update_elem(s_fd_lock_holder, &tid, &count, BPF_ANY);
     s_thread_pub.published = true;
     s_thread_pub.tid = tid;
@@ -544,6 +707,10 @@ void thread_job_begin(THD *thd, bool time_sensitive) {
    * drain so blocked waiters can proceed. */
   if (time_sensitive) {
     int32_t ts = kTierTS;
+    /* rg-tier (if any) already registered a gate reason for the same
+     * task_tier entry — do not double-count. */
+    if (!s_thread_pub.published_rg_tier)
+      gate_reason_add(tid);
     bpf_map_update_elem(s_fd_task_tier, &tid, &ts, BPF_ANY);
     s_thread_pub.published_ts_tier = true;
     s_thread_pub.tid = tid;
@@ -560,6 +727,7 @@ void thread_job_end(THD *thd) {
   if (tid < 0) tid = current_tid();
   if (s_thread_pub.published) {
     bpf_map_delete_elem(s_fd_lock_holder, &tid);
+    gate_reason_remove(tid);
     s_thread_pub.published = false;
   }
   if (s_thread_pub.published_rg_tier) {
@@ -567,6 +735,7 @@ void thread_job_end(THD *thd) {
   }
   if (s_thread_pub.published_ts_tier || s_thread_pub.published_rg_tier) {
     bpf_map_delete_elem(s_fd_task_tier, &tid);
+    gate_reason_remove(tid);
   }
   s_thread_pub.published_ts_tier = false;
   s_thread_pub.published_rg_tier = false;
@@ -578,8 +747,10 @@ void set_thread_tier(int tier) {
   int32_t tid = current_tid();
   if (tier == kTierNormal) {
     bpf_map_delete_elem(s_fd_task_tier, &tid);
+    gate_reason_remove(tid);
   } else {
     int32_t val = tier;
+    gate_reason_add(tid);
     bpf_map_update_elem(s_fd_task_tier, &tid, &val, BPF_ANY);
   }
 }
@@ -590,6 +761,7 @@ void commit_begin() {
   if (!s_connected) return;
   int32_t tid = current_tid();
   uint8_t val = 1;
+  gate_reason_add(tid);
   bpf_map_update_elem(s_fd_commit_vip, &tid, &val, BPF_ANY);
 }
 
@@ -597,13 +769,15 @@ void commit_end() {
   if (!s_connected) return;
   int32_t tid = current_tid();
   bpf_map_delete_elem(s_fd_commit_vip, &tid);
+  gate_reason_remove(tid);
 }
 
 void lock_holder_add(my_thread_id holder_tid) {
   if (!s_connected) return;
   int32_t holder = static_cast<int32_t>(holder_tid);
   uint32_t count = 0;
-  bpf_map_lookup_elem(s_fd_lock_holder, &holder, &count);
+  if (bpf_map_lookup_elem(s_fd_lock_holder, &holder, &count) != 0)
+    gate_reason_add(holder);
   count++;
   bpf_map_update_elem(s_fd_lock_holder, &holder, &count, BPF_ANY);
 }
@@ -618,6 +792,7 @@ void lock_holder_remove(my_thread_id holder_tid) {
       bpf_map_update_elem(s_fd_lock_holder, &holder, &count, BPF_EXIST);
     } else {
       bpf_map_delete_elem(s_fd_lock_holder, &holder);
+      gate_reason_remove(holder);
     }
   }
 }
@@ -639,10 +814,25 @@ void init() {
   s_fd_rg_prio     = open_map(kMapRgPrio);
   /* task_tier is new; tolerate its absence (older scheduler build). */
   s_fd_task_tier   = open_map(kMapTaskTier);
+  /* sem_any gate (two-pool fast path); required — a v5 scheduler
+   * without it would fast-path every task and drop all semantics. */
+  s_fd_sem_any     = open_map(kMapSemAny);
 
   if (s_fd_commit_vip >= 0 && s_fd_blocked_by >= 0 &&
-      s_fd_lock_holder >= 0 && s_fd_rg_prio >= 0) {
+      s_fd_lock_holder >= 0 && s_fd_rg_prio >= 0 && s_fd_sem_any >= 0) {
     s_connected = true;
+    /* Fresh scheduler session: any refcount state from a previous
+     * session is meaningless (the BPF maps were recreated empty). */
+    {
+      std::lock_guard<std::mutex> lock(s_gate_mu);
+      s_gate_refs.clear();
+    }
+    /* Start the gate sweeper once per process.  It is a detached thread
+     * that only touches the BPF fds and leaky-static state, so process
+     * exit needs no join. */
+    if (!s_sweeper_started.exchange(true)) {
+      std::thread(gate_sweeper_main).detach();
+    }
   } else {
     /* Partial failure — close whatever we opened. */
     close_map(s_fd_commit_vip);
@@ -650,11 +840,13 @@ void init() {
     close_map(s_fd_lock_holder);
     close_map(s_fd_rg_prio);
     close_map(s_fd_task_tier);
+    close_map(s_fd_sem_any);
     s_fd_commit_vip  = -1;
     s_fd_blocked_by  = -1;
     s_fd_lock_holder = -1;
     s_fd_rg_prio     = -1;
     s_fd_task_tier   = -1;
+    s_fd_sem_any     = -1;
     s_connected = false;
   }
 }
