@@ -1,6 +1,6 @@
 # coroutine / sched_ext 协同调度：工作交接
 
-> 更新时间：2026-11-09（§4.5 perf2、§4.6 vs97）。本文是后续 agent 的入口，记录真实代码状态，不把设计目标当作已验证结果。
+> 更新时间：2026-11-10（§4.7 paper64、§4.8 c4perf）。本文是后续 agent 的入口，记录真实代码状态，不把设计目标当作已验证结果。
 
 ## 1. 工作背景与目标
 
@@ -321,6 +321,56 @@ coroutine_latch_status），云端增量重建后复测通过。BenchBase v2023 
 **资源仍保留（用户后续还有测试，勿释放）**：同 4.6 双节点；auto-release 兜底
 2026-11-09T15:30Z（=23:30 CST），若跨点需先推迟。当前 db 节点无 mysqld、
 loadgen 无 java 残留，处于干净空闲态。
+
+## 4.8 c4perf 轮（2026-11-10，C4 vs V97 持平攻关，资源保留中）
+
+目标：把 C4（coroutine + scx 语义调度）对 V97（pristine 9.7 线程模型）
+的吞吐差距追到持平。起点 rw256：V97 7829 / C2 7237 / C4(v4) 6692 TPS
+（-14.5%）。结果与过程数据：
+`aliyun/mysql-sched-bench/results/c4perf-20261110/summary.md`。
+
+perf 归因（30s 稳态，v4）：BPF 直接成本 14.07 CPU-s = 16 核 2.84%
+（dispatch 859ns×9.5M 为大头，全局 vtime DSQ 自旋锁+rbtree），
+cpu-migrations 73.6k/s = C2 的 2.5×（全局池无亲和性）。三项叠加解释
+C2→C4 的 -7.5%。
+
+两个修复轮次（均独立 commit 已 push github/coroutine-dev2）：
+
+1. **v5 两池化**（`30260af4b`）：无语义状态任务 → per-CPU FIFO DSQ
+   （零 vtime 计算、仅本 CPU 锁）；仅携带语义状态（commit VIP、锁持有、
+   PI waiter、BG 层）的任务进全局 EEVDF DSQ；dispatch 先 EEVDF 后本地
+   FIFO 再轮询窃取（工作守恒）；TS 层插队本 CPU FIFO 头+kick。gate
+   （sem_any）为引用计数，先加后发布/先清后删。注意：per-CPU DSQ 创建
+   必须 node=-1；不能用 SCX_DSQ_LOCAL（6.6+ balance_one 只在 builtin
+   local 空时才调 ops.dispatch，会饿死语义池）。
+2. **v6 泄漏修复**（`17b1f9420`）：lock_holder 计数用跨系统调用
+   check-then-act RMW 维护，并发 clear 丢更新 → 永久残留 → gate 引用
+   计数泄漏 → 数分钟内全部 worker 被 gate → 退化回慢路径（TPC-C 半程
+   fastpath 只剩 30%）。修复：值改 {count=1, ts_ns} 布尔语义（幂等发布
+   {1,now}、clear 直接删、无 RMW），BPF 侧 HOLDER_TTL_NS=1s 过期不认，
+   sweeper 2s GC。验证：t64 60s 后空闲 4s，lock_holder/blocked_by/
+   commit_vip 全 0，sem_any=15=task_tier（仅启动线程钉住）。
+
+最终结果（同日同集群）：
+
+- **rw256（60s sysbench oltp_read_write）**：V97 7829 / C2 7237 /
+  C4-v4 6692 / C4-v5 7239 / **C4-v6 7167、7125（两轮）**。
+  调度器开销归零（C4 ≈ C2）；残差 -8% 是 C2↔V97 协程模型差距
+  （C2 在 t256 留 ~9% CPU 空闲），属另一工作项。
+- **ratescan（open-loop 点查 25k→300k，64 线程）**：v5 起 300k 档
+  p95 0.28ms（v4 曾 3.49ms 爆炸；C2 0.25 / V97 0.30），尾延迟修复确认。
+- **TPC-C（干净库 32w/64t/180s，顺序 V97→C2→C4）**：V97 2247.7 /
+  C2 2179.2（-3.0%）/ C4-v6 2137.9（-4.9% vs V97，**-1.9% vs C2**）；
+  NewOrder p99 三者 702-738ms 打平。TPC-C 跨 run 库增长对最后的 C4
+  略不利，C4↔C2 的 -1.9% 更接近调度器真实残差。
+
+部署坑（已写入 `mysql-sched-bench/ENVIRONMENT.md` §9）：`rsync -a`
+保留旧 mtime → make 跳过重建（bridge 没编进去，sem_any 全空，语义静默
+绕过）；同步后 touch 或 `--no-times`，验证 `strings mysqld | grep sem_any`。
+
+**资源保留中（用户后续还有测试，勿释放）**：双节点同 4.6/4.7
+（db `i-0jlde5e4b4n8ea717zz0`，loadgen `i-0jl9k261boqz655doivn`），
+auto-release 兜底 2026-11-10T12:40:40Z。
 
 ## 5. 已知边界与注意事项
 
