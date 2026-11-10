@@ -1,0 +1,108 @@
+# Inline COM_STMT_EXECUTE (binary protocol, D5b) under the coroutine
+# connection handler, verified via the Coroutine_reactor_exec counters:
+#   - prepared plain SELECTs are executed inline on the reactor
+#   - a prepared SELECT SLEEP() is NOT inlined (classifier excludes
+#     unbounded / advisory-lock functions)
+#   - a prepared SELECT ... FOR UPDATE is NOT inlined (TL_WRITE takes
+#     locks)
+#   - prepared DML is NOT inlined
+#   - the binary-protocol inline path does not depend on
+#     coroutine_reactor_parse (text-protocol inlining does)
+#
+# Requires mysqltest --ps-protocol so the statements below are sent as
+# COM_STMT_PREPARE + COM_STMT_EXECUTE; run manually with:
+#   ./mtr --ps-protocol coroutine_ps_exec
+#
+# The counter snapshots are read with plain SELECTs, which are NOT
+# ps-converted (let-assignment queries bypass run_query) and are
+# themselves inlined via the text path: a snapshot reports the exec
+# count BEFORE its own increment, so each delta below equals (inlined
+# statements between the snapshots) + 1 for the leading snapshot's own
+# inline execution.  The recorded values therefore prove per-statement
+# classification exactly.  Section 7 turns reactor parsing OFF, which
+# stops inlining the snapshots themselves: its delta is exactly the
+# number of inlined prepared statements.
+
+call mtr.add_suppression("Server ignores the discovered container restrictions");
+
+if (!$PS_PROTOCOL)
+{
+  skip Need binary protocol, run with: mtr --ps-protocol coroutine_ps_exec;
+}
+
+CREATE TABLE t1 (id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1, 10), (2, 20);
+
+--echo # 1. Prepared plain SELECTs are executed inline on the reactor (2 statements -> +3)
+let $exec_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+SELECT v FROM t1 WHERE id = 1;
+SELECT v FROM t1 WHERE id = 2;
+let $exec_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+let $inline_delta = `SELECT $exec_after - $exec_before`;
+--echo inline_delta $inline_delta
+
+--echo # 2. A prepared SELECT SLEEP() is not inlined (0 statements -> +1)
+let $exec_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+SELECT SLEEP(0) AS slept;
+let $exec_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+let $inline_delta = `SELECT $exec_after - $exec_before`;
+--echo inline_delta $inline_delta
+
+--echo # 3. A prepared SELECT ... FOR UPDATE is not inlined; transaction
+--echo #    control (text protocol) is not inlined either (+1)
+let $exec_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+BEGIN;
+SELECT v FROM t1 WHERE id = 1 FOR UPDATE;
+COMMIT;
+let $exec_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+let $inline_delta = `SELECT $exec_after - $exec_before`;
+--echo inline_delta $inline_delta
+
+--echo # 4. Prepared DML is not inlined (+1)
+let $exec_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+UPDATE t1 SET v = v + 1 WHERE id = 1;
+INSERT INTO t1 VALUES (3, 30);
+DELETE FROM t1 WHERE id = 3;
+let $exec_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+let $inline_delta = `SELECT $exec_after - $exec_before`;
+--echo inline_delta $inline_delta
+
+--echo # 5. Nothing exceeded the inline budget (no cooldown engaged)
+let $slow = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec_slow'`;
+let $slow_inline = `SELECT $slow`;
+--echo slow_inline $slow_inline
+
+--echo # 6. Inline execution keeps working (aggregates too: 1 statement -> +2)
+let $exec_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+SELECT COUNT(*) AS rows_left FROM t1;
+let $exec_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+let $inline_delta = `SELECT $exec_after - $exec_before`;
+--echo inline_delta $inline_delta
+
+--echo # 7. The binary-protocol inline path does not depend on reactor-side
+--echo #    parsing: with coroutine_reactor_parse=OFF the text-protocol
+--echo #    snapshot queries stop being inlined while prepared SELECTs are
+--echo #    still executed inline (2 statements -> +2, no snapshot +1)
+SET GLOBAL coroutine_reactor_parse = OFF;
+let $exec_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+SELECT v FROM t1 WHERE id = 1;
+SELECT v FROM t1 WHERE id = 2;
+let $exec_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+let $inline_delta = `SELECT $exec_after - $exec_before`;
+--echo inline_delta $inline_delta
+SET GLOBAL coroutine_reactor_parse = ON;
+
+--echo # 8. Dynamic toggle: OFF stops inlining immediately
+SET GLOBAL coroutine_reactor_exec = OFF;
+let $exec_before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+SELECT 42 AS answer;
+SELECT 43 AS answer;
+let $exec_after = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Coroutine_reactor_exec'`;
+let $inline_delta = `SELECT $exec_after - $exec_before`;
+--echo inline_delta $inline_delta
+SET GLOBAL coroutine_reactor_exec = ON;
+
+DROP TABLE t1;
+
+--echo # 9. Server still healthy after the binary-protocol inline path
+SELECT 1 AS ok;

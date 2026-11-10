@@ -3964,9 +3964,11 @@ static Sys_var_bool Sys_coroutine_reactor_parse(
 
 static Sys_var_bool Sys_coroutine_reactor_exec(
     "coroutine_reactor_exec",
-    "Execute reactor-safe statements (plain non-locking SELECTs without "
-    "advisory-lock or sleeping functions) inline on the reactor thread, "
-    "skipping the executor handoff. Requires coroutine_reactor_parse=ON. "
+    "Execute reactor-safe statements inline on the reactor thread, "
+    "skipping the executor handoff: plain non-locking SELECTs without "
+    "advisory-lock or sleeping functions, both for the text protocol "
+    "(requires coroutine_reactor_parse=ON) and for binary-protocol "
+    "COM_STMT_EXECUTE of equally classified prepared SELECTs. "
     "Statements that run longer than coroutine_reactor_exec_budget_us put "
     "their connection on a 1s cooldown back to the executor path. "
     "Takes effect immediately.",

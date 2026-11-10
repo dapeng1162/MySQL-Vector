@@ -1,0 +1,11 @@
+# Run with the coroutine connection handler, reactor-side parsing and
+# reactor-side inline execution enabled.  The budget is raised far above
+# cold-path first-execution cost so the 1s cooldown never engages during
+# the test (the classifier cases below do not depend on the budget).
+--thread-handling=coroutine-epoll
+--coroutine-reactor-parse=ON
+--coroutine-reactor-exec=ON
+--coroutine-reactor-exec-budget-us=100000
+--coroutine-reactor-threads=2
+--coroutine-executor-threads=8
+--skip-log-bin

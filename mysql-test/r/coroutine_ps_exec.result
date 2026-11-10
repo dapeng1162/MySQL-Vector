@@ -1,0 +1,64 @@
+call mtr.add_suppression("Server ignores the discovered container restrictions");
+CREATE TABLE t1 (id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1, 10), (2, 20);
+# 1. Prepared plain SELECTs are executed inline on the reactor (2 statements -> +3)
+SELECT v FROM t1 WHERE id = 1;
+v
+10
+SELECT v FROM t1 WHERE id = 2;
+v
+20
+inline_delta 3
+# 2. A prepared SELECT SLEEP() is not inlined (0 statements -> +1)
+SELECT SLEEP(0) AS slept;
+slept
+0
+inline_delta 1
+# 3. A prepared SELECT ... FOR UPDATE is not inlined; transaction
+#    control (text protocol) is not inlined either (+1)
+BEGIN;
+SELECT v FROM t1 WHERE id = 1 FOR UPDATE;
+v
+10
+COMMIT;
+inline_delta 1
+# 4. Prepared DML is not inlined (+1)
+UPDATE t1 SET v = v + 1 WHERE id = 1;
+INSERT INTO t1 VALUES (3, 30);
+DELETE FROM t1 WHERE id = 3;
+inline_delta 1
+# 5. Nothing exceeded the inline budget (no cooldown engaged)
+slow_inline 0
+# 6. Inline execution keeps working (aggregates too: 1 statement -> +2)
+SELECT COUNT(*) AS rows_left FROM t1;
+rows_left
+2
+inline_delta 2
+# 7. The binary-protocol inline path does not depend on reactor-side
+#    parsing: with coroutine_reactor_parse=OFF the text-protocol
+#    snapshot queries stop being inlined while prepared SELECTs are
+#    still executed inline (2 statements -> +2, no snapshot +1)
+SET GLOBAL coroutine_reactor_parse = OFF;
+SELECT v FROM t1 WHERE id = 1;
+v
+11
+SELECT v FROM t1 WHERE id = 2;
+v
+20
+inline_delta 2
+SET GLOBAL coroutine_reactor_parse = ON;
+# 8. Dynamic toggle: OFF stops inlining immediately
+SET GLOBAL coroutine_reactor_exec = OFF;
+SELECT 42 AS answer;
+answer
+42
+SELECT 43 AS answer;
+answer
+43
+inline_delta 0
+SET GLOBAL coroutine_reactor_exec = ON;
+DROP TABLE t1;
+# 9. Server still healthy after the binary-protocol inline path
+SELECT 1 AS ok;
+ok
+1

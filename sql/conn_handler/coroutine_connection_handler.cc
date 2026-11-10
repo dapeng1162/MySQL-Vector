@@ -58,6 +58,7 @@
 #include "sql/sql_connect.h"          // thd_prepare_connection, close_connection
 #include "sql/sql_lex.h"              // Parser_state
 #include "sql/sql_parse.h"            // do_command
+#include "sql/sql_prepare.h"          // Prepared_statement
 #include "sql/sql_thd_internal_api.h" // thd_set_thread_stack
 #include "sql/sched_ext_bridge.h"     // sched_ext::init
 #include "sql/stmt_priority.h"        // stmt_priority::classify
@@ -492,13 +493,12 @@ static bool parse_on_reactor(const std::shared_ptr<ConnectionState> &self,
 // Statement-priority taxonomy (D5)
 // -------------------------------------------------------------------
 
-/// Whether the just-parsed statement's top-level SELECT list contains
-/// RELEASE_LOCK()/RELEASE_ALL_LOCKS(): executing it releases advisory
-/// user locks that other sessions may be blocked on in GET_LOCK().
+/// Whether a just-parsed (or prepared) SELECT's top-level SELECT list
+/// contains RELEASE_LOCK()/RELEASE_ALL_LOCKS(): executing it releases
+/// advisory user locks that other sessions may be blocked on in GET_LOCK().
 /// Only the top-level SELECT list is inspected; a RELEASE_LOCK() hidden
 /// in a subquery or a WHERE clause is not detected (documented limit).
-static bool parsed_select_releases_user_lock(const THD *thd) {
-  const LEX *lex = thd->lex;
+static bool select_lex_releases_user_lock(const LEX *lex) {
   if (lex->sql_command != SQLCOM_SELECT) return false;
   const Query_block *qb = lex->query_block;
   if (qb == nullptr) return false;
@@ -513,17 +513,21 @@ static bool parsed_select_releases_user_lock(const THD *thd) {
   return false;
 }
 
-/// Whether the just-parsed statement is safe to execute inline on the
-/// reactor thread (D5b): a single plain SELECT that only takes plain read
-/// locks (no FOR UPDATE / LOCK IN SHARE MODE) and whose top-level select
+/// Whether a just-parsed (or prepared) statement is safe to execute inline
+/// on the reactor thread (D5b): a single plain SELECT that only takes plain
+/// read locks (no FOR UPDATE / LOCK IN SHARE MODE) and whose top-level select
 /// list contains no function with user-visible side effects or unbounded
 /// runtime.  Anything else — DML, locks, stored programs, advisory-lock
 /// functions — goes through the executor pool as before.  Deeply nested
 /// or expensive expressions are not detected here; the runtime budget
 /// (coroutine_reactor_exec_budget_us) plus per-connection cooldown bounds
 /// their cost.
-static bool parsed_select_is_reactor_safe(const THD *thd) {
-  const LEX *lex = thd->lex;
+///
+/// The check is over the LEX alone so it applies both to a COM_QUERY just
+/// parsed on the reactor (thd->lex) and to a prepared statement's retained
+/// parse tree (Prepared_statement::m_lex), which keeps the same parser-only
+/// lock descriptors between executions.
+static bool select_lex_is_reactor_safe(const LEX *lex) {
   if (lex->sql_command != SQLCOM_SELECT) return false;
   const Query_block *qb = lex->query_block;
   if (qb == nullptr) return false;
@@ -534,7 +538,7 @@ static bool parsed_select_is_reactor_safe(const THD *thd) {
   // descriptor to TL_WRITE and LOCK IN SHARE MODE to TL_READ_WITH_SHARED_
   // LOCKS during contextualization, so both are excluded here and run on
   // executors (they can block and hold locks others wait on).
-  for (Table_ref *tr = lex->query_tables; tr != nullptr;
+  for (const Table_ref *tr = lex->query_tables; tr != nullptr;
        tr = tr->next_global) {
     const thr_lock_type lt = tr->lock_descriptor().type;
     if (lt != TL_IGNORE && lt != TL_READ_DEFAULT && lt != TL_READ)
@@ -568,7 +572,7 @@ static stmt_priority::Input stmt_priority_input(
   in.parsed = true;
   in.sql_command = thd->lex->sql_command;
   in.holds_open_tables = thd->open_tables != nullptr;
-  in.contains_release_lock = parsed_select_releases_user_lock(thd);
+  in.contains_release_lock = select_lex_releases_user_lock(thd->lex);
   in.lock_conflict_victim = lock_conflict_victim;
   return in;
 }
@@ -583,6 +587,94 @@ static bool is_lock_conflict_victim(const THD *thd) {
   return da->is_error() &&
          (da->mysql_errno() == ER_LOCK_DEADLOCK ||
           da->mysql_errno() == ER_LOCK_WAIT_TIMEOUT);
+}
+
+// -------------------------------------------------------------------
+// Inline COM_STMT_EXECUTE (binary protocol, D5b)
+// -------------------------------------------------------------------
+
+/// Peek the pending command packet and decide whether it is a
+/// COM_STMT_EXECUTE that can run inline on the reactor thread: a plain
+/// prepared SELECT with no cursor, no bulk iteration, whose whole packet
+/// is already in the kernel buffer (so the inline my_net_read() cannot
+/// block).  The prepared statement is located by id and classified with
+/// the same taxonomy as the text-protocol inline path, applied to the
+/// statement's retained parse tree; the classification therefore also
+/// excludes FOR UPDATE / LOCK IN SHARE MODE prepared SELECTs and prepared
+/// DML.  Runs on the reactor thread between commands, where this
+/// coroutine has exclusive access to the THD and its statement map.
+static bool can_inline_stmt_execute(
+    const std::shared_ptr<ConnectionState> &self) {
+  if (!coroutine_reactor_exec) return false;
+  if (std::chrono::steady_clock::now() < self->reactor_exec_cooldown_until)
+    return false;
+  THD *thd = self->thd;
+  NET *net = thd->get_protocol_classic()->get_net();
+  Vio *vio = thd->get_protocol_classic()->get_vio();
+  if (vio == nullptr || vio->ssl_arg != nullptr || net->compress ||
+      has_buffered_input(thd)) {
+    return false;
+  }
+
+  // Peek the MySQL packet header plus the fixed COM_STMT_EXECUTE body:
+  // cmd(1) stmt_id(4) flags(1) iteration_count(4).  Bound parameters may
+  // follow but are not needed for the routing decision.
+  uchar peek[NET_HEADER_SIZE + 10];
+  const ssize_t n =
+      mysql_socket_recv(vio->mysql_socket,
+                        reinterpret_cast<SOCKBUF_T *>(peek), sizeof(peek),
+                        MSG_PEEK | MSG_DONTWAIT);
+  if (n != static_cast<ssize_t>(sizeof(peek))) return false;
+  const size_t packet_length = uint3korr(peek);
+  if (packet_length < 10 || peek[NET_HEADER_SIZE] != COM_STMT_EXECUTE) {
+    return false;
+  }
+  // A server-side cursor (CURSOR_TYPE_READ_ONLY) is served row-by-row by
+  // COM_STMT_FETCH and bulk execution (iteration_count != 1) re-runs the
+  // statement per parameter set: both take slower paths than the inline
+  // budget is meant for.  PARAMETER_COUNT_AVAILABLE (query attributes)
+  // is fine to inline.
+  const uchar flags = peek[NET_HEADER_SIZE + 5];
+  const uint32 iteration_count = uint4korr(peek + NET_HEADER_SIZE + 6);
+  if (iteration_count != 1 || (flags & CURSOR_TYPE_READ_ONLY)) return false;
+
+  // The whole packet must already be in the kernel buffer so that the
+  // inline do_command() -> my_net_read() completes without ever blocking
+  // the reactor thread.
+  int available = 0;
+  if (ioctl(self->client_fd, FIONREAD, &available) < 0) return false;
+  if (available < 0 ||
+      static_cast<size_t>(available) < NET_HEADER_SIZE + packet_length)
+    return false;
+
+  Prepared_statement *stmt =
+      thd->stmt_map.find(uint4korr(peek + NET_HEADER_SIZE + 1));
+  return stmt != nullptr && select_lex_is_reactor_safe(stmt->m_lex);
+}
+
+/// Read and execute an inline-routed COM_STMT_EXECUTE on the reactor
+/// thread.  This runs exactly the code an Unparsed executor job would
+/// run (do_command: my_net_read + dispatch -> mysql_stmt_execute), only
+/// on this thread while the packet is hot in cache.  A regular function
+/// (not a coroutine body) so &thd is a real OS-stack address for
+/// thd_set_thread_stack().
+static bool inline_stmt_execute(
+    const std::shared_ptr<ConnectionState> &self) {
+  THD *thd = self->thd;
+  thd_set_thread_stack(thd, reinterpret_cast<const char *>(&thd));
+  thd->store_globals();
+  mysql_socket_set_thread_owner(
+      thd->get_protocol_classic()->get_vio()->mysql_socket);
+  bool close_connection = true;
+  try {
+    close_connection = do_command(thd);
+  } catch (...) {
+    LogErr(ERROR_LEVEL, ER_INTERNAL_ERROR,
+           "coroutine reactor: uncaught exception in inline COM_STMT_EXECUTE");
+    self->job_threw = true;
+  }
+  thd->restore_globals();
+  return close_connection;
 }
 
 /// Clean up THD, VIO, globals, fd, and decrement the connection count.
@@ -776,7 +868,7 @@ coroutine::DetachedTask ConnectionState::run() {
         stmt_prio == stmt_priority::Reason::None &&
         std::chrono::steady_clock::now() >=
             self->reactor_exec_cooldown_until &&
-        parsed_select_is_reactor_safe(self->thd)) {
+        select_lex_is_reactor_safe(self->thd->lex)) {
       THD *thd = self->thd;
       const auto t0 = std::chrono::steady_clock::now();
       /* Do NOT call thd_set_thread_stack() here: this code lives in a
@@ -810,6 +902,36 @@ coroutine::DetachedTask ConnectionState::run() {
         g_reactor_exec_slow.fetch_add(1, std::memory_order_relaxed);
       }
       // The admission credit was taken before parse; return it.
+      admission_job_done();
+      lock_conflict_victim = is_lock_conflict_victim(self->thd);
+      g_reactor_exec.fetch_add(1, std::memory_order_relaxed);
+      g_commands_completed.fetch_add(1, std::memory_order_relaxed);
+      if (self->connection_closed.load() || self->job_threw || close_conn)
+        break;
+      continue;
+    }
+
+    // Inline execution for the binary protocol (D5b): a COM_STMT_EXECUTE
+    // of a reactor-safe prepared SELECT runs here instead of paying the
+    // executor handoff, exactly like the text-protocol inline path above.
+    // The packet has been peeked to be fully buffered and the prepared
+    // statement classified, so the same budget / cooldown machinery
+    // bounds the work; a reprepare (schema change) or an MDL wait can
+    // still make one execution slow, which then cools this connection
+    // down to the executor path.
+    if (!parsed && can_inline_stmt_execute(self)) {
+      const auto t0 = std::chrono::steady_clock::now();
+      const bool close_conn = inline_stmt_execute(self);
+      const auto took =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - t0)
+              .count();
+      if ((ulonglong)took > coroutine_reactor_exec_budget_us) {
+        self->reactor_exec_cooldown_until =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        g_reactor_exec_slow.fetch_add(1, std::memory_order_relaxed);
+      }
+      // The admission credit was taken above; return it.
       admission_job_done();
       lock_conflict_victim = is_lock_conflict_victim(self->thd);
       g_reactor_exec.fetch_add(1, std::memory_order_relaxed);
