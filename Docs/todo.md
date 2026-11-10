@@ -453,6 +453,65 @@ StmtPriority 9 共 35 个 gunit 全 pass。云端二进制与 v7/v8 保存件 SH
 **资源保留中（用户后续还有测试，勿释放）**：实例同 §4.8，auto-release
 兜底 2026-11-10T12:40:40Z。
 
+## 4.10 psinline 轮（2026-11-10，COM_STMT_EXECUTE reactor 内联，提交 8e14d449f，已 push github/coroutine-dev2）
+
+背景：§4.9 收尾时 PS rw256 比 V97 低 18.57%，而 text 点查靠 reactor
+内联追平；根因是 `can_parse_on_reactor` 只识别 COM_QUERY，二进制协议的
+COM_STMT_EXECUTE 全部走 executor 交接，协议间不对称。
+
+实现（`sql/conn_handler/coroutine_connection_handler.cc`）：
+- D5b 分类器重构为按 LEX 判定（`select_lex_is_reactor_safe`），同一套
+  分类既用于 reactor 刚 parse 的 COM_QUERY，也用于 prepared statement
+  保留的解析树（`Prepared_statement::m_lex`，惰性求值，不改
+  sql_prepare）。
+- 新增 `can_inline_stmt_execute`：MSG_PEEK 14 字节（header+cmd+stmt_id+
+  flags+iteration_count），要求 COM_STMT_EXECUTE、iteration_count==1、
+  无 CURSOR_TYPE_READ_ONLY、FIONREAD 确认整包已在内核缓冲（内联
+  my_net_read 不会阻塞 reactor）、stmt_map 按 id 找到且分类为安全。
+- 新增 `inline_stmt_execute`：普通函数（真实 OS 栈），设
+  thd_set_thread_stack/store_globals 后直接跑 `do_command(thd)`——与
+  Unparsed worker job 完全相同的代码，只是跑在 reactor 上。
+- run() 循环在 text 内联块后新增 PS 内联块，复用 500µs 预算 + 1s 冷却、
+  admission 还款、计数器（`Coroutine_reactor_exec`）。
+- 只受 `coroutine_reactor_exec` 门控（不需要 reactor_parse）；默认 OFF，
+  sysvar 描述已更新。
+
+测试：新增 `coroutine_ps_exec` MTR（需 `--ps-protocol` 运行，默认运行
+skip）：prepared 普通 SELECT 内联 +3、SLEEP/FOR UPDATE/DML 不内联 +1、
+parse=OFF 时 prepared SELECT 仍内联（恰好 +2，证明二进制路径独立于
+text parse）、动态开关生效。注意：**mysqltest 的 `enable_ps_protocol`
+指令在不加 CLI `--ps-protocol` 时是空操作**（它只是把开关设回 CLI 标志
+值）；`coroutine_stmt_prio` 在 `--ps-protocol` 下失败是**既有行为**
+（已用 stash 基线复现确认）：D5 优先级分类依赖 COM_QUERY 的 reactor
+parse，PS 命令不经过该路径，非本次回归。回归：4 个 coroutine MTR 双模
+式全过、35 个 gunit 全过、build/build_coro 均编译通过。
+
+云端 A/B（同轮、二进制按 SHA 校验，C4-old=8cc28c00 v7+v8，C4-new=
+4d78baf9 本提交远端构建；本地是 aarch64 不能直接上传 x86 云机，源文件
+rsync 后云端增量构建）：
+- PS 点查 open-loop（64 线程、30s、p99）：200k 档 V97 199944/0.16ms、
+  C4-old 199923/0.45ms、C4-new 200026/0.21ms；300k 档 V97 299916/
+  0.20ms、**C4-old 复现性 FAIL（event queue full，30s/60s 预热均失败）**、
+  C4-new 300002/0.26ms。预热闭环节奏下 C4-new 达 370k QPS。
+- PS rw256（60s 同轮）：V97 13150.06/53.85ms；C4-old 10280.71/71.83ms；
+  C4-new 10660.97/68.05ms（**+3.7% TPS、p99 -5.3%**）；对 V97 差距仍
+  -18.9%——瓶颈在写/提交路径排队（submit→run 588µs），非读交接。
+- text rw256 回归（60s 同轮）：C4-old 10366.07/73.13ms（内联 10.3%）、
+  C4-new 10334.51/74.46ms（9.6%）——无回归；另一轮 9394.86/63% 内联为
+  已知双相位现象（旧二进制同日也出现 9163/68%）。
+- 内联预算扫描（PS rw256 30s）：500µs→7.7% 内联/p99 87.56ms；1ms→20%/
+  90.78；2ms→63%/121.08；5ms→63%/110.66；10ms→63%/132.49；100ms→64%/
+  161.51ms（TPS 9154）。饱和下把多数读搬进 8 个 reactor 反而使 reactor
+  成为瓶颈；默认 500µs+冷却自适应限制在快语句尾部，是正确默认。
+
+产物：`/root/src/aliyun/mysql-sched-bench/results/psinline-20261110/`
+（summary.md + 各日志；300k 旧二进制失败日志在 loader 上被覆盖，目录内
+为重构记录）。云端保留 `mysqld.pre_psinline`/`mysqld.psinline` 供后续
+A/B。实例同 §4.8 保留，auto-release 兜底 12:40:40Z。
+
+下一步候选（未做）：写/提交路径的排队差距（-18.9%）才是 rw256 主矛盾；
+预算扫描表明继续提高内联占比方向错误。
+
 ## 5. 已知边界与注意事项
 
 - D3 让 slow-query 起点和 `thread_running` 覆盖 reactor→worker 排队时间，这是有意的语义变化，需在测试中确认。
