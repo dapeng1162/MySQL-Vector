@@ -505,9 +505,19 @@ rsync 后云端增量构建）：
   成为瓶颈；默认 500µs+冷却自适应限制在快语句尾部，是正确默认。
 
 产物：`/root/src/aliyun/mysql-sched-bench/results/psinline-20261110/`
-（summary.md + 各日志；300k 旧二进制失败日志在 loader 上被覆盖，目录内
-为重构记录）。云端保留 `mysqld.pre_psinline`/`mysqld.psinline` 供后续
-A/B。实例同 §4.8 保留，auto-release 兜底 12:40:40Z。
+（summary.md + 各日志；300k 旧二进制失败日志与三条 60s rw256 原始日志在
+loader 上被后续运行覆盖，目录内为校验过的重构记录）。云端保留
+`mysqld.pre_psinline`/`mysqld.psinline` 供后续 A/B。
+
+**资源已于 2026-11-10 11:38Z 释放**（用户确认后执行）：db
+`i-0jlde5e4b4n8ea717zz0` 与 loadgen `i-0jl9k261boqz655doivn` 均已
+DeleteInstance，API 复查为空。新 mysqld（`4d78baf9`，提交 8e14d449f 的
+x86_64 云端构建）与 loader `scx_db_sched`（`97c5dad7`）已压缩备份到
+`/root/src/aliyun/mysql-sched-bench/binaries/`（mysqld.psinline[.zst]、
+scx_db_sched[.zst]，SHA 已核对）；旧二进制（`8cc28c00`）可从已 push 的
+ba06ba8ac 重建。明天继续时：按 ENVIRONMENT.md 重新购买/初始化，或直接
+用备份 mysqld.psinline + 全新 datadir 快速起服务（basedir 需指向含
+share/ 的构建树，最简单是重跑 run_remote.sh 后用备份二进制覆盖）。
 
 下一步候选（未做）：写/提交路径的排队差距（-18.9%）才是 rw256 主矛盾；
 预算扫描表明继续提高内联占比方向错误。
