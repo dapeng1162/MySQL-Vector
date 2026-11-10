@@ -187,10 +187,11 @@ struct {
 } task_account_map SEC(".maps");
 
 /* Per-CPU statistics: [0]=commit bonus, [1]=normal (gated), [2]=holder,
- * [3]=ts, [4]=bg, [5]=fast-path (ungated, per-CPU FIFO) */
+ * [3]=ts, [4]=bg, [5]=fast-path (ungated, per-CPU FIFO),
+ * [6]=TS kick skipped because the task is already running, [7]=TS kick sent */
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __uint(max_entries, 6);
+  __uint(max_entries, 8);
   __type(key, u32);
   __type(value, u64);
 } stats SEC(".maps");
@@ -322,16 +323,23 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags)
   }
 
   /* Time-sensitive role (reactor, VIP workers).  Head of this CPU's
-   * FIFO pool plus a preempt kick: the kick makes the target CPU
-   * re-enter dispatch immediately, and the head insert wins over the
-   * fast-path FIFO entries (the semantic vtime pool is still drained
-   * first — a waiting COMMIT outranks a reactor for one slice, which
-   * matches the v4 vd-bonus equivalence of B_TS and B_COMMIT). */
+   * FIFO pool plus a preempt kick when it is not already running: the
+   * kick makes the target CPU re-enter dispatch immediately, and the
+   * head insert wins over the fast-path FIFO entries (the semantic
+   * vtime pool is still drained first — a waiting COMMIT outranks a
+   * reactor for one slice, matching the v4 B_TS/B_COMMIT equivalence). */
   if (tier == TIER_TS) {
+    s32 cpu = scx_bpf_task_cpu(p);
+
     stat_inc(3);
-    scx_bpf_dsq_insert(p, cpu_dsq_id(scx_bpf_task_cpu(p)), SCX_SLICE_DFL,
+    scx_bpf_dsq_insert(p, cpu_dsq_id(cpu), SCX_SLICE_DFL,
                        enq_flags | SCX_ENQ_HEAD);
-    scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_PREEMPT);
+    if (scx_bpf_task_running(p)) {
+      stat_inc(6);
+    } else {
+      stat_inc(7);
+      scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+    }
     goto inherit_publish;
   }
 
