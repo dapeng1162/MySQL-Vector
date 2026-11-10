@@ -363,6 +363,19 @@ C2→C4 的 -7.5%。
   C2 2179.2（-3.0%）/ C4-v6 2137.9（-4.9% vs V97，**-1.9% vs C2**）；
   NewOrder p99 三者 702-738ms 打平。TPC-C 跨 run 库增长对最后的 C4
   略不利，C4↔C2 的 -1.9% 更接近调度器真实残差。
+- **p99 专项（rw256 t256 60s，--percentile=99）**：V97 397.4 /
+  C2 272.3 / **C4-v6 215.4ms（比 V97 低 46%）**，语义调度（commit VIP
+  +锁持有加速）在尾延迟上兑现了设计目标。TPC-C 按类型：OrderStatus
+  p99 C4 最优（-39% vs V97），StockLevel -29%，NewOrder 打平，
+  Payment +30% 偏弱（短更新事务 worker 排队尾，待查）。
+- **perf 多角度（30s 稳态归一化）**：每事务指令数 V97 5.36M /
+  C2 5.88M / C4v6 6.32M（+18% 是 C4↔V97 差距的主构成：reactor 解析/
+  交接/桥接 syscall）；ctx 220k→159k/s；迁移 C4v6 59.9k/s 仍 2× C2；
+  RES-IPI 16.7k/s（调度器 kick 引入，V97 仅 4/s）；分支误表率
+  V97 1.42% 反而最高。优化方向按收益排序见 summary.md §9
+  （指令总量 > kick 收敛 > 全局池亲和 > dispatch 空池跳过 >
+  Payment 短事务尾部）。注意：perf-stat time-enabled 是 16 核求和，
+  归一化窗口 = 值/16 = 30s，别用 bpftool 的 69s 窗口去除 perf-stat。
 
 部署坑（已写入 `mysql-sched-bench/ENVIRONMENT.md` §9）：`rsync -a`
 保留旧 mtime → make 跳过重建（bridge 没编进去，sem_any 全空，语义静默
