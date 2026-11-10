@@ -1,6 +1,6 @@
 # coroutine / sched_ext 协同调度：工作交接
 
-> 更新时间：2026-11-10（§4.7 paper64、§4.8 c4perf）。本文是后续 agent 的入口，记录真实代码状态，不把设计目标当作已验证结果。
+> 更新时间：2026-11-10（§4.7 paper64、§4.8 c4perf、§4.9 c4opt）。本文是后续 agent 的入口，记录真实代码状态，不把设计目标当作已验证结果。
 
 ## 1. 工作背景与目标
 
@@ -384,6 +384,74 @@ C2→C4 的 -7.5%。
 **资源保留中（用户后续还有测试，勿释放）**：双节点同 4.6/4.7
 （db `i-0jlde5e4b4n8ea717zz0`，loadgen `i-0jl9k261boqz655doivn`），
 auto-release 兜底 2026-11-10T12:40:40Z。
+
+## 4.9 c4opt 轮（2026-11-10，逐项优化与负结果，资源保留中）
+
+完整原始日志与逐轮分析：
+`aliyun/mysql-sched-bench/results/c4opt-20261110/summary.md`。
+本轮只保留两个代码改动，均已独立提交并 push `github/coroutine-dev2`：
+
+1. **v7 命令交接降本**（`2a903c485`）：命令状态放入 ConnectionState，
+   executor lambda 只捕获 shared_ptr 以落入 std::function 内联存储；worker
+   复用 reactor 的 lock-holder 判定，inline SELECT 不再做无效锁图查询；
+   命令完成标志复位不再多拿一次 mutex。100MB redo 下同日下午 perf：
+   每事务指令 6.172M → 5.608M（-9.1%），迁移 61.6k/s → 54.9k/s。
+2. **v8 运行中 TS 任务免 kick**（`7cc194212`）：task_running 为真时不再
+   发 SCX_KICK_PREEMPT，stats[6]/[7] 记录跳过/发送。关闭内联对照：
+   v7 9793.68 / v8 9897.57 TPS，p99 75.82 → 73.13ms；默认内联复测
+   10416.37 TPS、p99 69.29ms。首轮默认内联曾出现 9163.78 TPS /
+   49.21ms 的高内联相位，不能当作稳定收益，故用关闭内联和第二轮复核。
+
+逐项试验后**明确否决**的方向：
+
+- worker 扫描（4G redo、rw256）：v7 默认 64 worker = 10236.68 TPS；
+  128 = 9832.95 / p99 102.97ms（CPU 99.5%、loadavg≈89）；48 = 9232.06；
+  32 = 9385.90 / p99 53.85ms。128 的 submit→run 均值虽从 551µs 降至
+  349µs，吞吐反而下降；低排队不等于全局高性能，默认池大小不改。
+- 100ms 内联冷却：9036.65 TPS（比 v8 低约 13%）、p99 63.32ms，
+  inline 比例 69.5%，执行并发不足。恢复 1s 冷却，未提交。
+- dispatch 空全局池 `nr_queued` 预检：在同样约 10% inline 相位，
+  dispatch 433 → 635ns/call，rhashtable/count 查询比失败 consume 更贵，
+  未提交；没有把该预检扩展到窃取路径。
+- worker 硬绑核：迁移 29.3k/s → 12.2k/s，但吞吐 8828.34 TPS、
+  p99 118.92ms。跨核工作守恒比迁移数更重要，未提交。DML/COMMIT 也不
+  放到 reactor 内联，避免行锁/redo 的无界阻塞破坏韧性。
+
+**测试环境的重要修正**：原配置 `innodb_redo_log_capacity=100M`，错误日志
+持续 MY-014084 checkpoint 追不上，导致吞吐限速和轮次漂移。最终对照全部
+统一 4G（V97 与 C4 同样参数），不与 100MB 历史数据混算。loadgen 在
+rw256 稳态仍有约 78% CPU 空闲，不是客户端瓶颈。`ENVIRONMENT.md` 已补
+COMMON_ARGS、结果小文件回收、zombie 关闭等待和开放环预热经验。
+
+最终版本 rw256（60s、4G redo、p99）：V97 11846.82 TPS / 54.83ms；
+C4(v7+v8) 10342.88 TPS / 74.46ms，C4 吞吐 -12.65%、p99 +35.8%。
+即本轮降低了指令与 IPI 成本，但**没有宣称对 V97 吞吐持平**。
+
+其他最终场景：
+
+- 点查开放环（64 线程，每配置先预热 30s，再测 30s）：200k 目标下
+  V97/C4 达成 199946.86/199944.92，p99 0.18/0.24ms；300k 下达成
+  299938.97/299991.88，p99 0.23/0.32ms。C4 两档都达到目标速率，
+  p99 绝对差为 0.06/0.09ms。
+- 默认 PS 协议 rw256（30s，统一 max_prepared_stmt_count=100000）：
+  V97 12351.80 TPS / 78.60ms，C4 10055.39 TPS / 90.78ms。
+  C4 reactor_parsed 仅 302559、reactor_exec=3，确认覆盖 COM_STMT_EXECUTE
+  的 worker 路径，未借用文本内联优化。第一次 16382 语句上限失败和点查
+  冷启动 event queue full 均已排除，不计作性能数据。
+- TPC-C（32 仓库、64 terminal、RC、180s、4G redo）：V97 goodput
+  7872.18/s、整体 p99 40.61ms；C4 6521.00/s（-17.17%）、45.20ms
+  （+11.3%）。NewOrder/Payment p99 分别 +24.6%/+20.0%，StockLevel
+  p99 -12.0%。双方均无 Unexpected SQL Errors；只使用 tpcc-final 中
+  15-48-17 / 15-52-07 的新结果，旧 rsync 文件不参与计算。
+
+验证：最终本地 mysqld/mysqltest、build_coro sql_main、BPF 编译通过；
+coroutine_reactor_exec / coroutine_stmt_prio / coroutine_latch_status 及
+shutdown_report 全 pass；ExecutorPool 13 + Reactor 8 + Task 5 +
+StmtPriority 9 共 35 个 gunit 全 pass。云端二进制与 v7/v8 保存件 SHA
+一致，本地与云端源文件 SHA 一致。
+
+**资源保留中（用户后续还有测试，勿释放）**：实例同 §4.8，auto-release
+兜底 2026-11-10T12:40:40Z。
 
 ## 5. 已知边界与注意事项
 
