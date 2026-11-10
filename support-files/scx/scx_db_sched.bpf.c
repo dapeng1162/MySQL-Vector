@@ -103,12 +103,23 @@ struct {
   __type(value, u32);
 } blocked_by SEC(".maps");
 
-/* lock_holder[tid] = N  →  N threads are waiting for this tid */
+/* lock_holder[tid] = {count, ts_ns}  →  this tid holds a lock/latch that
+ * other threads wait on.  The value is effectively boolean (count is kept
+ * for observability only; the scheduler checks count > 0); publishers
+ * write {1, now} idempotently and clears delete eagerly.  There is no
+ * read-modify-write anywhere: a lost update can only leave a stale entry,
+ * which the scheduler stops honouring after HOLDER_TTL_NS and the bridge
+ * sweeper garbage-collects a period later. */
+struct holder_entry {
+  u32 count;
+  u64 ts_ns;  /* CLOCK_MONOTONIC ns of the last publish (bridge writes) */
+};
+#define HOLDER_TTL_NS (1000 * 1000 * 1000ULL) /* 1s staleness bound */
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 4096);
   __type(key, u32);
-  __type(value, u32);
+  __type(value, struct holder_entry);
 } lock_holder SEC(".maps");
 
 /* Kept for userspace bridge ABI compatibility; ignored by the scheduler. */
@@ -268,7 +279,6 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags)
   u32 weight;
   struct task_account *st;
   u8 *vip;
-  u32 *wcnt;
   u8 *gate;
 
   /* Fast path: no semantic state published for this tid.  Per-CPU FIFO
@@ -325,20 +335,24 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags)
     goto inherit_publish;
   }
 
-  /* Lock holder: bounded slice + inheritance from most urgent waiter. */
-  wcnt = bpf_map_lookup_elem(&lock_holder, &tid);
-  if (wcnt && *wcnt > 0) {
-    struct boost_entry *hb;
+  /* Lock holder: bounded slice + inheritance from most urgent waiter.
+   * A stale entry (lost update / leaked clear) is ignored: publishers
+   * refresh ts_ns, so anything older than HOLDER_TTL_NS is dead state. */
+  {
+    struct holder_entry *he = bpf_map_lookup_elem(&lock_holder, &tid);
+    if (he && he->count > 0 && now - he->ts_ns <= HOLDER_TTL_NS) {
+      struct boost_entry *hb;
 
-    stat_inc(2);
-    slice = HOLDER_SLICE;
-    if (!st || st->borrowed < B_MAX) {
-      hb = bpf_map_lookup_elem(&holder_boost, &tid);
-      if (hb) {
-        if (now - hb->ts <= PI_STALE_NS && hb->floor < vd)
-          vd = hb->floor;
-        /* One-shot: delete on use or when stale; waiters re-publish. */
-        bpf_map_delete_elem(&holder_boost, &tid);
+      stat_inc(2);
+      slice = HOLDER_SLICE;
+      if (!st || st->borrowed < B_MAX) {
+        hb = bpf_map_lookup_elem(&holder_boost, &tid);
+        if (hb) {
+          if (now - hb->ts <= PI_STALE_NS && hb->floor < vd)
+            vd = hb->floor;
+          /* One-shot: delete on use or when stale; waiters re-publish. */
+          bpf_map_delete_elem(&holder_boost, &tid);
+        }
       }
     }
   }
@@ -426,7 +440,7 @@ void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable)
   u32 weight;
   u64 runtime;
   u8 *vip;
-  u32 *wcnt;
+  struct holder_entry *he;
   struct task_account *st;
 
   gate = bpf_map_lookup_elem(&sem_any, &tid);
@@ -455,8 +469,10 @@ void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable)
   p->scx.dsq_vtime += runtime * 100 / weight;
 
   vip = bpf_map_lookup_elem(&commit_vip, &tid);
-  wcnt = bpf_map_lookup_elem(&lock_holder, &tid);
-  if ((vip && *vip) || (wcnt && *wcnt > 0)) {
+  he = bpf_map_lookup_elem(&lock_holder, &tid);
+  if ((vip && *vip) ||
+      (he && he->count > 0 &&
+       scx_bpf_now() - he->ts_ns <= HOLDER_TTL_NS)) {
     if (st) {
       st->borrowed += runtime;
       if (st->borrowed >= B_MAX)

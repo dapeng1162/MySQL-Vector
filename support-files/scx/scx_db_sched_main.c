@@ -3,8 +3,8 @@
  * Userspace loader for the DB-aware sched_ext scheduler (scx_db_sched).
  *
  * Loads scx_db_sched.bpf.o (built from scx_db_sched.bpf.c), attaches it
- * as the system scheduler, and optionally dumps the contents of the four
- * DB-aware maps (commit_vip, blocked_by, lock_holder, rg_prio).
+ * as the system scheduler, and optionally dumps the contents of the
+ * DB-aware maps (commit_vip, blocked_by, lock_holder, rg_prio, task_tier).
  *
  * Requires:
  *   - Linux kernel with CONFIG_SCHED_CLASS_EXT (sched_ext), checked at
@@ -60,8 +60,8 @@ static volatile int exit_req;
 
 /*
  * Where the DB-aware maps are pinned so that a running mysqld (via
- * sql/sched_ext_bridge.cc) can open them with bpf_obj_get().  All four
- * maps share a single directory under /sys/fs/bpf.
+ * sql/sched_ext_bridge.cc) can open them with bpf_obj_get().  All maps
+ * share a single directory under /sys/fs/bpf.
  */
 #define SCX_MAP_DIR "/sys/fs/bpf/scx_db_sched"
 #define SCX_MAP_PIN_PREFIX SCX_MAP_DIR "/"
@@ -101,7 +101,8 @@ static void dump_map_entries(const char *name, struct bpf_map *map,
   int fd = bpf_map__fd(map);
   __u32 next_key, key = 0;
   int ret;
-  char value[8] = {0};
+  /* Large enough for the widest value (lock_holder's holder_entry). */
+  char value[16] = {0};
 
   printf("%s:\n", name);
   while ((ret = bpf_map_get_next_key(fd, &key, &next_key)) == 0) {
@@ -113,6 +114,9 @@ static void dump_map_entries(const char *name, struct bpf_map *map,
         printf("  tid=%u value=%u\n", k, *(u8 *)value);
       else if (value_size == 4)
         printf("  tid=%u value=%d\n", k, *(int *)value);
+      else if (value_size == 12) /* lock_holder: {count, ts_ns} */
+        printf("  tid=%u count=%u ts_ns=%llu\n", k, *(u32 *)value,
+               *(unsigned long long *)(value + 4));
       else
         printf("  tid=%u value=%s\n", k, value_fmt);
     }
@@ -123,7 +127,7 @@ static void dump_map_entries(const char *name, struct bpf_map *map,
 }
 
 /*
- * Pin the four DB-aware maps so that the running mysqld can open them
+ * Pin the DB-aware maps so that the running mysqld can open them
  * via bpf_obj_get() from sql/sched_ext_bridge.cc.
  *
  * The maps are pinned under /sys/fs/bpf/scx_db_sched/.
@@ -173,7 +177,7 @@ static void dump_maps_all(struct scx_db_sched *skel) {
   printf("=== scx_db_sched map dump ===\n");
   dump_map_entries("commit_vip", skel->maps.commit_vip, 1, "u8");
   dump_map_entries("blocked_by", skel->maps.blocked_by, 4, "u32");
-  dump_map_entries("lock_holder", skel->maps.lock_holder, 4, "u32");
+  dump_map_entries("lock_holder", skel->maps.lock_holder, 12, "");
   dump_map_entries("rg_prio", skel->maps.rg_prio, 4, "i32");
   dump_map_entries("task_tier", skel->maps.task_tier, 4, "i32");
   printf("=== end dump ===\n");

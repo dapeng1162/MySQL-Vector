@@ -363,6 +363,41 @@ static void gate_reason_remove(int32_t tid) {
 }
 
 // -----------------------------------------------------------------------
+// lock_holder value: effectively boolean "this tid holds a contended
+// lock/latch" with a freshness timestamp.  The BPF scheduler only checks
+// count > 0 and HOLDER_TTL_NS freshness, so all publish sites write
+// {1, now} idempotently and clear sites delete eagerly — no
+// read-modify-write, hence no cross-thread count race.  A lost or
+// duplicated update can only leave a stale entry behind, which the
+// scheduler stops honouring after 1s and the gate sweeper (below)
+// garbage-collects on its next pass.
+// -----------------------------------------------------------------------
+struct holder_entry_v {
+  uint32_t count;
+  uint64_t ts_ns;  // CLOCK_MONOTONIC ns; matches bpf_ktime_get_ns()
+};
+
+static inline uint64_t now_ns() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+/** Publish/refresh the holder marker for @c tid (idempotent). */
+static void publish_holder(int32_t tid) {
+  struct holder_entry_v v {1, now_ns()};
+  gate_reason_add(tid);
+  bpf_map_update_elem(s_fd_lock_holder, &tid, &v, BPF_ANY);
+}
+
+/** Drop the holder marker for @c tid (eager clear; refcounted gate). */
+static void clear_holder(int32_t tid) {
+  bpf_map_delete_elem(s_fd_lock_holder, &tid);
+  gate_reason_remove(tid);
+}
+
+// -----------------------------------------------------------------------
 // Gate sweeper (self-healing).
 //
 // The eager add/remove pairs above keep the gate tight in the common case,
@@ -402,6 +437,28 @@ static void sweep_collect(int fd, std::unordered_set<int32_t> *out,
 }
 
 static void gate_sweep_once() {
+  /* GC: drop stale lock_holder entries first.  The value is boolean with
+   * a freshness timestamp; a lost update or a missed clear would
+   * otherwise leave a permanently-boosted "holder" behind.  The BPF side
+   * already stops honouring entries older than 1s (HOLDER_TTL_NS); the
+   * sweeper deletes them at 2s so a genuinely contended holder that is
+   * being refreshed is never collected. */
+  if (s_fd_lock_holder >= 0) {
+    constexpr uint64_t kGcTtlNs = 2ull * 1000 * 1000 * 1000;
+    uint64_t now = now_ns();
+    int32_t key = 0, next = 0;
+    bool first = true;
+    while (bpf_map_get_next_key(s_fd_lock_holder, first ? nullptr : &key,
+                                &next) == 0) {
+      first = false;
+      key = next;
+      struct holder_entry_v v {};
+      if (bpf_map_lookup_elem(s_fd_lock_holder, &key, &v) == 0 &&
+          now - v.ts_ns > kGcTtlNs)
+        bpf_map_delete_elem(s_fd_lock_holder, &key);
+    }
+  }
+
   std::unordered_set<int32_t> wanted;
   std::unordered_map<int32_t, uint32_t> refs;
   sweep_collect(s_fd_task_tier, &wanted, &refs);
@@ -550,13 +607,8 @@ void scx_publish_wait_edge(THD *waiter, THD *holder) {
   gate_reason_add(waiter_tid);
   bpf_map_update_elem(s_fd_blocked_by, &waiter_tid, &holder_tid, BPF_ANY);
 
-  /* lock_holder[holder] = wait count */
-  {
-    uint32_t old = 0;
-    if (bpf_map_lookup_elem(s_fd_lock_holder, &holder_tid, &old) != 0)
-      gate_reason_add(holder_tid);
-  }
-  bpf_map_update_elem(s_fd_lock_holder, &holder_tid, &count, BPF_ANY);
+  /* lock_holder[holder] = {1, now} (idempotent boolean marker) */
+  publish_holder(holder_tid);
 }
 
 /*
@@ -574,16 +626,10 @@ void scx_clear_wait_edge(THD *waiter, THD *holder) {
       holder_tid = thd_os_tid(holder);
       if (holder_tid < 0) return;
     }
-    uint32_t count = 0;
-    if (bpf_map_lookup_elem(s_fd_lock_holder, &holder_tid, &count) == 0) {
-      if (count > 1) {
-        count--;
-        bpf_map_update_elem(s_fd_lock_holder, &holder_tid, &count, BPF_EXIST);
-      } else {
-        bpf_map_delete_elem(s_fd_lock_holder, &holder_tid);
-        gate_reason_remove(holder_tid);
-      }
-    }
+    /* The holder marker is boolean now: this waiter's clear drops the
+     * entry even if other waiters remain; the boost has done its job by
+     * the time a wait resolves, and any fresh wait re-publishes. */
+    clear_holder(holder_tid);
     bpf_map_delete_elem(s_fd_blocked_by, &waiter_tid);
     gate_reason_remove(waiter_tid);
   }
@@ -607,16 +653,8 @@ void scx_publish_latch_edge(std::thread::id owner) {
   gate_reason_add(waiter_tid);
   bpf_map_update_elem(s_fd_blocked_by, &waiter_tid, &holder_tid, BPF_ANY);
 
-  /* lock_holder[holder] += 1 */
-  uint32_t count = 1;
-  uint32_t old = 0;
-  if (bpf_map_lookup_elem(s_fd_lock_holder, &holder_tid, &old) == 0) {
-    count = old + 1;
-  } else {
-    /* Entry created: register the gate reason for the holder. */
-    gate_reason_add(holder_tid);
-  }
-  bpf_map_update_elem(s_fd_lock_holder, &holder_tid, &count, BPF_ANY);
+  /* lock_holder[holder] = {1, now} (idempotent boolean marker) */
+  publish_holder(holder_tid);
 }
 
 void scx_clear_latch_edge() {
@@ -628,17 +666,7 @@ void scx_clear_latch_edge() {
     return;
   bpf_map_delete_elem(s_fd_blocked_by, &waiter_tid);
   gate_reason_remove(waiter_tid);
-
-  uint32_t count = 0;
-  if (bpf_map_lookup_elem(s_fd_lock_holder, &holder_tid, &count) == 0) {
-    if (count > 1) {
-      count--;
-      bpf_map_update_elem(s_fd_lock_holder, &holder_tid, &count, BPF_EXIST);
-    } else {
-      bpf_map_delete_elem(s_fd_lock_holder, &holder_tid);
-      gate_reason_remove(holder_tid);
-    }
-  }
+  clear_holder(holder_tid);
 }
 
 }  // namespace
@@ -692,10 +720,7 @@ void thread_job_begin(THD *thd, bool time_sensitive) {
 
   uint32_t count = holder_wait_count(thd);
   if (count > 0) {
-    uint32_t old = 0;
-    if (bpf_map_lookup_elem(s_fd_lock_holder, &tid, &old) != 0)
-      gate_reason_add(tid);
-    bpf_map_update_elem(s_fd_lock_holder, &tid, &count, BPF_ANY);
+    publish_holder(tid);
     s_thread_pub.published = true;
     s_thread_pub.tid = tid;
   }
@@ -726,8 +751,7 @@ void thread_job_end(THD *thd) {
   int32_t tid = s_thread_pub.tid;
   if (tid < 0) tid = current_tid();
   if (s_thread_pub.published) {
-    bpf_map_delete_elem(s_fd_lock_holder, &tid);
-    gate_reason_remove(tid);
+    clear_holder(tid);
     s_thread_pub.published = false;
   }
   if (s_thread_pub.published_rg_tier) {
@@ -774,27 +798,12 @@ void commit_end() {
 
 void lock_holder_add(my_thread_id holder_tid) {
   if (!s_connected) return;
-  int32_t holder = static_cast<int32_t>(holder_tid);
-  uint32_t count = 0;
-  if (bpf_map_lookup_elem(s_fd_lock_holder, &holder, &count) != 0)
-    gate_reason_add(holder);
-  count++;
-  bpf_map_update_elem(s_fd_lock_holder, &holder, &count, BPF_ANY);
+  publish_holder(static_cast<int32_t>(holder_tid));
 }
 
 void lock_holder_remove(my_thread_id holder_tid) {
   if (!s_connected) return;
-  int32_t holder = static_cast<int32_t>(holder_tid);
-  uint32_t count = 1;
-  if (bpf_map_lookup_elem(s_fd_lock_holder, &holder, &count) == 0) {
-    if (count > 1) {
-      count--;
-      bpf_map_update_elem(s_fd_lock_holder, &holder, &count, BPF_EXIST);
-    } else {
-      bpf_map_delete_elem(s_fd_lock_holder, &holder);
-      gate_reason_remove(holder);
-    }
-  }
+  clear_holder(static_cast<int32_t>(holder_tid));
 }
 
 void set_priority(int nice) {
