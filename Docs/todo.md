@@ -256,3 +256,40 @@ executor-t(13) netpoller-t(8) task-t(5) stmt_priority-t(9)  # 共 35 个，全�
   批处理）→ 增量重建 → rw256 复测；备选：writer 唤醒频率 trace 确认（eBPF
   sys_enter_pwrite64 按 tid 聚合），再考虑 scx 侧 credit 衰减。火焰图原始数据
   已留存（node2-diagnostics/perf_pair.zst）。
+
+### 5.8 N1 负向测试（外部 CPU 干扰，2026-11-11）
+
+详细数据与证据链：`../aliyun/mysql-sched-bench/results/c5-20261111/summary-n1.md`。
+
+**判据**：16 个 stress-ng CPU hogs + open-loop 点查（10k/50k），p99 劣化应与
+CFS 基线相当（V97 2.2×）。**结果：未达标但大幅收敛**——v6.1 151×（队列满
+FATAL）→ v6.2 38×（187b73b1e）→ v6.3 **32×**（8751b3650，noise p99@10k
+5.18ms / @50k 1.58ms）。50k 档已与 V97 同量级（0.80 vs 1.58ms）。
+
+两层已修复的根因：
+
+1. `SCX_ENQ_PREEMPT` 只对 `SCX_DSQ_LOCAL` 生效，快路径插 user DSQ 的唤醒
+   从未抢占过（187b73b1e：显式 `scx_bpf_kick_cpu(SCX_KICK_PREEMPT)`）。
+2. 快路径 vtime 超额记账（stopping 用停止时池深重算入队时授予的 slice）+
+   gated 语义任务（COMMIT/TS/BG）完全没有 kick（8751b3650：入队时记
+   granted + gated 任务插入后显式 kick）。
+
+剩余 0.7–1.4% 尾部（10k 档 p99 5.18ms）已定位到 **rq_wait**：wake_proc 恒
+2–5µs，延迟全在 wakeup→switch，典型 ≈ 完整 20ms slice。两个候选机制：
+kick_one_cpu 清零目标 slice 导致 stopping 记账多收（vtime 膨胀 → MAX_LAG
+钳制、gated kick 条件失效）；kick 的 irq_work 在 llist 非空时不补发 IPI，
+NET_RX softirq 批处理下被延迟/合并。
+
+**明日计划（v6.4，按优先级）**：
+
+1. 记账不受 kick 清零影响（granted 在 `running()` 记录或 kick 前快照）。
+2. CPU-bound 任务 slice cap 2.5ms——兜底性修复，任何卡住上限 20ms→2.5ms。
+3. kick-eligible 唤醒改插 `SCX_DSQ_LOCAL + SCX_ENQ_PREEMPT`（同步抢占
+   路径，不经 irq_work；需评估语义池饿死风险，仅限交互类）。
+4. `ops.tick` 兜底检查。
+5. 复测 rw256（验证 8751b3650 是否顺带消除 -13.9%）。
+6. N1 复测；通过后进入 N2（latch 大范围持有）、N3（连接风暴）。
+
+**方法论沉淀**：测调度必须用 bpftrace——perf record 每 ~4s 自身产生全 CPU
+stopper 风暴且被饿到 280ms 丢事件，perf sched 只能佐证。诊断数据已留存
+本地 `results/c5-20261111/n1/C5-v6.3-diag/`。
