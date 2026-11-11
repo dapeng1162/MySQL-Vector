@@ -12,9 +12,11 @@
  *     but vtime ordering with a lag clamp, so a task that slept (its
  *     vruntime fell behind) sorts to the front of its CPU's pool — the
  *     wakeup-preemption behaviour CFS/EEVDF gives interactive tasks and
- *     a plain FIFO denies.  A wakeup whose lag exceeds one adaptive
- *     slice also carries SCX_ENQ_PREEMPT so the target CPU re-dispatches
- *     immediately instead of waiting out the current task's slice.
+ *     a plain FIFO denies.  A wakeup whose lag exceeds ~100us also
+ *     kicks the target CPU with SCX_KICK_PREEMPT (SCX_ENQ_PREEMPT is a
+ *     no-op for user DSQs), and the slice granted at enqueue is recorded
+ *     so stopping() charges the exact runtime — recomputing it from the
+ *     pool depth at stop time overcharged sleepers (N1: 21ms delays).
  *       The fast-path slice shrinks with the pool depth (20ms → 2.5ms),
  *     bounding the head-of-line wait a CPU-bound task can impose on the
  *     pool — the saturation-granularity behaviour CFS gets from its
@@ -330,12 +332,27 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags)
   if (!gate) {
     s32 cpu = scx_bpf_task_cpu(p);
     u64 enq = enq_flags;
+    struct task_account *fst;
 
     stat_inc(5);
     vr = p->scx.dsq_vtime;
     if (vr + MAX_LAG < vtime_now)
       vr = vtime_now - MAX_LAG;
     slice = fast_slice(cpu);
+    /* Record the slice granted HERE so stopping() charges the exact
+     * runtime.  Recomputing fast_slice() at stop time (pool depth then,
+     * not now) overcharges a task whose pool drained while it ran:
+     * granted 5ms at enqueue, empty pool at stop -> a 50us point select
+     * is charged 20ms - remaining of vtime.  The task's vtime then runs
+     * AHEAD of vtime_now: it loses both the wakeup kick (negative lag)
+     * and its front-of-pool position and waits out a full 20ms slice
+     * behind a hog — N1 measured a tight 21.1ms delay cluster and
+     * cyclictest (pool depth < 2 on both sides, no overcharge) stayed
+     * at 55us.  One hash write per wakeup is the price of correct
+     * EEVDF accounting. */
+    fst = account_of(tid);
+    if (fst)
+      fst->slice_ns = slice;
     /* EEVDF-style wakeup preemption.  The lag threshold is deliberately
      * tiny: a task whose vruntime is more than ~100us behind really slept
      * (network I/O wait), and running it promptly after its wakeup keeps
@@ -386,6 +403,11 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags)
     if (!st || st->borrowed < B_MAX)
       vd = (vd > B_COMMIT) ? vd - B_COMMIT : 0;
     insert_task(p, SCX_SLICE_DFL, vd, enq_flags, tid);
+    /* A COMMIT landing in the global DSQ must not wait out the current
+     * task's slice: kick the target CPU into dispatch, which drains the
+     * semantic pool first. */
+    if (!scx_bpf_task_running(p))
+      scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_PREEMPT);
     goto inherit_publish;
   }
 
@@ -403,12 +425,11 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags)
     stat_inc(3);
     vd = (vtime_now > MAX_LAG) ? vtime_now - MAX_LAG : 0;
     scx_bpf_dsq_insert_vtime(p, cpu_dsq_id(cpu), SCX_SLICE_DFL, vd,
-                             enq_flags | SCX_ENQ_PREEMPT);
-    if (scx_bpf_task_running(p)) {
-      stat_inc(6);
-    } else {
-      stat_inc(7);
-    }
+                             enq_flags);
+    /* SCX_ENQ_PREEMPT is a no-op for user DSQs (only SCX_DSQ_LOCAL
+     * inserts preempt); kick explicitly — same reason as the fast path. */
+    if (!scx_bpf_task_running(p))
+      scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
     goto inherit_publish;
   }
 
@@ -440,6 +461,14 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags)
     stat_inc(1);
 
   insert_task(p, slice, vd, enq_flags, tid);
+  /* Urgent gated wake (vd older than the global clock = it lands at the
+   * front of the semantic pool): kick the target CPU into dispatch now
+   * instead of at the current task's slice boundary.  Without this, an
+   * InnoDB log thread waking behind a CPU hog waited a full 20ms slice
+   * (N1: ib_log_flush runqueue delay 20.6ms, same window as the
+   * connection threads). */
+  if (vd < vtime_now && !scx_bpf_task_running(p))
+    scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_PREEMPT);
 
 inherit_publish:
   /* If this task is itself a waiter, publish its effective vd as a floor
@@ -522,15 +551,19 @@ void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable)
 
   gate = bpf_map_lookup_elem(&sem_any, &tid);
   if (!gate) {
-    /* Fast path: keep dsq_vtime current at normal weight so a later
-     * transition into the semantic pool (this tid gets a gate entry)
-     * starts from a sane vruntime instead of a stale one.  The granted
-     * slice was adaptive; approximate it from the current pool depth —
-     * the error is at most one bucket and MAX_LAG bounds any drift.
-     * No maps are written: the per-CPU vtime pool needs no account. */
-    u64 granted = fast_slice(scx_bpf_task_cpu(p));
-    if (p->scx.slice < granted)
-      p->scx.dsq_vtime += granted - p->scx.slice;
+    /* Fast path: charge the runtime granted at ENQUEUE time (recorded in
+     * task_account_map), not a fast_slice() recomputed from the pool
+     * depth now — the pool may have drained while the task ran, and the
+     * difference (up to 15ms per wakeup) was charged to the task's
+     * vtime, pushing it ahead of vtime_now, killing its wakeup kick
+     * and its front-of-pool position (N1: 21ms delay clusters).
+     * Keep dsq_vtime current at normal weight so a later transition
+     * into the semantic pool starts from a sane vruntime.  No account
+     * (task raced with disable/reuse): leave vtime untouched — the
+     * MAX_LAG clamp bounds any drift. */
+    struct task_account *fst = bpf_map_lookup_elem(&task_account_map, &tid);
+    if (fst && fst->slice_ns >= p->scx.slice)
+      p->scx.dsq_vtime += fst->slice_ns - p->scx.slice;
     return;
   }
 
