@@ -344,10 +344,19 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags)
      * preempting) halves context switches but inflates cycles/txn by
      * +10% for IDENTICAL instructions (-8.5% tps) — the CFS behaviour
      * of preempting on nearly every wake is the cache-efficient one.
-     * Sub-100us sleeps (tight pipelining) stay on the cheap path. */
+     * Sub-100us sleeps (tight pipelining) stay on the cheap path.
+     *
+     * SCX_ENQ_PREEMPT only preempts when the insert targets
+     * SCX_DSQ_LOCAL; our per-CPU pools are USER DSQs, so the kick must
+     * be explicit — scx_bpf_kick_cpu(SCX_KICK_PREEMPT) zeroes the
+     * target CPU's current slice and forces a dispatch, where the
+     * woken task's stale vtime puts it at the front of the pool.
+     * N1 (16 external CPU hogs, open-loop point select): without the
+     * kick, p99 degraded 151x (0.13ms -> 19.65ms ~= one full
+     * SCX_SLICE_DFL behind a hog); V97/CFS degraded 2.2x. */
     if ((enq & SCX_ENQ_WAKEUP) && vtime_now > p->scx.dsq_vtime &&
         vtime_now - p->scx.dsq_vtime > WAKE_PREEMPT_LAG_NS)
-      enq |= SCX_ENQ_PREEMPT;
+      scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
     scx_bpf_dsq_insert_vtime(p, cpu_dsq_id(cpu), slice, vr, enq);
     return;
   }
