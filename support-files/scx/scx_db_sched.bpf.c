@@ -81,6 +81,10 @@ static __always_inline u64 cpu_dsq_id(s32 cpu)
 #define D_MAX           (8 * SCX_SLICE_DFL)  /* outstanding debt cap */
 #define PI_DEPTH_MAX    8
 #define PI_STALE_NS     (1000 * 1000 * 1000ULL) /* 1s wait-edge freshness */
+/* Wakeup-preemption lag threshold (fast path): a vruntime this far behind
+ * means the task genuinely slept (network I/O), so preempt the target CPU
+ * and run it while its data is cache-hot.  See enqueue fast path. */
+#define WAKE_PREEMPT_LAG_NS (100 * 1000ULL)
 
 /* Background tasks (purge & friends) get a smaller weight: their virtual
  * deadline lands 4x later and their vruntime accumulates 4x faster, so
@@ -332,8 +336,17 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags)
     if (vr + MAX_LAG < vtime_now)
       vr = vtime_now - MAX_LAG;
     slice = fast_slice(cpu);
+    /* EEVDF-style wakeup preemption.  The lag threshold is deliberately
+     * tiny: a task whose vruntime is more than ~100us behind really slept
+     * (network I/O wait), and running it promptly after its wakeup keeps
+     * the just-arrived socket data and its own working set cache-hot.
+     * Measured at rw256: a slice-sized threshold (i.e. almost never
+     * preempting) halves context switches but inflates cycles/txn by
+     * +10% for IDENTICAL instructions (-8.5% tps) — the CFS behaviour
+     * of preempting on nearly every wake is the cache-efficient one.
+     * Sub-100us sleeps (tight pipelining) stay on the cheap path. */
     if ((enq & SCX_ENQ_WAKEUP) && vtime_now > p->scx.dsq_vtime &&
-        vtime_now - p->scx.dsq_vtime > slice)
+        vtime_now - p->scx.dsq_vtime > WAKE_PREEMPT_LAG_NS)
       enq |= SCX_ENQ_PREEMPT;
     scx_bpf_dsq_insert_vtime(p, cpu_dsq_id(cpu), slice, vr, enq);
     return;
