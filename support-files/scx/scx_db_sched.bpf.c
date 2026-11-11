@@ -7,11 +7,19 @@
  *     tier != NORMAL, COMMIT/ROLLBACK, lock/latch edges) are ordered by
  *       vd = vruntime + slice * 100 / weight + debt - bonus
  *     in one global vtime DSQ (EEVDF "earliest eligible" idea).  Ungated
- *     tasks — the vast majority of wakeups — take a per-CPU FIFO DSQ
- *     fast path with no vtime math and no global-DSQ lock, so the
- *     single-lock bottleneck of the v4 single-pool design is gone.
- *     dispatch() drains the semantic pool first, then the CPU's FIFO
- *     pool, preserving commit/latch priority over fast-path work.
+ *     tasks — the vast majority of wakeups — take a per-CPU vtime DSQ
+ *     fast path: no global-DSQ lock, no account, no inheritance walk,
+ *     but vtime ordering with a lag clamp, so a task that slept (its
+ *     vruntime fell behind) sorts to the front of its CPU's pool — the
+ *     wakeup-preemption behaviour CFS/EEVDF gives interactive tasks and
+ *     a plain FIFO denies.  A wakeup whose lag exceeds one adaptive
+ *     slice also carries SCX_ENQ_PREEMPT so the target CPU re-dispatches
+ *     immediately instead of waiting out the current task's slice.
+ *       The fast-path slice shrinks with the pool depth (20ms → 2.5ms),
+ *     bounding the head-of-line wait a CPU-bound task can impose on the
+ *     pool — the saturation-granularity behaviour CFS gets from its
+ *     latency-nice scaling.  dispatch() drains the semantic pool first,
+ *     then the CPU's vtime pool, preserving commit/latch priority.
  *   - No strict-priority FIFO bypass, no SCX_SLICE_INF.
  *   - Lag clamp on enqueue: a task that slept keeps its lag (EEVDF's
  *     burst-friendliness) but cannot hoard unbounded credit.
@@ -41,11 +49,14 @@ UEI_DEFINE(uei);
  *                           tasks: COMMIT/ROLLBACK, lock holders, waiters,
  *                           BG-tier.  Only these pay the rbtree + single
  *                           global lock, and only dispatch consumes it.
- *   CPU_DSQ_BASE + cpu    — per-CPU FIFO pool for everything else (the
- *                           vast majority of wakeups).  Per-CPU lock, list
- *                           insert: no cross-CPU contention, no vtime
- *                           math.  dispatch() drains the semantic pool
- *                           first, then this CPU's FIFO pool.
+ *   CPU_DSQ_BASE + cpu    — per-CPU vtime pool for everything else (the
+ *                           vast majority of wakeups).  Per-CPU lock, one
+ *                           vtime insert: no cross-CPU contention, no
+ *                           account, no inheritance walk.  Vtime order +
+ *                           lag clamp + guarded SCX_ENQ_PREEMPT give the
+ *                           sleeping-task priority CFS has and FIFO lacks
+ *                           (rw256 on plain FIFO measured -12% TPS, p99
+ *                           2.5x vs CFS on the same box).
  * The builtin SCX_DSQ_LOCAL is deliberately unused for the fast path:
  * the scheduler core only calls ops.dispatch() when the builtin local
  * DSQ is empty, so populating it would starve the semantic pool. */
@@ -80,7 +91,7 @@ static __always_inline u64 cpu_dsq_id(s32 cpu)
 /* Global minimum-vtime tracker (EEVDF lag reference). */
 static u64 vtime_now;
 
-/* Number of per-CPU FIFO DSQs actually created (set by init). */
+/* Number of per-CPU vtime DSQs actually created (set by init). */
 static u32 nr_cpu_dsqs;
 
 /* -----------------------------------------------------------------------
@@ -141,7 +152,7 @@ struct {
 /* sem_any[tid] = 1  →  the DB bridge currently has some semantic state
  * published for this tid (tier != NORMAL, commit_vip, lock edges, or a
  * lock_holder count).  Absent  →  pure normal task: the enqueue and
- * stopping fast paths put it on the per-CPU FIFO local DSQ and skip all
+ * stopping fast paths put it on the per-CPU vtime local DSQ and skip all
  * vtime math, accounts and the global DSQ lock.  The bridge maintains
  * this gate as a refcount over its published entries, so the gate is a
  * conservative superset of the real state: a stale entry only costs the
@@ -187,7 +198,7 @@ struct {
 } task_account_map SEC(".maps");
 
 /* Per-CPU statistics: [0]=commit bonus, [1]=normal (gated), [2]=holder,
- * [3]=ts, [4]=bg, [5]=fast-path (ungated, per-CPU FIFO),
+ * [3]=ts, [4]=bg, [5]=fast-path (ungated, per-CPU vtime pool),
  * [6]=TS kick skipped because the task is already running, [7]=TS kick sent */
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -253,12 +264,32 @@ static void insert_task(struct task_struct *p, u64 slice, u64 vd,
   scx_bpf_dsq_insert_vtime(p, EEVDF_DSQ, slice, vd, enq_flags);
 }
 
+/* Fast-path slice, shrinking with the per-CPU pool depth: 20ms when the
+ * pool is empty or shallow, halving at depth 2/4/8 down to 2.5ms.  This
+ * is CFS's saturation granularity: a CPU-bound task can hold the CPU for
+ * at most one adaptive slice before the pool's next task (possibly a
+ * just-woken interactive one at the vtime front) is dispatched, while an
+ * unloaded machine keeps full slices and near-zero switch overhead. */
+static __always_inline u64 fast_slice(s32 cpu)
+{
+  s32 nr = scx_bpf_dsq_nr_queued(cpu_dsq_id(cpu));
+  if (nr < 0)
+    nr = 0;
+  if (nr >= 8)
+    return SCX_SLICE_DFL >> 3;
+  if (nr >= 4)
+    return SCX_SLICE_DFL >> 2;
+  if (nr >= 2)
+    return SCX_SLICE_DFL >> 1;
+  return SCX_SLICE_DFL;
+}
+
 /* -----------------------------------------------------------------------
  * select_cpu
  *   Cache-affine default placement ONLY.  No direct DSQ insert from here:
  *   that fast path bypasses enqueue and would silently skip the sem_any
  *   gate, vd bonuses, inheritance and accounting (v3 bug).  Ungated
- *   tasks reach their per-CPU FIFO DSQ through enqueue's fast path,
+ *   tasks reach their per-CPU vtime DSQ through enqueue's fast path,
  *   which has already verified they carry no semantic state.
  * ----------------------------------------------------------------------- */
 s32 BPF_STRUCT_OPS(db_sched_select_cpu, struct task_struct *p,
@@ -274,7 +305,6 @@ s32 BPF_STRUCT_OPS(db_sched_select_cpu, struct task_struct *p,
 void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags)
 {
   u32 tid = p->pid;
-  u64 now = scx_bpf_now();
   u64 vr, vd, slice = SCX_SLICE_DFL;
   s32 tier;
   u32 weight;
@@ -282,19 +312,34 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags)
   u8 *vip;
   u8 *gate;
 
-  /* Fast path: no semantic state published for this tid.  Per-CPU FIFO
-   * user DSQ of the select_cpu() target — no vtime arithmetic, no
-   * account, no rbtree insert under the global DSQ lock.  This is where
-   * the overwhelming majority of wakeups (idle workers, kernel threads,
-   * non-DB tasks) must land. */
+  /* Fast path: no semantic state published for this tid.  Per-CPU vtime
+   * pool of the select_cpu() target — no vtime account, no rbtree insert
+   * under the global DSQ lock, no inheritance walk.  This is where the
+   * overwhelming majority of wakeups (idle workers, kernel threads,
+   * non-DB tasks) must land.  Unlike a plain FIFO, the vtime order with
+   * a lag clamp puts a task that slept (vruntime fell behind) at the
+   * front of the pool, and a wakeup carrying more than one adaptive
+   * slice of lag also preempts the target CPU — together this is the
+   * interactive-task treatment CFS/EEVDF gives, which rw256 showed a
+   * plain FIFO fast path lacks (-12% TPS, p99 2.5x). */
   gate = bpf_map_lookup_elem(&sem_any, &tid);
   if (!gate) {
+    s32 cpu = scx_bpf_task_cpu(p);
+    u64 enq = enq_flags;
+
     stat_inc(5);
-    scx_bpf_dsq_insert(p, cpu_dsq_id(scx_bpf_task_cpu(p)),
-                       SCX_SLICE_DFL, enq_flags);
+    vr = p->scx.dsq_vtime;
+    if (vr + MAX_LAG < vtime_now)
+      vr = vtime_now - MAX_LAG;
+    slice = fast_slice(cpu);
+    if ((enq & SCX_ENQ_WAKEUP) && vtime_now > p->scx.dsq_vtime &&
+        vtime_now - p->scx.dsq_vtime > slice)
+      enq |= SCX_ENQ_PREEMPT;
+    scx_bpf_dsq_insert_vtime(p, cpu_dsq_id(cpu), slice, vr, enq);
     return;
   }
 
+  u64 now = scx_bpf_now();
   tier = get_tier(tid);
   weight = (tier == TIER_BG) ? BG_WEIGHT : NORMAL_WEIGHT;
 
@@ -322,23 +367,25 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags)
     goto inherit_publish;
   }
 
-  /* Time-sensitive role (reactor, VIP workers).  Head of this CPU's
-   * FIFO pool plus a preempt kick when it is not already running: the
-   * kick makes the target CPU re-enter dispatch immediately, and the
-   * head insert wins over the fast-path FIFO entries (the semantic
-   * vtime pool is still drained first — a waiting COMMIT outranks a
-   * reactor for one slice, matching the v4 B_TS/B_COMMIT equivalence). */
+  /* Time-sensitive role (reactor, VIP workers).  Oldest-possible vd in
+   * this CPU's vtime pool (the MAX_LAG clamp bounds how old anything in
+   * the pool can be, so this is effectively the head) plus a preempt
+   * kick when it is not already running: the kick makes the target CPU
+   * re-enter dispatch immediately, and the clamped vd wins over the
+   * fast-path entries (the semantic vtime pool is still drained first —
+   * a waiting COMMIT outranks a reactor for one slice, matching the v4
+   * B_TS/B_COMMIT equivalence). */
   if (tier == TIER_TS) {
     s32 cpu = scx_bpf_task_cpu(p);
 
     stat_inc(3);
-    scx_bpf_dsq_insert(p, cpu_dsq_id(cpu), SCX_SLICE_DFL,
-                       enq_flags | SCX_ENQ_HEAD);
+    vd = (vtime_now > MAX_LAG) ? vtime_now - MAX_LAG : 0;
+    scx_bpf_dsq_insert_vtime(p, cpu_dsq_id(cpu), SCX_SLICE_DFL, vd,
+                             enq_flags | SCX_ENQ_PREEMPT);
     if (scx_bpf_task_running(p)) {
       stat_inc(6);
     } else {
       stat_inc(7);
-      scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
     }
     goto inherit_publish;
   }
@@ -408,7 +455,7 @@ void BPF_STRUCT_OPS(db_sched_dispatch, s32 cpu, struct task_struct *prev)
 
   /* Semantic pool first (commit / lock holders / BG): the global
    * vtime-ordered DSQ holds only gated tasks, so its lock is no longer
-   * hammered by every wakeup.  Then this CPU's FIFO fast-path pool.
+   * hammered by every wakeup.  Then this CPU's vtime fast-path pool.
    * enq_flags 0: plain move; the compat macro resolves to
    * scx_bpf_consume() on pre-6.12 kernels. */
   if (scx_bpf_dsq_move_to_local(EEVDF_DSQ, 0))
@@ -417,7 +464,7 @@ void BPF_STRUCT_OPS(db_sched_dispatch, s32 cpu, struct task_struct *prev)
     return;
 
   /* Work conservation: this CPU would otherwise go idle while another
-   * CPU's FIFO holds fast-path tasks.  Per-CPU user DSQs have no builtin
+   * CPU's pool holds fast-path tasks.  Per-CPU user DSQs have no builtin
    * stealing, so scan neighbours round-robin from cpu+1.  Idle path only
    * — under saturation this loop is rarely reached. */
   for (i = 1; i < MAX_CPUS; i++) {
@@ -455,10 +502,13 @@ void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable)
   if (!gate) {
     /* Fast path: keep dsq_vtime current at normal weight so a later
      * transition into the semantic pool (this tid gets a gate entry)
-     * starts from a sane vruntime instead of a stale one.  No maps are
-     * written: the FIFO local pool ignores vtime entirely. */
-    if (p->scx.slice <= SCX_SLICE_DFL)
-      p->scx.dsq_vtime += SCX_SLICE_DFL - p->scx.slice;
+     * starts from a sane vruntime instead of a stale one.  The granted
+     * slice was adaptive; approximate it from the current pool depth —
+     * the error is at most one bucket and MAX_LAG bounds any drift.
+     * No maps are written: the per-CPU vtime pool needs no account. */
+    u64 granted = fast_slice(scx_bpf_task_cpu(p));
+    if (p->scx.slice < granted)
+      p->scx.dsq_vtime += granted - p->scx.slice;
     return;
   }
 
@@ -520,7 +570,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(db_sched_init)
   if (ret)
     return ret;
 
-  /* Per-CPU FIFO pools for the ungated fast path.  The "per-CPU" aspect
+  /* Per-CPU vtime pools for the ungated fast path.  The "per-CPU" aspect
    * is purely conventional (id = CPU_DSQ_BASE + cpu); the node argument
    * is only a NUMA allocation hint and must be NUMA_NO_NODE — passing the
    * cpu index would be rejected with -EINVAL once cpu >= nr_node_ids. */
@@ -534,7 +584,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(db_sched_init)
   }
   nr_cpu_dsqs = nr;
 
-  bpf_printk("EEVDF-Sem: registered (semantic vtime DSQ=%d + %d per-CPU FIFO DSQs)",
+  bpf_printk("EEVDF-Sem: registered (semantic vtime DSQ=%d + %d per-CPU vtime DSQs)",
              EEVDF_DSQ, nr);
   return 0;
 }
