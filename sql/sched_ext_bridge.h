@@ -154,6 +154,34 @@ void thread_job_begin(THD *thd, bool lock_holder, bool time_sensitive);
 void thread_job_end(THD *thd);
 
 /**
+  Whether any THD is currently recorded in the lock-wait graph as waiting
+  on a lock held by another THD.  A single relaxed atomic load, maintained
+  by lock_wait_begin/end/forget_thd: lets per-command hook sites skip the
+  wait-graph mutex entirely in uncontended runs.
+*/
+bool any_lock_waits();
+
+/**
+  Per-command publication for the classic (one-thread-per-connection)
+  architecture.  command_begin() is called from do_command_impl AFTER the
+  command has been read from the socket and immediately before dispatch:
+
+    - placement after the read is deliberate: a lock holder that sat idle
+      between statements of an explicit transaction gets a fresh marker at
+      wake-up, not one published before the (possibly long) idle read that
+      the scheduler's staleness TTL would have expired by then;
+    - the holder classification reuses is_lock_holder(), guarded by the
+      any_lock_waits() fast path so the uncontended cost is one atomic
+      load.
+
+  No-op in the coroutine architecture (the executor pool already brackets
+  each job with thread_job_begin/end, and double publication would
+  unbalance the gate refcount) and in builds without HAVE_SCX_SCHEDULER.
+*/
+void command_begin(THD *thd);
+void command_end(THD *thd);
+
+/**
   Whether any other transaction is currently blocked on a lock held by
   @c thd.  Called by the reactor thread before submitting the THD's next
   job, to decide whether the job should go to the high-priority queue.
@@ -238,6 +266,8 @@ inline void set_thread_tier(int) {}
 inline void clear_thread_tier() {}
 inline void set_priority(int) {}
 inline void init() {}
+inline void command_begin(THD *) {}
+inline void command_end(THD *) {}
 }  // namespace sched_ext
 #endif
 

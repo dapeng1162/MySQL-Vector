@@ -91,6 +91,10 @@ static std::mutex s_wait_mu;
 static std::unordered_map<THD *, THD *> s_waiter_to_holder;
 static std::unordered_map<THD *, uint32_t> s_holder_wait_count;
 
+/** Number of live waiter->holder edges (relaxed; advisory fast-path
+ * counter for per-command hook sites, never used for correctness). */
+static std::atomic<uint32_t> s_thd_wait_edges{0};
+
 /** Current wait count for @c holder (THD level), 0 if none. */
 static uint32_t holder_wait_count(THD *holder) {
   std::lock_guard<std::mutex> lock(s_wait_mu);
@@ -133,6 +137,10 @@ bool is_lock_holder(THD *thd) {
   return holder_wait_count(thd) > 0;
 }
 
+bool any_lock_waits() {
+  return s_thd_wait_edges.load(std::memory_order_relaxed) != 0;
+}
+
 void lock_wait_begin(THD *waiter, THD *holder) {
   if (waiter == nullptr || holder == nullptr) return;
 
@@ -145,6 +153,7 @@ void lock_wait_begin(THD *waiter, THD *holder) {
     s_waiter_to_holder[waiter] = holder;
     s_holder_wait_count[holder]++;
   }
+  s_thd_wait_edges.fetch_add(1, std::memory_order_relaxed);
 
 #ifdef HAVE_SCX_SCHEDULER
   /*
@@ -178,6 +187,7 @@ void lock_wait_end(THD *waiter) {
         }
       }
       s_waiter_to_holder.erase(w);
+      s_thd_wait_edges.fetch_sub(1, std::memory_order_relaxed);
     }
   }
 
@@ -206,6 +216,7 @@ void forget_thd(THD *thd) {
       }
     }
     s_waiter_to_holder.erase(w);
+    s_thd_wait_edges.fetch_sub(1, std::memory_order_relaxed);
   }
   // Remove as holder: any waiters still pointing at us keep their entries;
   // they will fail to resolve at end/forget time and be cleaned then.  Drop
@@ -288,6 +299,7 @@ extern "C" void mysql_sched_set_thread_tier(int tier) {
 #include <vector>
 
 #include "my_thread.h"  // my_thread_self
+#include "sql/conn_handler/connection_handler_manager.h"  // thread_handling
 #include "sql/resourcegroups/resource_group.h"  // Resource_group
 #include "sql/resourcegroups/thread_resource_control.h"
 
@@ -763,6 +775,25 @@ void thread_job_end(THD *thd) {
   s_thread_pub.published_ts_tier = false;
   s_thread_pub.published_rg_tier = false;
   s_thread_pub.tid = -1;
+}
+
+void command_begin(THD *thd) {
+  if (thd == nullptr) return;
+  /* Classic (per-thread / no-threads / plugin) architectures only: the
+   * coroutine executor brackets its jobs with thread_job_begin/end itself,
+   * and a second publication here would unbalance the gate refcount. */
+  if (Connection_handler_manager::thread_handling ==
+      Connection_handler_manager::SCHEDULER_COROUTINE_EPOLL)
+    return;
+  thread_job_begin(thd, any_lock_waits() && is_lock_holder(thd), false);
+}
+
+void command_end(THD *thd) {
+  if (thd == nullptr) return;
+  if (Connection_handler_manager::thread_handling ==
+      Connection_handler_manager::SCHEDULER_COROUTINE_EPOLL)
+    return;
+  thread_job_end(thd);
 }
 
 void set_thread_tier(int tier) {

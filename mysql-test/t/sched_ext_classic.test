@@ -1,0 +1,45 @@
+# C5: the DB-aware sched_ext bridge hooks in the classic
+# one-thread-per-connection architecture (this test runs in the default
+# server mode).  In a default build (no WITH_SCX_SCHEDULER) the bridge
+# must be completely inert: it reports itself as not connected, and no
+# coroutine runtime is created for the classic architecture.  The command
+# loop, the THD lock-wait graph and the connection teardown paths that
+# carry the hooks are exercised end to end by the queries and the
+# two-session lock conflict below: session 1 holds a row lock while idle
+# between statements, session 2 blocks on it, and the holder's COMMIT is
+# the command whose publication the command_begin() hook classifies.
+
+# Container environment: mysqld logs MY-015655 at startup on this host
+# and MTR would fail every test over it (environment issue, not ours).
+call mtr.add_suppression("Server ignores the discovered container restrictions");
+
+SHOW GLOBAL STATUS LIKE 'Sched_ext_connected';
+SHOW GLOBAL STATUS LIKE 'Coroutine_executor_threads';
+
+CREATE TABLE t1 (a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1, 0), (2, 0);
+
+connect(con1, localhost, root,,);
+connect(con2, localhost, root,,);
+connection con1;
+BEGIN;
+UPDATE t1 SET b = 1 WHERE a = 1;
+connection con2;
+--send UPDATE t1 SET b = 2 WHERE a = 1
+connection con1;
+# Let con2 reach the row-lock wait edge (holder idle, waiter blocked).
+--sleep 1
+COMMIT;
+connection con2;
+--reap
+SELECT * FROM t1 ORDER BY a;
+COMMIT;
+disconnect con1;
+disconnect con2;
+connection default;
+DROP TABLE t1;
+
+# Still inert after connections came and went (thread registry and wait
+# graph cleanup ran on teardown).
+SHOW GLOBAL STATUS LIKE 'Sched_ext_connected';
+SHOW GLOBAL STATUS LIKE 'Coroutine_executor_threads';

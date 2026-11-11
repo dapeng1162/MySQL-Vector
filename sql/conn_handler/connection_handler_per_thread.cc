@@ -56,6 +56,7 @@
 #include "sql/mysqld.h"                                   // max_connections
 #include "sql/mysqld_thd_manager.h"                       // Global_THD_manager
 #include "sql/protocol_classic.h"
+#include "sql/sched_ext_bridge.h"  // sched_ext::thread_start/end, forget_thd
 #include "sql/sql_class.h"    // THD
 #include "sql/sql_connect.h"  // close_connection
 #include "sql/sql_error.h"
@@ -260,6 +261,12 @@ static void *handle_connection(void *arg) {
     return nullptr;
   }
 
+  /* Register this connection thread in the sched_ext bridge so lock-wait
+     and latch wait edges can resolve a THD's owning thread to the OS tid
+     the scheduler's BPF maps are keyed by.  No-op when the bridge is not
+     connected (or built without WITH_SCX_SCHEDULER). */
+  sched_ext::thread_start();
+
   for (;;) {
     THD *thd = init_new_thd(channel_info);
     if (thd == nullptr) {
@@ -317,6 +324,10 @@ static void *handle_connection(void *arg) {
     thd_manager->remove_thd(thd);
     Connection_handler_manager::dec_connection_count();
 
+    /* Defensive cleanup of any residual lock-wait graph entries keyed by
+       this THD (as waiter or holder) before its memory is freed. */
+    sched_ext::forget_thd(thd);
+
 #ifdef HAVE_PSI_THREAD_INTERFACE
     /* Stop telemetry, while THD is still available. */
     if (psi != nullptr) {
@@ -351,6 +362,7 @@ static void *handle_connection(void *arg) {
     }
   }
 
+  sched_ext::thread_end();
   my_thread_end();
   my_thread_exit(nullptr);
   return nullptr;

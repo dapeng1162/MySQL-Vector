@@ -986,8 +986,18 @@ void Coroutine_connection_handler::init() {
   if (s_initialized) return;
   /* Probe (once) whether a sched_ext scheduler is running with its maps
    * pinned.  When it is not (or WITH_SCX_SCHEDULER is OFF), this is a
-   * no-op and the server keeps working normally. */
+   * no-op and the server keeps working normally.  The probe is
+   * architecture-independent — the classic per-thread handler publishes
+   * the same semantic state from its command loop — so it runs even when
+   * the coroutine handler is not selected. */
   sched_ext::init();
+  /* The runtime (reactors, executor pool, vio pre-close hook) is only
+   * created when this handler is actually the selected connection
+   * architecture: a one-thread-per-connection server must not carry idle
+   * reactor and worker threads it never uses. */
+  if (Connection_handler_manager::thread_handling !=
+      Connection_handler_manager::SCHEDULER_COROUTINE_EPOLL)
+    return;
   try {
     size_t n_reactors = coroutine_reactor_threads ? coroutine_reactor_threads : 1;
     if (n_reactors > 64) n_reactors = 64;

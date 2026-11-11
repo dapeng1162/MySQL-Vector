@@ -141,6 +141,7 @@
 #include "sql/rpl_utility.h"
 #include "sql/session_tracker.h"
 #include "sql/set_var.h"
+#include "sql/sched_ext_bridge.h"  // sched_ext::command_begin/end
 #include "sql/sp.h"        // sp_create_routine
 #include "sql/sp_cache.h"  // sp_cache_enforce_limit
 #include "sql/sp_head.h"   // sp_head
@@ -1491,11 +1492,21 @@ static bool do_command_impl(THD *thd, Parser_state *parser_state,
 
   DEBUG_SYNC(thd, "before_command_dispatch");
 
+  /* Publish DB-aware scheduler state for the command that is about to run
+     (classic one-thread-per-connection architecture; no-op in the coroutine
+     architecture and in builds without the sched_ext bridge).  Must be
+     after the socket read above: a lock holder idle between statements of
+     an explicit transaction gets a fresh marker at wake-up instead of one
+     the scheduler's staleness TTL expired while it was parked. */
+  sched_ext::command_begin(thd);
+
   return_value = dispatch_command(
       thd, &com_data, command, /*pre_parsed=*/nullptr,
       /*parse_only_state=*/parser_state, /*parse_completed=*/ready);
   thd->get_protocol_classic()->get_output_packet()->shrink(
       thd->variables.net_buffer_length);
+
+  sched_ext::command_end(thd);
 
   if (parser_state != nullptr) {
     if (!return_value && *ready) {

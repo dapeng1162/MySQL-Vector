@@ -1,0 +1,25 @@
+call mtr.add_suppression("Server ignores the discovered container restrictions");
+SHOW GLOBAL STATUS LIKE 'Sched_ext_connected';
+Variable_name	Value
+Sched_ext_connected	0
+SHOW GLOBAL STATUS LIKE 'Coroutine_executor_threads';
+Variable_name	Value
+Coroutine_executor_threads	0
+CREATE TABLE t1 (a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1, 0), (2, 0);
+BEGIN;
+UPDATE t1 SET b = 1 WHERE a = 1;
+UPDATE t1 SET b = 2 WHERE a = 1;
+COMMIT;
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	2
+2	0
+COMMIT;
+DROP TABLE t1;
+SHOW GLOBAL STATUS LIKE 'Sched_ext_connected';
+Variable_name	Value
+Sched_ext_connected	0
+SHOW GLOBAL STATUS LIKE 'Coroutine_executor_threads';
+Variable_name	Value
+Coroutine_executor_threads	0

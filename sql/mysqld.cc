@@ -804,6 +804,7 @@ MySQL clients support the protocol:
 #include "sql/conn_handler/coroutine_connection_handler.h"  // Coroutine_connection_handler
 #include "sql/conn_handler/socket_connection.h"  // stmt_info_new_packet
 #include "sql/current_thd.h"                     // current_thd
+#include "sql/sched_ext_bridge.h"                // sched_ext::connected
 #include "sql/dd/cache/dictionary_client.h"
 #include "sql/debug_sync.h"  // debug_sync_end
 #include "sql/derror.h"
@@ -11371,6 +11372,16 @@ static int show_coroutine_executor_threads(THD *, SHOW_VAR *var, char *buff) {
   return 0;
 }
 
+static int show_sched_ext_connected(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  /* 1 when the DB-aware sched_ext bridge probed live, pinned BPF maps at
+     startup (requires WITH_SCX_SCHEDULER and a running scx_db_sched);
+     0 otherwise — including every default build. */
+  *reinterpret_cast<long *>(buff) = sched_ext::connected() ? 1 : 0;
+  return 0;
+}
+
 static int show_coroutine_commands_completed(THD *, SHOW_VAR *var,
                                               char *buff) {
   var->type = SHOW_LONGLONG;
@@ -12069,6 +12080,8 @@ SHOW_VAR status_vars[] = {
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Coroutine_reactor_exec_slow",
      (char *)&show_coroutine_reactor_exec_slow, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Sched_ext_connected", (char *)&show_sched_ext_connected, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
     {"Coroutine_stmt_prio_kill", (char *)&show_coroutine_stmt_prio_kill,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
