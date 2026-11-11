@@ -239,3 +239,20 @@ executor-t(13) netpoller-t(8) task-t(5) stmt_priority-t(9)  # 共 35 个，全�
 - 云 benchmark 遵守根目录 `AGENTS.md`：结果先拉回并校验，实例测试后立即释放；
   Spot 实例构建产物及时备份（本地 `binaries/` 模式）。
 - perf-stat time-enabled 是多核求和，归一化窗口 = 值/核数；别用 bpftool 窗口去除。
+
+### 5.7 C5 性能持平攻坚（2026-11-11 当日结论）
+
+详细数据与证据链：`../aliyun/mysql-sched-bench/results/c5-20261111/summary-c5.md`。
+
+- **桥接税已清零**（d36f65842，256 分片锁 + stale-pin 防护）：C5n 全档位与 V97
+  ±2%（node-1/node-2 双节点复测）。
+- **调度器 v6/v6.1（29c309b32/c4b7f7d2f）未消除活调度器差距**：rw256 -13.9%，
+  p99 101ms。已排除：BPF 执行税（1.5%）、唤醒时机（100µs 门槛无效）、语义层
+  （稳态空转）、切换/迁移（反而更少）。
+- **归因**：instr 相同、cycles +10%；差额落在 redo log writer 路径（6×）与内核
+  自旋锁（3% vs 0.55%）。主假设：scx 改变 log writer 唤醒节奏，group commit 批
+  处理崩溃。
+- **下一步首选**：srv_log_writer_thread 打 TIER_BG（一行，刻意延迟 writer 恢复
+  批处理）→ 增量重建 → rw256 复测；备选：writer 唤醒频率 trace 确认（eBPF
+  sys_enter_pwrite64 按 tid 聚合），再考虑 scx 侧 credit 衰减。火焰图原始数据
+  已留存（node2-diagnostics/perf_pair.zst）。
