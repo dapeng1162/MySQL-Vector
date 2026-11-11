@@ -67,6 +67,7 @@
 #include "sql/sched_ext_bridge.h"
 
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <unordered_map>
 
@@ -77,19 +78,38 @@ namespace sched_ext {
 namespace {
 
 // -----------------------------------------------------------------------
+// Sharded maps.
+//
+// v1 used one global mutex per structure (wait graph, gate refcount, tid
+// registries, latch mirror).  In the classic architecture those locks are
+// taken once per COMMAND (is_lock_holder read) and twice per COMMIT (gate
+// refcount churn), from every connection thread: at 256 connections the
+// single cacheline degenerated into futex traffic, measured as -8% TPS
+// with +40% cpu-migrations at rw256.  Each logical map below is split
+// into 256 independently-locked shards.  Shard locks are NEVER nested
+// across maps (each helper locks one shard, releases, then takes the
+// next), so there is no ordering hazard by construction.
+// -----------------------------------------------------------------------
+template <typename K, typename V>
+struct Sharded_map {
+  static constexpr size_t kCount = 256;
+  static_assert((kCount & (kCount - 1)) == 0, "power of two");
+  std::mutex mu[kCount];
+  std::unordered_map<K, V> m[kCount];
+  size_t idx(K k) const { return std::hash<K>()(k) & (kCount - 1); }
+};
+
+// -----------------------------------------------------------------------
 // THD-level lock-wait graph (always compiled).
 //
-// m_waiter_to_holder[waiter]  = holder   (set on begin, removed on end)
-// m_holder_wait_count[holder] = N        (number of waiters on this holder)
+// s_waiter_to_holder[waiter]  = holder   (set on begin, removed on end)
+// s_holder_wait_count[holder] = N        (number of waiters on this holder)
 //
-// Guarded by s_wait_mu, a leaf mutex: no callback or latch is ever taken
-// while holding it, and it is never taken while holding anything else.
 // THD pointers are only used as opaque keys, never dereferenced — a stale
 // entry is cleaned up by forget_thd() at connection teardown.
 // -----------------------------------------------------------------------
-static std::mutex s_wait_mu;
-static std::unordered_map<THD *, THD *> s_waiter_to_holder;
-static std::unordered_map<THD *, uint32_t> s_holder_wait_count;
+static Sharded_map<THD *, THD *> s_waiter_to_holder;
+static Sharded_map<THD *, uint32_t> s_holder_wait_count;
 
 /** Number of live waiter->holder edges (relaxed; advisory fast-path
  * counter for per-command hook sites, never used for correctness). */
@@ -97,9 +117,10 @@ static std::atomic<uint32_t> s_thd_wait_edges{0};
 
 /** Current wait count for @c holder (THD level), 0 if none. */
 static uint32_t holder_wait_count(THD *holder) {
-  std::lock_guard<std::mutex> lock(s_wait_mu);
-  auto it = s_holder_wait_count.find(holder);
-  return it == s_holder_wait_count.end() ? 0 : it->second;
+  const size_t i = s_holder_wait_count.idx(holder);
+  std::lock_guard<std::mutex> lock(s_holder_wait_count.mu[i]);
+  auto it = s_holder_wait_count.m[i].find(holder);
+  return it == s_holder_wait_count.m[i].end() ? 0 : it->second;
 }
 
 #ifdef HAVE_SCX_SCHEDULER
@@ -113,14 +134,12 @@ void scx_clear_latch_edge();
 // -----------------------------------------------------------------------
 // Latch-level wait mirror (always compiled).
 //
-// s_latch_waiter_to_holder[waiter] = holder   (set on begin, removed on end)
-//
-// Same leaf-mutex discipline as the THD wait graph above.  Keyed by
-// std::thread::id — the raw id the instrumentation sites read from the
-// latch — so no tid registry is needed for this userspace half.
+// s_latch_waiter_to_holder[waiter] = holder   (set on begin, removed on
+// end).  Keyed by std::thread::id — the raw id the instrumentation sites
+// read from the latch — so no tid registry is needed for this userspace
+// half.
 // -----------------------------------------------------------------------
-static std::mutex s_latch_mu;
-static std::unordered_map<std::thread::id, std::thread::id>
+static Sharded_map<std::thread::id, std::thread::id>
     s_latch_waiter_to_holder;
 
 static std::atomic<uint64_t> s_latch_waits[2] = {};
@@ -144,14 +163,18 @@ bool any_lock_waits() {
 void lock_wait_begin(THD *waiter, THD *holder) {
   if (waiter == nullptr || holder == nullptr) return;
 
-  /* THD-level wait graph: always recorded, SCX or not.  The lock is scoped:
-     scx_publish_wait_edge() below takes s_wait_mu again internally, and
-     std::mutex is not recursive — holding it across the call would
-     self-deadlock. */
+  /* THD-level wait graph: always recorded, SCX or not.  Shard locks are
+     scoped per map and never nested: scx_publish_wait_edge() below takes
+     the holder-count shard again internally. */
   {
-    std::lock_guard<std::mutex> lock(s_wait_mu);
-    s_waiter_to_holder[waiter] = holder;
-    s_holder_wait_count[holder]++;
+    const size_t i = s_waiter_to_holder.idx(waiter);
+    std::lock_guard<std::mutex> lock(s_waiter_to_holder.mu[i]);
+    s_waiter_to_holder.m[i][waiter] = holder;
+  }
+  {
+    const size_t i = s_holder_wait_count.idx(holder);
+    std::lock_guard<std::mutex> lock(s_holder_wait_count.mu[i]);
+    s_holder_wait_count.m[i][holder]++;
   }
   s_thd_wait_edges.fetch_add(1, std::memory_order_relaxed);
 
@@ -174,20 +197,25 @@ void lock_wait_end(THD *waiter) {
   /* THD-level: drop the waiter's edge and decrement the holder count. */
   THD *holder = nullptr;
   {
-    std::lock_guard<std::mutex> lock(s_wait_mu);
-    auto w = s_waiter_to_holder.find(waiter);
-    if (w != s_waiter_to_holder.end()) {
+    const size_t i = s_waiter_to_holder.idx(waiter);
+    std::lock_guard<std::mutex> lock(s_waiter_to_holder.mu[i]);
+    auto w = s_waiter_to_holder.m[i].find(waiter);
+    if (w != s_waiter_to_holder.m[i].end()) {
       holder = w->second;
-      auto c = s_holder_wait_count.find(holder);
-      if (c != s_holder_wait_count.end()) {
-        if (c->second > 1) {
-          c->second--;
-        } else {
-          s_holder_wait_count.erase(c);
-        }
-      }
-      s_waiter_to_holder.erase(w);
+      s_waiter_to_holder.m[i].erase(w);
       s_thd_wait_edges.fetch_sub(1, std::memory_order_relaxed);
+    }
+  }
+  if (holder != nullptr) {
+    const size_t i = s_holder_wait_count.idx(holder);
+    std::lock_guard<std::mutex> lock(s_holder_wait_count.mu[i]);
+    auto c = s_holder_wait_count.m[i].find(holder);
+    if (c != s_holder_wait_count.m[i].end()) {
+      if (c->second > 1) {
+        c->second--;
+      } else {
+        s_holder_wait_count.m[i].erase(c);
+      }
     }
   }
 
@@ -202,26 +230,40 @@ void lock_wait_end(THD *waiter) {
 void forget_thd(THD *thd) {
   if (thd == nullptr) return;
 
-  std::lock_guard<std::mutex> lock(s_wait_mu);
-  // Remove as waiter: decrement the holder's wait count.
-  auto w = s_waiter_to_holder.find(thd);
-  if (w != s_waiter_to_holder.end()) {
-    THD *holder = w->second;
-    auto c = s_holder_wait_count.find(holder);
-    if (c != s_holder_wait_count.end()) {
-      if (c->second > 1) {
-        c->second--;
-      } else {
-        s_holder_wait_count.erase(c);
+  /* Remove as waiter: decrement the holder's wait count. */
+  {
+    THD *holder = nullptr;
+    {
+      const size_t i = s_waiter_to_holder.idx(thd);
+      std::lock_guard<std::mutex> lock(s_waiter_to_holder.mu[i]);
+      auto w = s_waiter_to_holder.m[i].find(thd);
+      if (w != s_waiter_to_holder.m[i].end()) {
+        holder = w->second;
+        s_waiter_to_holder.m[i].erase(w);
+        s_thd_wait_edges.fetch_sub(1, std::memory_order_relaxed);
       }
     }
-    s_waiter_to_holder.erase(w);
-    s_thd_wait_edges.fetch_sub(1, std::memory_order_relaxed);
+    if (holder != nullptr) {
+      const size_t i = s_holder_wait_count.idx(holder);
+      std::lock_guard<std::mutex> lock(s_holder_wait_count.mu[i]);
+      auto c = s_holder_wait_count.m[i].find(holder);
+      if (c != s_holder_wait_count.m[i].end()) {
+        if (c->second > 1) {
+          c->second--;
+        } else {
+          s_holder_wait_count.m[i].erase(c);
+        }
+      }
+    }
   }
-  // Remove as holder: any waiters still pointing at us keep their entries;
-  // they will fail to resolve at end/forget time and be cleaned then.  Drop
-  // our own count entry.
-  s_holder_wait_count.erase(thd);
+  /* Remove as holder: any waiters still pointing at us keep their entries;
+     they will fail to resolve at end/forget time and be cleaned then.  Drop
+     our own count entry. */
+  {
+    const size_t i = s_holder_wait_count.idx(thd);
+    std::lock_guard<std::mutex> lock(s_holder_wait_count.mu[i]);
+    s_holder_wait_count.m[i].erase(thd);
+  }
 }
 
 // -----------------------------------------------------------------------
@@ -234,14 +276,16 @@ bool latch_wait_begin(std::thread::id owner, Latch_kind kind) {
   if (owner == std::thread::id{}) return false;
 
   {
-    std::lock_guard<std::mutex> lock(s_latch_mu);
-    s_latch_waiter_to_holder[std::this_thread::get_id()] = owner;
+    const std::thread::id waiter = std::this_thread::get_id();
+    const size_t i = s_latch_waiter_to_holder.idx(waiter);
+    std::lock_guard<std::mutex> lock(s_latch_waiter_to_holder.mu[i]);
+    s_latch_waiter_to_holder.m[i][waiter] = owner;
   }
   s_latch_edges[k].fetch_add(1, std::memory_order_relaxed);
 
 #ifdef HAVE_SCX_SCHEDULER
   /* Publish the tid-keyed BPF maps (no-op unless connected).  Scoped:
-     scx_publish_latch_edge() must not take s_latch_mu. */
+     scx_publish_latch_edge() must not take the latch-wait shard. */
   scx_publish_latch_edge(owner);
 #endif
   return true;
@@ -249,8 +293,10 @@ bool latch_wait_begin(std::thread::id owner, Latch_kind kind) {
 
 void latch_wait_end() {
   {
-    std::lock_guard<std::mutex> lock(s_latch_mu);
-    s_latch_waiter_to_holder.erase(std::this_thread::get_id());
+    const std::thread::id waiter = std::this_thread::get_id();
+    const size_t i = s_latch_waiter_to_holder.idx(waiter);
+    std::lock_guard<std::mutex> lock(s_latch_waiter_to_holder.mu[i]);
+    s_latch_waiter_to_holder.m[i].erase(waiter);
   }
 
 #ifdef HAVE_SCX_SCHEDULER
@@ -267,9 +313,11 @@ uint64_t latch_wait_edge_count(Latch_kind kind) {
 }
 
 std::thread::id latch_wait_holder(std::thread::id waiter) {
-  std::lock_guard<std::mutex> lock(s_latch_mu);
-  auto it = s_latch_waiter_to_holder.find(waiter);
-  return it == s_latch_waiter_to_holder.end() ? std::thread::id{} : it->second;
+  const size_t i = s_latch_waiter_to_holder.idx(waiter);
+  std::lock_guard<std::mutex> lock(s_latch_waiter_to_holder.mu[i]);
+  auto it = s_latch_waiter_to_holder.m[i].find(waiter);
+  return it == s_latch_waiter_to_holder.m[i].end() ? std::thread::id{}
+                                                   : it->second;
 }
 
 }  // namespace sched_ext
@@ -294,6 +342,8 @@ extern "C" void mysql_sched_set_thread_tier(int tier) {
 #include <unistd.h>
 #include <chrono>
 #include <cstring>
+#include <fstream>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -341,15 +391,15 @@ static int s_fd_sem_any     = -1;
 // harmless reverse: state without a gate would be a bug, an extra gate
 // just costs the slow path).
 // -----------------------------------------------------------------------
-static std::mutex s_gate_mu;
-static std::unordered_map<int32_t, uint32_t> s_gate_refs;
+static Sharded_map<int32_t, uint32_t> s_gate_refs;
 
 static void gate_reason_add(int32_t tid) {
   if (tid < 0 || s_fd_sem_any < 0) return;
+  const size_t i = s_gate_refs.idx(tid);
   bool first = false;
   {
-    std::lock_guard<std::mutex> lock(s_gate_mu);
-    first = ++s_gate_refs[tid] == 1;
+    std::lock_guard<std::mutex> lock(s_gate_refs.mu[i]);
+    first = ++s_gate_refs.m[i][tid] == 1;
   }
   if (first) {
     uint8_t one = 1;
@@ -359,15 +409,16 @@ static void gate_reason_add(int32_t tid) {
 
 static void gate_reason_remove(int32_t tid) {
   if (tid < 0 || s_fd_sem_any < 0) return;
+  const size_t i = s_gate_refs.idx(tid);
   bool last = false;
   {
-    std::lock_guard<std::mutex> lock(s_gate_mu);
-    auto it = s_gate_refs.find(tid);
-    if (it == s_gate_refs.end()) return;
+    std::lock_guard<std::mutex> lock(s_gate_refs.mu[i]);
+    auto it = s_gate_refs.m[i].find(tid);
+    if (it == s_gate_refs.m[i].end()) return;
     if (it->second > 1) {
       it->second--;
     } else {
-      s_gate_refs.erase(it);
+      s_gate_refs.m[i].erase(it);
       last = true;
     }
   }
@@ -504,10 +555,21 @@ static void gate_sweep_once() {
   }
 
   /* Rebuild the refcount from ground truth so the eager paths stay
-   * balanced from here on. */
+   * balanced from here on.  The collected refs are bucketed per shard
+   * first so each shard lock is taken exactly once, with no map
+   * operation held under it. */
   {
-    std::lock_guard<std::mutex> lock(s_gate_mu);
-    s_gate_refs = std::move(refs);
+    std::vector<std::vector<std::pair<int32_t, uint32_t>>> per_shard(
+        s_gate_refs.kCount);
+    for (const auto &kv : refs)
+      per_shard[s_gate_refs.idx(kv.first)].push_back(kv);
+    for (size_t i = 0; i < s_gate_refs.kCount; ++i) {
+      if (per_shard[i].empty()) continue;
+      std::lock_guard<std::mutex> lock(s_gate_refs.mu[i]);
+      auto &dst = s_gate_refs.m[i];
+      dst.clear();
+      for (const auto &kv : per_shard[i]) dst[kv.first] = kv.second;
+    }
   }
 }
 
@@ -530,11 +592,12 @@ static void gate_sweeper_main() {
 // (THD::real_id), which is opaque.  Executor/worker threads call
 // thread_start() from themselves, registering pthread_t -> gettid(), so the
 // bridge can translate a THD into the numeric tid the scheduler needs.
+// Shard-split like the wait graph: in the classic architecture every
+// connection registers at connect and thread_end erases at disconnect.
 // -----------------------------------------------------------------------
-static std::mutex s_registry_mu;
-static std::unordered_map<my_thread_t, int32_t> s_tid_registry;
+static Sharded_map<my_thread_t, int32_t> s_tid_registry;
 /* Second registry for latch wait edges: std::thread::id -> OS tid. */
-static std::unordered_map<std::thread::id, int32_t> s_std_tid_registry;
+static Sharded_map<std::thread::id, int32_t> s_std_tid_registry;
 
 /** Cached OS tid of the current thread (lazily initialised). */
 thread_local int32_t s_current_tid = -1;
@@ -583,9 +646,10 @@ static void close_map(int fd) {
 /** OS tid of the thread currently running @c thd, or -1 if unknown. */
 static int32_t thd_os_tid(THD *thd) {
   if (thd == nullptr) return -1;
-  std::lock_guard<std::mutex> lock(s_registry_mu);
-  auto it = s_tid_registry.find(thd->real_id);
-  return it == s_tid_registry.end() ? -1 : it->second;
+  const size_t i = s_tid_registry.idx(thd->real_id);
+  std::lock_guard<std::mutex> lock(s_tid_registry.mu[i]);
+  auto it = s_tid_registry.m[i].find(thd->real_id);
+  return it == s_tid_registry.m[i].end() ? -1 : it->second;
 }
 
 }  // anonymous namespace
@@ -602,17 +666,15 @@ namespace {
  */
 void scx_publish_wait_edge(THD *waiter, THD *holder) {
   if (!s_connected) return;
+  /* The waiter's tid is the calling thread (lock_wait_begin runs on the
+   * waiter); the THD itself is not needed here. */
+  (void)waiter;
 
   int32_t waiter_tid = current_tid();
   int32_t holder_tid = thd_os_tid(holder);
   if (holder_tid < 0) return;
 
-  uint32_t count = 0;
-  {
-    std::lock_guard<std::mutex> lock(s_wait_mu);
-    auto it = s_holder_wait_count.find(holder);
-    if (it != s_holder_wait_count.end()) count = it->second;
-  }
+  uint32_t count = holder_wait_count(holder);
   if (count == 0) return;
 
   /* blocked_by[waiter] = holder */
@@ -649,9 +711,10 @@ void scx_clear_wait_edge(THD *waiter, THD *holder) {
 
 /* Resolve a latch holder's std::thread::id to its OS tid, or -1. */
 static int32_t latch_owner_tid(std::thread::id owner) {
-  std::lock_guard<std::mutex> lock(s_registry_mu);
-  auto it = s_std_tid_registry.find(owner);
-  return it == s_std_tid_registry.end() ? -1 : it->second;
+  const size_t i = s_std_tid_registry.idx(owner);
+  std::lock_guard<std::mutex> lock(s_std_tid_registry.mu[i]);
+  auto it = s_std_tid_registry.m[i].find(owner);
+  return it == s_std_tid_registry.m[i].end() ? -1 : it->second;
 }
 
 void scx_publish_latch_edge(std::thread::id owner) {
@@ -690,15 +753,34 @@ void scx_clear_latch_edge() {
 bool connected() { return s_connected; }
 
 void thread_start() {
-  std::lock_guard<std::mutex> lock(s_registry_mu);
-  s_tid_registry[my_thread_self()] = current_tid();
-  s_std_tid_registry[std::this_thread::get_id()] = current_tid();
+  const int32_t tid = current_tid();
+  {
+    const my_thread_t self = my_thread_self();
+    const size_t i = s_tid_registry.idx(self);
+    std::lock_guard<std::mutex> lock(s_tid_registry.mu[i]);
+    s_tid_registry.m[i][self] = tid;
+  }
+  {
+    const std::thread::id sid = std::this_thread::get_id();
+    const size_t i = s_std_tid_registry.idx(sid);
+    std::lock_guard<std::mutex> lock(s_std_tid_registry.mu[i]);
+    s_std_tid_registry.m[i][sid] = tid;
+  }
 }
 
 void thread_end() {
-  std::lock_guard<std::mutex> lock(s_registry_mu);
-  s_tid_registry.erase(my_thread_self());
-  s_std_tid_registry.erase(std::this_thread::get_id());
+  {
+    const my_thread_t self = my_thread_self();
+    const size_t i = s_tid_registry.idx(self);
+    std::lock_guard<std::mutex> lock(s_tid_registry.mu[i]);
+    s_tid_registry.m[i].erase(self);
+  }
+  {
+    const std::thread::id sid = std::this_thread::get_id();
+    const size_t i = s_std_tid_registry.idx(sid);
+    std::lock_guard<std::mutex> lock(s_std_tid_registry.mu[i]);
+    s_std_tid_registry.m[i].erase(sid);
+  }
 }
 
 void thread_job_begin(THD *thd, bool lock_holder, bool time_sensitive) {
@@ -778,7 +860,7 @@ void thread_job_end(THD *thd) {
 }
 
 void command_begin(THD *thd) {
-  if (thd == nullptr) return;
+  if (!s_connected || thd == nullptr) return;
   /* Classic (per-thread / no-threads / plugin) architectures only: the
    * coroutine executor brackets its jobs with thread_job_begin/end itself,
    * and a second publication here would unbalance the gate refcount. */
@@ -789,7 +871,7 @@ void command_begin(THD *thd) {
 }
 
 void command_end(THD *thd) {
-  if (thd == nullptr) return;
+  if (!s_connected || thd == nullptr) return;
   if (Connection_handler_manager::thread_handling ==
       Connection_handler_manager::SCHEDULER_COROUTINE_EPOLL)
     return;
@@ -847,6 +929,18 @@ void init() {
   /* Already connected or probe already failed — do nothing. */
   if (s_connected) return;
 
+  /* Stale-pin guard: the loader pins its maps under
+   * /sys/fs/bpf/scx_db_sched and the pins survive the loader's exit even
+   * though the scheduler behind them is gone.  Attaching to those dead
+   * maps makes every hook site pay the publication cost for nothing
+   * (observed as a connected bridge with sched_ext disabled).  Only
+   * attach while a sched_ext scheduler is actually loaded. */
+  {
+    std::ifstream state("/sys/kernel/sched_ext/state");
+    std::string v;
+    if (!(state >> v) || v != "enabled") return;
+  }
+
   s_fd_commit_vip  = open_map(kMapCommitVIP);
   s_fd_blocked_by  = open_map(kMapBlockedBy);
   s_fd_lock_holder = open_map(kMapLockHolder);
@@ -862,9 +956,9 @@ void init() {
     s_connected = true;
     /* Fresh scheduler session: any refcount state from a previous
      * session is meaningless (the BPF maps were recreated empty). */
-    {
-      std::lock_guard<std::mutex> lock(s_gate_mu);
-      s_gate_refs.clear();
+    for (size_t i = 0; i < s_gate_refs.kCount; ++i) {
+      std::lock_guard<std::mutex> lock(s_gate_refs.mu[i]);
+      s_gate_refs.m[i].clear();
     }
     /* Start the gate sweeper once per process.  It is a detached thread
      * that only touches the BPF fds and leaky-static state, so process
