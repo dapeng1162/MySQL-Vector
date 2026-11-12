@@ -14,12 +14,16 @@
  *     wakeup-preemption behaviour CFS/EEVDF gives interactive tasks and
  *     a plain FIFO denies.  A wakeup whose lag exceeds ~100us also
  *     kicks the target CPU with SCX_KICK_PREEMPT (SCX_ENQ_PREEMPT is a
- *     no-op for user DSQs), and the slice granted at enqueue is recorded
- *     so stopping() charges the exact runtime — recomputing it from the
- *     pool depth at stop time overcharged sleepers (N1: 21ms delays).
- *       The fast-path slice shrinks with the pool depth (20ms → 2.5ms),
- *     bounding the head-of-line wait a CPU-bound task can impose on the
- *     pool — the saturation-granularity behaviour CFS gets from its
+ *     no-op for user DSQs), and stopping() charges the runtime from the
+ *     running()->stopping() on-CPU interval — granted-minus-remaining
+ *     overcharges tasks kicked off the CPU, because kick_one_cpu()
+ *     zeroes the victim's scx.slice (N1: 21ms delay clusters).
+ *       The fast-path slice shrinks with the pool depth (20ms -> 2.5ms),
+ *     and a task whose undecayed on-CPU budget trips CPUBOUND_BUDGET_NS
+ *     (a CPU hog) has its slice capped at 2.5ms unconditionally —
+ *     together bounding the head-of-line wait a CPU-bound task can
+ *     impose on the pool even when the kick's preemption is delayed,
+ *     the saturation-granularity behaviour CFS gets from its
  *     latency-nice scaling.  dispatch() drains the semantic pool first,
  *     then the CPU's vtime pool, preserving commit/latch priority.
  *   - No strict-priority FIFO bypass, no SCX_SLICE_INF.
@@ -87,6 +91,16 @@ static __always_inline u64 cpu_dsq_id(s32 cpu)
  * means the task genuinely slept (network I/O), so preempt the target CPU
  * and run it while its data is cache-hot.  See enqueue fast path. */
 #define WAKE_PREEMPT_LAG_NS (100 * 1000ULL)
+
+/* CPU-bound containment.  The kick's preemption of the target CPU is not
+ * instantaneous (irq_work may be merged or delayed), so a CPU hog can still
+ * impose close to one full slice of head-of-line wait on a woken task.  A
+ * task whose undecayed on-CPU budget exceeds CPUBOUND_BUDGET_NS (it has been
+ * on-CPU for more than 20ms net of its off-CPU gaps) is treated as CPU-bound
+ * and its fast-path slice is capped at 2.5ms, bounding that wait regardless
+ * of why the kick was late (N1 v6.3: 0.7% of wakeups waited a full 20ms). */
+#define CPUBOUND_BUDGET_NS (20 * 1000 * 1000ULL)
+#define SLICE_CAP_CPU_BOUND (SCX_SLICE_DFL >> 3)
 
 /* Background tasks (purge & friends) get a smaller weight: their virtual
  * deadline lands 4x later and their vruntime accumulates 4x faster, so
@@ -194,6 +208,9 @@ struct task_account {
   u64 debt;
   u64 last_stop_ns;
   u64 slice_ns;   /* slice granted at last insert (for exact runtime) */
+  u64 start_ns;   /* on-CPU start timestamp, set in running() */
+  u64 cpu_budget; /* undecayed on-CPU credit (CPU-bound detector) */
+  u64 last_decay_ns; /* wall time of the last budget decay */
 };
 
 struct {
@@ -349,10 +366,18 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags)
      * behind a hog — N1 measured a tight 21.1ms delay cluster and
      * cyclictest (pool depth < 2 on both sides, no overcharge) stayed
      * at 55us.  One hash write per wakeup is the price of correct
-     * EEVDF accounting. */
+     * EEVDF accounting.
+     *
+     * CPU-bound tasks additionally get their slice capped (after their
+     * on-CPU budget trips CPUBOUND_BUDGET_NS), bounding the wait a hog
+     * can impose when the kick's preemption is delayed. */
     fst = account_of(tid);
-    if (fst)
+    if (fst) {
+      if (fst->cpu_budget > CPUBOUND_BUDGET_NS &&
+          slice > SLICE_CAP_CPU_BOUND)
+        slice = SLICE_CAP_CPU_BOUND;
       fst->slice_ns = slice;
+    }
     /* EEVDF-style wakeup preemption.  The lag threshold is deliberately
      * tiny: a task whose vruntime is more than ~100us behind really slept
      * (network I/O wait), and running it promptly after its wakeup keeps
@@ -534,13 +559,28 @@ void BPF_STRUCT_OPS(db_sched_dispatch, s32 cpu, struct task_struct *prev)
  * ----------------------------------------------------------------------- */
 void BPF_STRUCT_OPS(db_sched_running, struct task_struct *p)
 {
+  struct task_account *st;
+
   if (time_before(vtime_now, p->scx.dsq_vtime))
     vtime_now = p->scx.dsq_vtime;
+
+  /* Timestamp the on-CPU period so stopping() charges the runtime the task
+   * ACTUALLY consumed.  granted - p->scx.slice is wrong when the task was
+   * kicked off the CPU: kick_one_cpu() zeroes the victim's scx.slice, so a
+   * hog preempted after 1.6ms of a 20ms grant was charged the full 20ms,
+   * inflating its vtime (and vtime_now, which running() tracks as a max)
+   * until the MAX_LAG clamp collapsed the pool's vtime spread and ordering
+   * degraded (N1 v6.3 residual tail).  The account entry exists by now:
+   * every path that inserts a task (fast or gated) creates it first. */
+  st = bpf_map_lookup_elem(&task_account_map, &p->pid);
+  if (st)
+    st->start_ns = scx_bpf_now();
 }
 
 void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable)
 {
   u32 tid = p->pid;
+  u64 now = scx_bpf_now();
   u8 *gate;
   s32 tier;
   u32 weight;
@@ -551,19 +591,37 @@ void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable)
 
   gate = bpf_map_lookup_elem(&sem_any, &tid);
   if (!gate) {
-    /* Fast path: charge the runtime granted at ENQUEUE time (recorded in
-     * task_account_map), not a fast_slice() recomputed from the pool
-     * depth now — the pool may have drained while the task ran, and the
-     * difference (up to 15ms per wakeup) was charged to the task's
-     * vtime, pushing it ahead of vtime_now, killing its wakeup kick
-     * and its front-of-pool position (N1: 21ms delay clusters).
-     * Keep dsq_vtime current at normal weight so a later transition
-     * into the semantic pool starts from a sane vruntime.  No account
-     * (task raced with disable/reuse): leave vtime untouched — the
-     * MAX_LAG clamp bounds any drift. */
+    /* Fast path: charge the runtime the task actually consumed — the
+     * running() -> stopping() wall interval when the account has it,
+     * granted-slice-minus-remaining as the fallback.  Both replace a
+     * fast_slice() recomputed from the pool depth at stop time, which
+     * overcharged sleepers (N1 v6.2: 21ms delay clusters); the interval
+     * form additionally survives kick_one_cpu() zeroing p->scx.slice,
+     * which made granted-minus-remaining charge a preempted hog its
+     * FULL grant (N1 v6.3 residual tail: inflated vtime collapsed the
+     * pool's vtime spread via the MAX_LAG clamp).  No account (task
+     * raced with disable/reuse): leave vtime untouched — the clamp
+     * bounds any drift. */
     struct task_account *fst = bpf_map_lookup_elem(&task_account_map, &tid);
-    if (fst && fst->slice_ns >= p->scx.slice)
+
+    if (fst && fst->start_ns && now > fst->start_ns) {
+      u64 rt = now - fst->start_ns;
+
+      p->scx.dsq_vtime += rt;
+      /* CPU-bound detector: token bucket.  On-CPU time accrues, wall time
+       * between stops decays, so the budget tracks net CPU usage over the
+       * recent past: a hog's budget grows without bound, an interactive
+       * sleeper's stays near zero.  When it exceeds CPUBOUND_BUDGET_NS,
+       * the next enqueue caps the task's slice at 2.5ms. */
+      if (fst->last_decay_ns && now > fst->last_decay_ns) {
+        u64 gap = now - fst->last_decay_ns;
+        fst->cpu_budget = fst->cpu_budget > gap ? fst->cpu_budget - gap : 0;
+      }
+      fst->cpu_budget += rt;
+      fst->last_decay_ns = now;
+    } else if (fst && fst->slice_ns >= p->scx.slice) {
       p->scx.dsq_vtime += fst->slice_ns - p->scx.slice;
+    }
     return;
   }
 
@@ -571,8 +629,11 @@ void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable)
   weight = (tier == TIER_BG) ? BG_WEIGHT : NORMAL_WEIGHT;
   st = account_of(tid);
 
-  /* Exact runtime from the slice granted at insert time. */
-  if (st && st->slice_ns >= p->scx.slice)
+  /* Exact runtime from the on-CPU interval (kick-immune), falling back to
+   * the granted slice minus what is left of it. */
+  if (st && st->start_ns && now > st->start_ns)
+    runtime = now - st->start_ns;
+  else if (st && st->slice_ns >= p->scx.slice)
     runtime = st->slice_ns - p->scx.slice;
   else if (p->scx.slice <= SCX_SLICE_DFL)
     runtime = SCX_SLICE_DFL - p->scx.slice;
@@ -584,8 +645,7 @@ void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable)
   vip = bpf_map_lookup_elem(&commit_vip, &tid);
   he = bpf_map_lookup_elem(&lock_holder, &tid);
   if ((vip && *vip) ||
-      (he && he->count > 0 &&
-       scx_bpf_now() - he->ts_ns <= HOLDER_TTL_NS)) {
+      (he && he->count > 0 && now - he->ts_ns <= HOLDER_TTL_NS)) {
     if (st) {
       st->borrowed += runtime;
       if (st->borrowed >= B_MAX)
@@ -594,7 +654,7 @@ void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable)
   } else if (st) {
     /* Window closed (lock released / commit done): settle the account. */
     close_borrow_window(st);
-    st->last_stop_ns = scx_bpf_now();
+    st->last_stop_ns = now;
   }
 }
 
