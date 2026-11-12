@@ -294,7 +294,11 @@ NET_RX softirq 批处理下被延迟/合并。
 stopper 风暴且被饿到 280ms 丢事件，perf sched 只能佐证。诊断数据已留存
 本地 `results/c5-20261111/n1/C5-v6.3-diag/`。
 
-### 5.9 v6.4 验证（2026-11-12）：N1 判据达成
+### 5.9 v6.4 验证（2026-11-12）：N1 判据达成 —— ⚠️ 本节结论已作废，见 §5.10
+
+> **作废声明（2026-11-12 晚）**：本节所有 "C5 v6.4" 数据是在 **sched_ext 未加载**
+> 的情况下测得的（loader 加载失败被脚本静默吞掉，C5 实为 v6.4 mysqld + 纯 CFS）。
+> N1 "1.7×"、TPC-C "+1.3%"、rw256 "-5.8%" 均不成立。详见 §5.10。
 
 详细数据：`../aliyun/mysql-sched-bench/results/c5-20261112/summary.md`。
 v6.4 = `c2b654038`（running() 记 on-CPU 时间戳、stopping() 按真实区间记账
@@ -317,3 +321,48 @@ log writer 批大小分布、ctx-switch/cache 对比）。
 **下一步**：① rw256 剩余差距 bpftrace 归因；② N1 复测一轮确认稳定性；
 ③ N2（latch 大范围持有）、N3（连接风暴）推进；④ 可考虑把
 WAKE_PREEMPT_LAG_NS / fast_slice 阈值作为 rw256 调优变量。
+
+### 5.10 两次测量事故 + v6.4 真实重测（2026-11-12 晚，c5n2 campaign）
+
+详细数据：`../aliyun/mysql-sched-bench/results/c5n2-20261112/summary.md`。
+
+**事故 1：v6.4 loader 从未成功加载。** c2b654038 在 `db_sched_running()`
+把 `&p->pid`（trusted 内核对象内部指针）直接作为 `task_account_map` 的
+key，7.0.0-38.38 verifier 拒绝（-EACCES，"may write into memory pointed
+by R2 type=trusted_ptr_"）。测试脚本只打印不检查 sched_ext 状态 →
+**§5.9 全部 v6.4 数据实为纯 CFS**。修复 a7fa62de7（栈局部 key）；
+三个 run_c5*.sh 加 enabled 硬断言；坑已记 ENVIRONMENT.md §9。
+判定证据链：昨天 v6.3 会话日志 loader "enabled"，今晨 v6.4 起全部
+"disabled"；修复后实测 enabled。
+
+**事故 2：run_c5.sh 漏配 `--innodb-redo-log-capacity`。** 历史所有 rw
+测量被 100MB 默认 redo 限流：V97 t64+ 卡在 7.5-7.7k 假平台（以为 CPU
+饱和），4G redo 下真实基线 **11k+ tps**（t16: 3.9k→6.8k）。此前"低并发
+parity""-5.8% 收窄"等结论全部是限流假象。今日统一 4G 重测。
+
+**真实结果（v6.4 修复后，redo 4G，history list 清零）**：
+
+| 基准 | 结果 |
+|---|---|
+| rw8-2048 扫描 | **全线 -7%~-26%**：t8/16/32 -7~-8%，t64 -16%，t128-2048 -20~-26%；顺序对换验证偏差仅 ~1pp |
+| N2 混合负载 | **判据失败**：C5 mixed p99 47.47ms vs V97 16.12ms（3 倍劣化）；BG BENCHMARK 反多拿 ~2.3 核（323 vs 176 完成数）；前台吞吐保持率 58% vs 80% |
+| N1 噪声韧性 | **判据失败**：p99 持平（0.26/0.26，50k 档 0.53 略优），但 **noise@50k max 117.17ms vs V97 2.72ms（43 倍）**，比 v6.3 的 42ms 还差 3 倍——cap"修复"从未真实运行过，实测反而恶化 |
+
+**结论：性能持平目标远未达成，N1/N2 韧性判据双双失败。**
+干净负载代价 ~-20%（t64+），混合负载前台 p99 劣化 3 倍——后者比前者
+更致命：CFS 的交互性启发式天然优待频繁休眠的事务线程（V97 下 8 个
+CPU hogs 只抢到 2.9 核），而 v6.4 公平排队把份额让给了 CPU-bound BG
+（5.2 核），叠加每核 -26% 的调度开销。
+
+**下一步（优先级排序）**：
+1. bpftrace 归因干净负载 -20%：首要嫌疑 **CPU-bound slice cap 2.5ms**
+   （饱和负载下全线程被强制 2.5ms 轮转，切换暴涨——N1 max 117ms 恶化
+   与 rw -20% 疑似同源），其次 gated 全局 DSQ 锁 + kick IPI。对照实验：
+   cap 放宽到 CFS 量级重测 rw256 与 N1 noise@50k。
+2. N2 方向性重设计：语义层需要"短事务优先"的倾斜（频繁休眠/commit
+   边界的任务获得 lag 补偿），而不是对 CPU-bound BG 的纯公平——
+   这正是 EEVDF 的 eligibility 思想未落地之处。CFS 靠交互性启发式
+   天然做到了（V97 下 hogs 只抢到 2.9 核）。
+3. v6.3 的 41.6ms 尾部根因（wakeup 等满 slice）在 v6.4 下未消除
+   （117ms），区间记账未达设计意图，需重新审视 running/stopping
+   记账路径是否真的生效（bpftrace 验证 task_account_map 写入率）。
