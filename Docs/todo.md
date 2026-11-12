@@ -366,3 +366,51 @@ CPU hogs 只抢到 2.9 核），而 v6.4 公平排队把份额让给了 CPU-boun
 3. v6.3 的 41.6ms 尾部根因（wakeup 等满 slice）在 v6.4 下未消除
    （117ms），区间记账未达设计意图，需重新审视 running/stopping
    记账路径是否真的生效（bpftrace 验证 task_account_map 写入率）。
+
+## 7. v7 重设计与 v7-rc1 首轮实测（2026-11-12，设计见 Docs/sched-v7-redesign.md）
+
+上午完成 v6.4 归因（E1-E4+C5n，`results/c5n2-20261112/summary.md` §1-5），
+随后重写调度器并完成首轮验证。节点数据均 loader-enabled 断言 + redo 4G。
+
+### 已完成（commit 链）
+
+- `dcfefe2e1` 文档：v7 重设计（初版归因，后被 R0 修正）
+- `2ff5dc80a` **v7-rc1 (R0) 实现**：单一 per-CPU vtime 路径，语义 gate 只
+  计数不生效，无 kick；loader 开关（--r1-kick/--wake-gran-us/--kick-budget/
+  --hog-slice-us）+ 聚合计数器（--stats）
+- `3cde7bd33` **修复死代码 bug**：cpu_budget decay 误含自身运行时间，
+  自 v6.4 起 hog cap 从未生效（E1 结论作废）；修复后 N1@10k p99
+  11.24→3.02ms，rw 代价 ~0-3%
+
+### 最终归因（rw t256，V97=11320 早晨 / 10871 同时段）
+
+| 层 | tps | 代价 |
+|---|---|---|
+| mysqld 埋点（C5n） | 10995 | -2.9% |
+| scx 最小 EEVDF 无 kick（R0 修复后） | 10291 | -6.4%（vs C5n）/-5.3%（vs V97 同时段） |
+| 预算 kick 1ms/2048 | 10025 | 再 -3.0% |
+| 100µs kick（v6.4/E4） | 9158 | **kick 合计 -11pp，主犯** |
+| v6.4 语义机制 | 8848 | 再 -3.4% |
+
+### 负向矩阵现状（R0+cap修复）
+
+- base 档与 V97 完全对等（max 0.5-0.6ms）
+- N1 noise@10k：p99 3.02（V97 0.26，仍差 12×），max 23.6（V97 6.31）
+- N1 noise@50k：**仍 FATAL**——仅 slice cap 不够，需 kick（rw 代价
+  -3%~-9%）或 R2+ 语义机制，v7 开放项
+- N2（R0+capfix）：mixed 6127 tps/p99 59.99/BG 330 vs V97 9109/16.12/176
+  （BG 又拿 1.9×份额）；R1 kick（1ms/2048）仅边际改善（6514/56.84/295）
+  ——1ms 粒度滤掉了 FG 的短睡眠（0.2~1ms）周期，kick 不触发
+
+### 下一步（交接）
+
+1. R0 剩余 -5% 底座：select_cpu 补 wake-affine（唤醒者同核）、
+   base slice 缩短试验、dispatch 减负；过了 -2% 再谈语义
+2. N1@50k/N2 兜底：**gran=100µs + budget=2048 组合首试**（粒度放宽、
+   预算收紧、先到先得）——今日发现粒度倒置：1ms 粒度滤掉短睡眠场景
+   的 kick，100µs 无预算则 rw -9.3%；更长期是 R2 语义 kick（仅池首
+   任务被 hog/BG 阻挡时才花 IPI），或条件式 attach/detach（§7.6）
+3. R2（commit tilt）在 R0 门过后的按门重审；埋点成本消融（§8.3）
+4. 测试协议不变：c5n2 脚本 + R0_ARGS/R1_ARGS env 覆盖 +
+   enabled 硬断言；IP 漂移会导致脚本尾部断掉并遗留 hogs——测试前
+   `ps | grep stress` 检查残留（本日事故 6.5 节）

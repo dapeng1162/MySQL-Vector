@@ -36,47 +36,61 @@ E2（kick 阈值 100µs→3ms + 删 commit/urgent 无条件 kick）：rw256 8601
 （无改善），N1@50k max 117→93ms（有改善但仍 34× V97）。kick 率过高
 是尾部问题的一部分，但不是 rw -20% 的主因。
 
-### 根因 C（原"CPU-bound cap 引发切换风暴"）：已被 E1 证伪
+### 根因 E（v7-rc1 当日发现）：CPU-bound 检测器从 v6.4 起就是死代码
 
-E1（cap 禁用）：rw256 8506（无改善），N1@10k max 反而 34.5→108ms。
-**cap 在兜底尾部**（界定 hog 的最大加塞等待），删掉更糟。v7 保留。
+v6.4 与 v7-rc1 首版的 cpu_budget 记账：stop 时先按 `now -
+last_decay_ns`（**含自身运行时间**）decay、再加本段 rt。由于 rt ≤
+gap 恒成立，budget 永不增长——hog cap 从未真正生效（v7-rc1 冒烟
+测试中 84 次触发只是首跑 20ms grant 加计时抖动的边缘命中）。证据链：
+N1 noise@10k 无 kick 时 avg **5.2ms** ≈ 10ms grant（fast_slice 深度
+2-3 档）的一半——每次唤醒平均等半个 hog grant；p99 11.45 ≈ 一个
+grant；cap 2.5ms→1ms 的 knob 实验**完全无效**（p99 11.24→11.45）
+因为 cap 从未生效。**E1 的"cap 禁用无变化"也因此需要重新解读**：
+它禁用的是死代码，其 N1 恶化（34.5→108ms）另有来源（可能是实验
+补丁的副作用）。修复：decay 移到 running()，按纯离核间隙
+（last_stop→本次 start）衰减，累积留在 stopping()。
 
-### 根因 D（真正的主体）：公共底座成本 —— E4 + C5n 的关键发现
+修复后实测（3cde7bd33，默认 2.5ms cap）：**rw t256 10291（vs 修复前
+10334，-0.4%，漂移噪声内）、t64 10078（-2.8%）**——cap 在 rw 上
+几乎免费；**N1 noise@10k avg 5.20→1.43ms、p99 11.45→3.02ms**
+（V97 0.26）。noise@50k 仍 FATAL：点查 3-4 个 sleep/wake 周期 ×
+每周期 cap 等待（~2.5ms/2）在 50k/s 下需 70+ in-flight > 64 线程；
+CFS 靠原地唤醒抢占实现亚毫秒 per-cycle 等待，slice cap 摊不平这个
+差距——50k 档需要 kick 兜底（-3%~-9% rw 代价）或 R2+ 语义机制，
+列为 v7 开放项（§7.7）。
 
-E4（sem gate 永不命中，语义机制全部惰性化，一切走 fast path；
-mysqld 侧发布不动）：rw256 **9158**（仅 +3.5% vs 原版，仍 **-19.0%**
-vs V97）。N1 noise@50k p99 0.50ms（甚至略优于原版 0.53）。
+### 根因 D（E4 的修正版）：fast-path kick 才是 rw 杀手，scx 底座本身 ≈ -6%
 
-C5n（同一 mysqld 二进制、one-thread-per-connection、不挂 loader =
-CFS + 埋点）：rw256 **10995**（仅 -2.9% vs V97）。
+E4 曾把 -16.7% 记在"scx 基础路径"上。v7-rc1（R0：单一 per-CPU vtime 路径，
+语义 gate 只计数、完全无 kick）的实测推翻了这个归因：
 
-**rw256 三方分解**（redo 4G，V97=11320）：
+**rw256 修正后的分解**（redo 4G，V97=11320）：
 
-| 层 | tps | 该层代价 |
+| 层 | tps | 相对上一层 |
 |---|---|---|
 | V97（上游 9.7，CFS） | 11320 | — |
-| + mysqld 埋点（C5n，CFS） | 10995 | **-2.9%** |
-| + scx 基础路径（E4，语义惰性化） | 9158 | **-16.7%**（vs C5n） |
-| + 语义机制全开（v6.4 原版） | 8848 | **-3.4%**（vs E4） |
+| + mysqld 埋点（C5n，CFS） | 10995 | -2.9% |
+| + scx 最小 EEVDF、无 kick（**R0**） | **10334** | **-6.0%**（-8.7% vs V97） |
+| + 预算制唤醒 kick 1ms/2048每CPU秒（R1） | 10025 | -3.0% |
+| v6.4 fast path（含 100µs kick，语义惰性，= E4） | 9158 | **-11.4% vs R0** |
+| + 语义机制全开（v6.4 原版） | 8848 | -3.4% |
 
-三大嫌疑机制（全局 DSQ + kick 族 + tilt + cap）合计只贡献 ~3%；
-mysqld 埋点 ~3%；**scx 基础路径一项占 -16.7%，是绝对主体**。注意
-E4 的 fast path 仍是 v6.4 的 fast path（含 100µs kick 阈值与
-select_cpu_dfl），所以这 -16.7% = scx 平台开销 + v6.4 fast path
-策略与 CFS 的差距，两者的切分留给 R0：
+R0 与 E4 的机制几乎相同，唯一实质差异是去掉了 100µs 阈值的 fast-path
+kick——差值 +12.9%。**v6.4 注释中"几乎每次唤醒都抢占才是缓存高效"
+（去抢占 -8.5%）的结论在当前配置下不成立**：当自适应 slice 与区间记账
+正确工作后，队列深度本身就提供了及时的调度点，kick 的 IPI + slice
+清零 + 强制 dispatch 成为纯开销。E2（3ms 阈值）没测出这点，因为 rw
+的 IO 等待都在 ms 级、lag 照样超过 3ms，kick 率几乎没降。
 
-1. **scx 平台固定开销**：BPF 调度器每次 enqueue/dispatch 的固定成本、
-   verifier 约束下的直通性损失。
-2. **策略差距**：`scx_bpf_dsq_insert_vtime` 的 vtime 池是 CFS per-CPU
-   rbtree + wake_affine 的近似——CFS 的 wake_affine/wake_wide 会把
-   唤醒者与被唤醒者放同核利用缓存，v6.4 的 select_cpu_dfl 没有；
-   100µs kick 阈值远低于 CFS 的 granularity（~1-3ms），制造了 CFS
-   不会有的 IPI 与 slice 清零。
+连"预算制 kick"（R1，CFS 量级粒度 + 2048 IPI/s/CPU 上限）也要价
+-3.0%——SCX_KICK_PREEMPT 的代价比 CFS 原地唤醒抢占检查（无 IPI、
+不强制 dispatch）高得多。kick 从"默认机制"降级为"尾部兜底"，
+只在无 kick 的尾部实测不合格时按预算启用。
 
-**诚实的结论**：至 E4 为止，没有任何一个场景显示语义机制有实测正收益
-（当真正运行时）。v7 的第一优先级是修平根因 D 的底座差距，语义机制
-在 R2/R3 按验收门逐一重审，不过门即删。若 R0 的干净 EEVDF 仍无法
-把 scx 基础路径压到 -5% 以内，则启动条件式调度备选（§7.6）。
+剩余的 -6.0%（R0 vs C5n）是真正的 scx 平台差距，候选：BPF
+enqueue/dispatch 每次切换的固定开销、select_cpu_dfl 对 CFS
+wake_affine/wake_wide 的缺失（唤醒者与被唤醒者不同核、缓存冷）、
+vtime 池对 CFS rbtree 的近似。这 -6% 是 R0 后续优化的对象。
 
 ### N2 的教训：CFS 的"交互性优待"就是通用短事务倾斜
 
@@ -85,7 +99,12 @@ V97 下 8 个 hogs 只拿到 2.9 核（低于公平份额），频繁休眠的�
 EEVDF 的 lag/eligibility 原生提供同样的性质（睡得久的任务 lag 为负、
 更早 eligible）。v6.4 的问题是 gated 任务绕过了 per-CPU vtime 池的这
 个性质（进了全局 DSQ，且被 kick/debt 机制干扰）。
-**结论：N2 要的不是新机制，是正确的 EEVDF。**
+**v7-rc1 实测补充了下半句：池首位置（lag 排序）本身不够——FG 任务
+醒来后在池首等 running 任务让出 CPU，无 kick 时这个等待是（半）个
+slice；CFS 的原地唤醒抢占把这步压到亚毫秒。** N2 实测（R0+capfix）：
+mixed p99 59.99ms vs V97 16.12ms、BG 完成数 330 vs 176——公平
+EEVDF 把份额给了 BG，交互倾斜必须靠唤醒抢占或 R2/R3 语义倾斜
+补齐（§7.7）。
 
 ## 3. v7 设计原则
 
@@ -186,7 +205,7 @@ preempt := (enq & SCX_ENQ_WAKEUP)
 | 保留 | 理由 |
 |---|---|
 | per-CPU vtime DSQ + lag clamp | EEVDF 核心；N2 教训：这就是通用短事务倾斜 |
-| fast_slice 队列深度自适应 + CPU-bound cap | E1 证实 cap 在兜底尾部（N1@10k 34.5→108ms 当禁用）；饱和粒度收敛与 hog 加塞界定的双重机制 |
+| fast_slice 队列深度自适应 + CPU-bound cap | 自适应 slice 是饱和粒度收敛；cap 的 E1 "无害/兜底"结论作废（当时是死代码，见根因 E），修复后的真实代价待 v7-rc1 复测 |
 | 唤醒 preempt kick（语义+fast 共用） | E1 前后 N1 p99 均 0.26-0.28ms（与 V97 持平），kick 机制本身有效；需粒度过滤+预算化（E2 验证形态） |
 | commit tilt（vd -= B_COMMIT，有界） | 设计目标 1：commit 优先，但不再 per-event kick |
 | latch holder tilt + PI floor | 设计目标 2：临界区优先离场；depth 3 封顶 |
@@ -217,17 +236,30 @@ preempt := (enq & SCX_ENQ_WAKEUP)
 
 | 实验 | 变量 | 假设 | 结果 |
 |---|---|---|---|
-| E1 | SLICE_CAP 禁用（其余不变） | cap 贡献 rw -20% 的大部分与 N1 尾部 | **证伪**：rw256 8506（带 cap 8848，V97 11320）无改善；N1@10k max 反而 34.5→108ms。cap 在兜底尾部，rw 损失另有主因 |
+| E1 | SLICE_CAP 禁用（其余不变） | cap 贡献 rw -20% 的大部分与 N1 尾部 | **结果无效**：cap 当时是死代码（根因 E），禁用死代码当然无变化；其 N1 恶化（34.5→108ms）来源存疑，很可能是实验补丁副作用 |
 | E2 | WAKE_PREEMPT 100µs→3ms + commit/urgent kick 删除 | kick 风暴贡献 rw 损失的大部 | **部分证伪**：rw256 8601 无改善；N1@50k max 117→93ms 有改善但仍 34× V97。kick 只解释尾部的一小部分 |
 | E3 | gated 任务改插 per-CPU 池 + 去全局 DSQ 消费（= v7 核心原型） | 全局 DSQ 锁竞争是 rw -20% 主因 | **大部分证伪**：rw256 9128（+3.2% vs 原版，仍 -19.3% vs V97），p95 反而恶化（66.8→112.7ms）；N1 全面恶化（noise@50k p99 1.06ms、max 142ms）——语义任务失去全局池+kick 的尾部保护 |
-| E4 | sem gate 永不命中：一切走 fast path（语义机制全部惰性化，mysqld 侧发布不动） | -20% 的主体在 scx 基础路径（fast path 本身 + mysqld 埋点），不在语义机制 | **证实**：rw256 9158（+3.5% vs 原版，仍 -19.0% vs V97）；N1@50k p99 0.50ms 略优于原版——语义机制无实测正收益 |
-| C5n | 同 mysqld 二进制、one-thread-per-connection、不挂 loader（= CFS + 埋点） | 切分 mysqld 埋点与 scx 平台各自的占比 | **10995（-2.9% vs V97）**：埋点 ~3%，scx 基础路径 -16.7% 为绝对主体（见 §2 根因 D 分解表） |
+| E4 | sem gate 永不命中：一切走 fast path（语义机制全部惰性化，mysqld 侧发布不动） | -20% 的主体在 scx 基础路径（fast path 本身 + mysqld 埋点），不在语义机制 | 部分证实但归因有误：rw256 9158 中约 11pp 实为 100µs kick 的代价（见 R0 行），语义机制本身 ~3.4% |
+| C5n | 同 mysqld 二进制、one-thread-per-connection、不挂 loader（= CFS + 埋点） | 切分 mysqld 埋点与 scx 平台各自的占比 | **10995（-2.9% vs V97）**：埋点 ~3% |
+| R0 | v7-rc1：单一 per-CPU vtime 路径 + 语义 gate 只计数 + **完全无 kick** | 最小 EEVDF 的真实底座代价；顺带检验 E4 归因 | **t256 10334（-8.7% vs V97，-6.0% vs C5n）、t64 10365（-5.0%）**——比 E4 高 12.9%，kick 才是 rw 主体 |
+| R1 | R0 + 预算制唤醒 kick（1ms 粒度 + 2048 IPI/s/CPU） | CFS 形态的 kick 是否免费 | **t256 10025、t64 10038（-3.0% vs R0）**——预算制 kick 仍有 3% 代价 |
+| V97 重测 | 同日 10:22 漂移对照 | 日内顺序对比的漂移幅度 | **t256 10871（早晨 11320，-4.0%）**——同日对比有 ±4% 漂移，R0 按同时段算 -4.9% |
+| R1 激进 | gran=100µs + budget=8192 | 激进 kick 在干净记账下是否仍然昂贵 | **t256 9372（-9.3% vs R0）**——kick 代价随剂量线性，记账干净也救不了；kick 单次成本远高于 CFS 原地抢占 |
+| R0 cap1ms | hog cap 2.5ms→1ms（无 kick） | 无 IPI 路线：收紧 cap 缩短每周期等待 | t256 9925（-4.0% vs R0，死 cap 期测得）；修复后 1ms cap：noise@10k avg 1.05 但 p99 反升至 6.55（方差/切换扰动），50k 仍 FATAL |
+| R0fix | cpu_budget 死代码修复（3cde7bd33）后默认 2.5ms cap | 修复后 cap 的 rw 代价 + N1 收益 | **rw t256 10291（-0.4% vs 修复前，漂移噪声内）、t64 10078（-2.8%）；N1 noise@10k avg 5.20→1.43、p99 11.45→3.02、V97 为 0.26；noise@50k 仍 FATAL** |
 
-**E1-E4 + C5n 小结**：v6.4 的三大嫌疑机制（cap、kick、全局 DSQ）合计
-只解释约 3% 的 rw 差距，且各自有反向作用（cap 兜底尾部、kick+全局池
-保护语义任务延迟）；mysqld 埋点 ~3%；**scx 基础路径（平台开销 +
-fast path 策略差距）以 -16.7% 占绝对主体**。v7 的战场在底座，不在
-语义机制。
+**E1-E4 + C5n + R0/R1 小结**：v6.4 的 rw -21.8% 最终分解为——100µs
+fast-path kick 约 **11pp**（E4 vs R0），mysqld 埋点 ~3pp，语义机制
+~3pp，scx 平台真实底座 **~6pp**。kick 从根因 B 的"部分证伪"升级为
+**确认主犯**；语义机制维持"无实测正收益"结论。
+
+**kick 剂量-代价曲线**（rw t256，R0=10334 基线）：无 kick 10334 →
+gran=1ms/2048 每 CPU 秒 10025（-3.0%）→ gran=100µs/8192 9372
+（-9.3%）。SCX_KICK_PREEMPT（IPI + slice 清零 + forced dispatch）
+的单次成本远高于 CFS 原地唤醒抢占（need_resched），记账修复与预算
+上限都改变不了这一点。**v7 的 kick 定位从"R1 默认机制"降级为
+"N1 尾部不合格时的兜底开关"**；无 kick 路线下的替代是收紧 hog
+cap（2.5ms→1ms 代价 -4.0%，效果待 N1 验证）。
 
 ## 7. 风险与开放问题
 
@@ -242,17 +274,24 @@ fast path 策略差距）以 -16.7% 占绝对主体**。v7 的战场在底座，
    需要同步改 mysqld 侧发布代码，注意与 v6.4 ABI 的兼容期。
 5. 调度器外的问题不许用调度器修：本 campaign 已确认 redo 容量、
     max_connections 等配置会制造假的"调度器回归"（§5.10 事故 2）。
-6. **战略备选：条件式调度（conditional scheduling）**。C5n 分解显示
-   scx 基础路径在干净饱和负载下代价 -16.7%。若 R0 的最小 EEVDF
-   （修掉 100µs kick、补 wake-affine、最简 dispatch）经过逐项优化
-   仍无法把该代价压到 -5% 以内，则 v7 转向条件式形态：平时 CFS
-   （零代价），由 loader 通过信号/计数器监测威胁指标（运行队列
-   深度、唤醒延迟、noise 检测），仅在负向场景 attach scx 调度器，
-   威胁解除后 detach。sched_ext 支持运行时 attach/detach，切换
-   代价为一次全队列迁移（毫秒级），对 N1/N2 类瞬态场景可接受；
-   对持续性混合负载（N2 常驻 BG）则需滞回窗口避免抖动。R0 是
-   这个决策的实验门：**先测最小 EEVDF 的底座代价，再决定 v7 是
-   常驻 scx 还是条件式 scx**。
+6. **战略备选：条件式调度（conditional scheduling）**。R0 实测后此
+   备选的必要性大幅下降：scx 真实底座代价 ≈ -6%（vs C5n），而非 E4
+   误估的 -16.7%。优先尝试的底座优化（按序）：select_cpu 补
+   wake-affine（唤醒者同核放置）、base slice 缩到 CFS 量级（20ms→
+   6-10ms）、dispatch 路径减负。若这些逐项尝试后仍无法压进 -3%，
+   再考虑条件式形态：平时 CFS（零代价），由 loader 监测威胁指标
+   （队列深度、唤醒延迟），仅在负向场景 attach scx，解除后 detach。
+   sched_ext 支持运行时 attach/detach，切换代价为毫秒级全队列迁移。
+7. **N1@50k 与 N2 的残余差距，粒度倒置问题**：R1 kick 的 1ms 粒度
+   过滤在短睡眠高吞吐场景（N2 mixed、N1@50k）挡掉了本该发生的 kick
+   （查询周期睡眠 0.2~1ms < 粒度），而降到 100µs 则 rw -9.3%。
+   CFS 无此矛盾（原地抢占每事件近零成本）。scx 侧候选：
+   （a）gran=100µs + budget=2048 组合（粒度放宽、预算收紧、先到先得）
+   ——明日首试；（b）R2 语义 kick：仅在池首任务被 hog/BG 阻挡时才
+   花这个 IPI（语义知识买回预算效率）；（c）接受为 rc1 已知边界。
+   N2 实测（R0+capfix）：mixed 6127/p99 59.99/BG 330 vs V97
+   9109/16.12/176——BG 拿了 1.9× V97 份额，纯公平 EEVDF 无交互
+   倾斜；R1 kick 仅边际改善（6514/56.84/295）。
 
 ## 8. 实施计划
 
