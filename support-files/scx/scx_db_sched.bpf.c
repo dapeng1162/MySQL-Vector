@@ -560,6 +560,7 @@ void BPF_STRUCT_OPS(db_sched_dispatch, s32 cpu, struct task_struct *prev)
 void BPF_STRUCT_OPS(db_sched_running, struct task_struct *p)
 {
   struct task_account *st;
+  u32 pid = p->pid;
 
   if (time_before(vtime_now, p->scx.dsq_vtime))
     vtime_now = p->scx.dsq_vtime;
@@ -572,7 +573,7 @@ void BPF_STRUCT_OPS(db_sched_running, struct task_struct *p)
    * until the MAX_LAG clamp collapsed the pool's vtime spread and ordering
    * degraded (N1 v6.3 residual tail).  The account entry exists by now:
    * every path that inserts a task (fast or gated) creates it first. */
-  st = bpf_map_lookup_elem(&task_account_map, &p->pid);
+  st = bpf_map_lookup_elem(&task_account_map, &pid);
   if (st)
     st->start_ns = scx_bpf_now();
 }
