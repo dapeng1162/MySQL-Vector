@@ -293,3 +293,27 @@ NET_RX softirq 批处理下被延迟/合并。
 **方法论沉淀**：测调度必须用 bpftrace——perf record 每 ~4s 自身产生全 CPU
 stopper 风暴且被饿到 280ms 丢事件，perf sched 只能佐证。诊断数据已留存
 本地 `results/c5-20261111/n1/C5-v6.3-diag/`。
+
+### 5.9 v6.4 验证（2026-11-12）：N1 判据达成
+
+详细数据：`../aliyun/mysql-sched-bench/results/c5-20261112/summary.md`。
+v6.4 = `c2b654038`（running() 记 on-CPU 时间戳、stopping() 按真实区间记账
+——消除 kick_one_cpu 清零 slice 导致的 vtime 腐蚀；CPU-bound 任务
+token-bucket 检测 + slice cap 2.5ms 兜底）。
+
+| 基准 | 结果 |
+|---|---|
+| **N1（16 hogs + 点查）** | **判据达成**：C5 noise p99@10k 0.22ms（劣化 1.7×）vs V97 0.22ms（1.6×）；max 41.6→2.84ms（cap 生效直接证据）；50k 档 0.54ms 优于 V97 0.73ms |
+| ratescan 点查 | 25k–150k 全档 parity（±0.05%，p95 0.10–0.13ms） |
+| TPC-C（BenchBase，32w） | **C5 2222.8 vs V97 2194.7 txn/s（+1.3%）**，中位 5.94 vs 6.20ms，p99 481 vs 613ms（-21%） |
+| rw256 | **-13.9% → -5.8%**（两轮一致），第三轮 -5.0% |
+
+**TIER_BG log writer 实验证伪**：增量构建 + 两轮复测（-5.0% vs -5.8%，
+噪声级），§5.7 的"log writer 唤醒节奏破坏批处理"假设不成立，改动已回退
+未提交。剩余 -5% 的归因是下一步课题：perf stat 快测因自身扰动不可用
+（两配置 TPS 双掉至 6100-6400），必须用 bpftrace 计数法（唤醒路径计数、
+log writer 批大小分布、ctx-switch/cache 对比）。
+
+**下一步**：① rw256 剩余差距 bpftrace 归因；② N1 复测一轮确认稳定性；
+③ N2（latch 大范围持有）、N3（连接风暴）推进；④ 可考虑把
+WAKE_PREEMPT_LAG_NS / fast_slice 阈值作为 rw256 调优变量。
