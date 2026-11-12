@@ -54,6 +54,9 @@ static const char help_fmt[] =
 "                     (default 1000, CFS order).\n"
 "  --kick-budget=N    Kick IPI budget per target CPU per second when R1 is\n"
 "                     enabled (default 2048).\n"
+"  --hog-slice-us=N   Slice cap in microseconds for detected CPU-bound\n"
+"                     tasks, bounding the head-of-line wait a hog imposes\n"
+"                     on woken tasks (default 2500).\n"
 "  --stats            Periodically print aggregated scheduler counters\n"
 "                     (every 10s) while attached.\n"
 "  --dump             After attaching, dump the current contents of the\n"
@@ -243,6 +246,7 @@ int main(int argc, char **argv) {
   bool opt_r1_kick = false;
   long opt_wake_gran_us = 0;
   long opt_kick_budget = 0;
+  long opt_hog_slice_us = 0;
   static const struct option long_options[] = {
       {"dump", no_argument, NULL, 'd'},
       {"stats", no_argument, NULL, 's'},
@@ -251,6 +255,7 @@ int main(int argc, char **argv) {
       {"r1-kick", no_argument, NULL, 'K'},
       {"wake-gran-us", required_argument, NULL, 'g'},
       {"kick-budget", required_argument, NULL, 'b'},
+      {"hog-slice-us", required_argument, NULL, 'S'},
       {NULL, 0, NULL, 0},
   };
   int opt;
@@ -298,6 +303,13 @@ restart:
           return 1;
         }
         break;
+      case 'S':
+        opt_hog_slice_us = atol(optarg);
+        if (opt_hog_slice_us <= 0) {
+          fprintf(stderr, "--hog-slice-us must be positive\n");
+          return 1;
+        }
+        break;
       default:
         fprintf(stderr, help_fmt, basename(argv[0]));
         return opt != 'h';
@@ -311,12 +323,15 @@ restart:
     skel->rodata->scx_wake_gran_ns = (__u64)opt_wake_gran_us * 1000ULL;
   if (opt_kick_budget > 0)
     skel->rodata->scx_kick_budget_per_sec = (__u32)opt_kick_budget;
+  if (opt_hog_slice_us > 0)
+    skel->rodata->scx_hog_slice_ns = (__u64)opt_hog_slice_us * 1000ULL;
 
   fprintf(stderr,
-          "scx_db_sched v7-rc1 (R0): wake_preempt=%s gran=%lluus budget=%u/s\n",
+          "scx_db_sched v7-rc1 (R0): wake_preempt=%s gran=%lluus budget=%u/s hog_slice=%lluus\n",
           opt_r1_kick ? "on" : "off",
           (unsigned long long)skel->rodata->scx_wake_gran_ns / 1000,
-          skel->rodata->scx_kick_budget_per_sec);
+          skel->rodata->scx_kick_budget_per_sec,
+          (unsigned long long)skel->rodata->scx_hog_slice_ns / 1000);
 
 #ifdef SCX_SKEL_HAS_STRUCT_OPS
   SCX_OPS_LOAD(skel, db_sched_ops, scx_db_sched, uei);

@@ -57,7 +57,6 @@ UEI_DEFINE(uei);
  * impose on woken tasks even when a kick's preemption is delayed.
  * E1 (cap disabled) worsened the N1 noise tail 34.5ms -> 108ms. */
 #define CPUBOUND_BUDGET_NS (20 * 1000 * 1000ULL)
-#define SLICE_CAP_CPU_BOUND (SCX_SLICE_DFL >> 3)
 
 /* -----------------------------------------------------------------------
  * Runtime switches (loader-settable, same binary A/B).
@@ -67,6 +66,7 @@ UEI_DEFINE(uei);
 const volatile bool scx_enable_wake_preempt = false; /* R1 */
 const volatile u64 scx_wake_gran_ns = 1000 * 1000ULL; /* CFS-order granularity */
 const volatile u32 scx_kick_budget_per_sec = 2048;    /* IPI/s per target CPU */
+const volatile u64 scx_hog_slice_ns = 2500 * 1000ULL; /* 2.5ms default */
 
 /* Global minimum-vtime tracker (lag clamp reference). */
 static u64 vtime_now;
@@ -138,7 +138,7 @@ struct task_account {
   u64 slice_ns;      /* slice granted at last insert (fallback charge) */
   u64 start_ns;      /* on-CPU start timestamp, set in running() */
   u64 cpu_budget;    /* undecayed on-CPU credit (CPU-bound detector) */
-  u64 last_decay_ns; /* wall time of the last budget decay */
+  u64 last_stop_ns;  /* wall time of the last stop (decay reference) */
 };
 
 struct {
@@ -278,8 +278,8 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags)
   st = account_of(tid);
   if (st) {
     if (st->cpu_budget > CPUBOUND_BUDGET_NS &&
-        slice > SLICE_CAP_CPU_BOUND) {
-      slice = SLICE_CAP_CPU_BOUND;
+        slice > scx_hog_slice_ns) {
+      slice = scx_hog_slice_ns;
       stat_inc(2);
     }
     st->slice_ns = slice;
@@ -335,14 +335,26 @@ void BPF_STRUCT_OPS(db_sched_dispatch, s32 cpu, struct task_struct *prev)
 void BPF_STRUCT_OPS(db_sched_running, struct task_struct *p)
 {
   u32 pid = p->pid;
+  u64 now = scx_bpf_now();
   struct task_account *st;
 
   if (time_before(vtime_now, p->scx.dsq_vtime))
     vtime_now = p->scx.dsq_vtime;
 
   st = bpf_map_lookup_elem(&task_account_map, &pid);
-  if (st)
-    st->start_ns = scx_bpf_now();
+  if (st) {
+    st->start_ns = now;
+    /* Decay the CPU-bound budget by the task's OFF-CPU gap only (last
+     * stop -> this start).  Decaying at stop time by (now - last stop)
+     * includes the task's own runtime, and since runtime <= that gap
+     * the budget could never grow: the hog detector was dead code from
+     * v6.4 through v7-rc1 (N1: hogs ran full 10-20ms grants and every
+     * wakeup waited half a grant; avg 5.2ms at noise@10k). */
+    if (st->last_stop_ns && now > st->last_stop_ns) {
+      u64 gap = now - st->last_stop_ns;
+      st->cpu_budget = st->cpu_budget > gap ? st->cpu_budget - gap : 0;
+    }
+  }
 }
 
 void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable)
@@ -364,14 +376,11 @@ void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable)
     u64 rt = now - st->start_ns;
 
     p->scx.dsq_vtime += rt;
-    /* CPU-bound detector: on-CPU time accrues, wall time between
-     * stops decays — a hog's budget grows, a sleeper's stays near 0. */
-    if (st->last_decay_ns && now > st->last_decay_ns) {
-      u64 gap = now - st->last_decay_ns;
-      st->cpu_budget = st->cpu_budget > gap ? st->cpu_budget - gap : 0;
-    }
+    /* CPU-bound detector: accrue on-CPU time here; the off-CPU gap is
+     * decayed in running(), so a continuously-running hog's budget
+     * grows to the cap while a sleeper's stays near zero. */
     st->cpu_budget += rt;
-    st->last_decay_ns = now;
+    st->last_stop_ns = now;
     st->start_ns = 0;
   } else if (st->slice_ns >= p->scx.slice) {
     p->scx.dsq_vtime += st->slice_ns - p->scx.slice;
