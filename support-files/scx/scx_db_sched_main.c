@@ -44,19 +44,28 @@
 #include "scx_db_sched.bpf.skel.h"
 
 static const char help_fmt[] =
-"A DB-aware sched_ext scheduler for MySQL / InnoDB.\n"
+"A DB-aware sched_ext scheduler for MySQL / InnoDB (v7-rc1, R0 base).\n"
 "\n"
-"Usage: %s [--dump] [-v]\n"
+"Usage: %s [OPTIONS]\n"
 "\n"
-"  --dump         After attaching, dump the current contents of the\n"
-"                 DB-aware maps (commit_vip, blocked_by, lock_holder,\n"
-"                 rg_prio) and then keep running.\n"
-"  -v             Print libbpf debug messages\n"
-"  -h             Display this help and exit\n";
+"  --r1-kick          Enable R1 wakeup preemption (lag granularity filter\n"
+"                     + per-CPU kick budget).  Off by default (R0).\n"
+"  --wake-gran-us=N   Wakeup-preemption lag granularity in microseconds\n"
+"                     (default 1000, CFS order).\n"
+"  --kick-budget=N    Kick IPI budget per target CPU per second when R1 is\n"
+"                     enabled (default 2048).\n"
+"  --stats            Periodically print aggregated scheduler counters\n"
+"                     (every 10s) while attached.\n"
+"  --dump             After attaching, dump the current contents of the\n"
+"                     DB-aware maps (commit_vip, blocked_by, lock_holder,\n"
+"                     rg_prio) and then keep running.\n"
+"  -v                 Print libbpf debug messages\n"
+"  -h                 Display this help and exit\n";
 
 static bool verbose;
 static bool dump_maps;
-static volatile int exit_req;
+static bool print_stats;
+static volatile int exit_req = 0;
 
 /*
  * Where the DB-aware maps are pinned so that a running mysqld (via
@@ -184,13 +193,64 @@ static void dump_maps_all(struct scx_db_sched *skel) {
   fflush(stdout);
 }
 
+/*
+ * Aggregate the per-CPU scheduler counters across all CPUs and print
+ * them with the counter names from scx_db_sched.bpf.c.  The stats map
+ * is a BPF_MAP_TYPE_PERCPU_ARRAY of u64 with 8 slots, so one lookup
+ * returns one u64 per possible CPU.
+ */
+static const char *const stat_names[] = {
+    "inserts",        "sem_gate_hits", "cpubound_cap",
+    "kicks_sent",     "kick_gran_skip", "kick_budget_skip",
+    "dispatch_steals", NULL,
+};
+
+static void print_stats_once(struct scx_db_sched *skel) {
+  int fd = bpf_map__fd(skel->maps.stats);
+  int nr_cpus = libbpf_num_possible_cpus();
+  __u32 key = 0;
+  __u64 *values;
+  int i, slot;
+
+  if (nr_cpus < 0)
+    nr_cpus = 1;
+  values = calloc(nr_cpus, sizeof(__u64));
+  if (!values)
+    return;
+  printf("=== scx_db_sched stats ===\n");
+  for (slot = 0; stat_names[slot] != NULL; slot++) {
+    __u64 sum = 0;
+
+    key = (__u32)slot;
+    if (bpf_map_lookup_elem(fd, &key, values) != 0) {
+      printf("  %-17s (lookup failed: %s)\n", stat_names[slot],
+             strerror(errno));
+      continue;
+    }
+    for (i = 0; i < nr_cpus; i++)
+      sum += values[i];
+    printf("  %-17s %llu\n", stat_names[slot],
+           (unsigned long long)sum);
+  }
+  printf("=== end stats ===\n");
+  fflush(stdout);
+  free(values);
+}
+
 int main(int argc, char **argv) {
   struct scx_db_sched *skel;
   struct bpf_link *link;
+  bool opt_r1_kick = false;
+  long opt_wake_gran_us = 0;
+  long opt_kick_budget = 0;
   static const struct option long_options[] = {
       {"dump", no_argument, NULL, 'd'},
+      {"stats", no_argument, NULL, 's'},
       {"verbose", no_argument, NULL, 'v'},
       {"help", no_argument, NULL, 'h'},
+      {"r1-kick", no_argument, NULL, 'K'},
+      {"wake-gran-us", required_argument, NULL, 'g'},
+      {"kick-budget", required_argument, NULL, 'b'},
       {NULL, 0, NULL, 0},
   };
   int opt;
@@ -210,19 +270,53 @@ restart:
   SCX_BUG_ON(!skel, "Could not open scx_db_sched");
 #endif
 
-  while ((opt = getopt_long(argc, argv, "dvh", long_options, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, "dsvh", long_options, NULL)) != -1) {
     switch (opt) {
       case 'd':
         dump_maps = true;
         break;
+      case 's':
+        print_stats = true;
+        break;
       case 'v':
         verbose = true;
+        break;
+      case 'K':
+        opt_r1_kick = true;
+        break;
+      case 'g':
+        opt_wake_gran_us = atol(optarg);
+        if (opt_wake_gran_us <= 0) {
+          fprintf(stderr, "--wake-gran-us must be positive\n");
+          return 1;
+        }
+        break;
+      case 'b':
+        opt_kick_budget = atol(optarg);
+        if (opt_kick_budget <= 0) {
+          fprintf(stderr, "--kick-budget must be positive\n");
+          return 1;
+        }
         break;
       default:
         fprintf(stderr, help_fmt, basename(argv[0]));
         return opt != 'h';
     }
   }
+
+  /* Runtime switches must be applied after open() and before load(). */
+  if (opt_r1_kick)
+    skel->rodata->scx_enable_wake_preempt = true;
+  if (opt_wake_gran_us > 0)
+    skel->rodata->scx_wake_gran_ns = (__u64)opt_wake_gran_us * 1000ULL;
+  if (opt_kick_budget > 0)
+    skel->rodata->scx_kick_budget_per_sec = (__u32)opt_kick_budget;
+
+  fprintf(stderr,
+          "scx_db_sched v7-rc1 (R0): wake_preempt=%s gran=%lluus budget=%u/s\n",
+          opt_r1_kick ? "on" : "off",
+          (unsigned long long)skel->rodata->scx_wake_gran_ns / 1000,
+          skel->rodata->scx_kick_budget_per_sec);
 
 #ifdef SCX_SKEL_HAS_STRUCT_OPS
   SCX_OPS_LOAD(skel, db_sched_ops, scx_db_sched, uei);
@@ -246,7 +340,10 @@ restart:
   if (dump_maps) dump_maps_all(skel);
 
   while (!exit_req && !UEI_EXITED(skel, uei)) {
-    if (dump_maps) {
+    if (print_stats) {
+      sleep(10);
+      print_stats_once(skel);
+    } else if (dump_maps) {
       /* Print a periodic dump every 5s so the user can observe changes. */
       sleep(5);
       dump_maps_all(skel);
