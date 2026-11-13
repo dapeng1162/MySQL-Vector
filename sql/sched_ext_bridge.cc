@@ -861,20 +861,11 @@ void thread_job_end(THD *thd) {
 
 void command_begin(THD *thd) {
   if (!s_connected || thd == nullptr) return;
-  /* Classic (per-thread / no-threads / plugin) architectures only: the
-   * coroutine executor brackets its jobs with thread_job_begin/end itself,
-   * and a second publication here would unbalance the gate refcount. */
-  if (Connection_handler_manager::thread_handling ==
-      Connection_handler_manager::SCHEDULER_COROUTINE_EPOLL)
-    return;
   thread_job_begin(thd, any_lock_waits() && is_lock_holder(thd), false);
 }
 
 void command_end(THD *thd) {
   if (!s_connected || thd == nullptr) return;
-  if (Connection_handler_manager::thread_handling ==
-      Connection_handler_manager::SCHEDULER_COROUTINE_EPOLL)
-    return;
   thread_job_end(thd);
 }
 
