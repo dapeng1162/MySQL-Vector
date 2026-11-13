@@ -32,7 +32,12 @@ UEI_DEFINE(uei);
 #define SEM_TTL_NS (5 * 1000 * 1000 * 1000ULL)
 
 const volatile bool scx_enable_semantic = false;
-const volatile u64 scx_hog_slice_ns = 2500 * 1000ULL;
+/* 6ms: measured on 16-core c8i (2026-11-13) — 2.5ms shredded busy
+   connection threads in closed-loop OLTP (-3.6% rw64), while 20ms (cap
+   disabled) recovered only the same amount; the remaining gap is the
+   base policy itself, not the cap.  6ms keeps true CPU hogs bounded
+   for the mixed-workload scenario without hurting foreground OLTP. */
+const volatile u64 scx_hog_slice_ns = 6000 * 1000ULL;
 
 struct sem_state {
   u32 flags;         /* 1=commit, 2=holder */
