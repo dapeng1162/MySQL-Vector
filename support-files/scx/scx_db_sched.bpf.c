@@ -78,6 +78,7 @@ const volatile bool scx_enable_wake_preempt = false; /* R1 */
 const volatile u64 scx_wake_gran_ns = 1000 * 1000ULL; /* CFS-order granularity */
 const volatile u32 scx_kick_budget_per_sec = 2048;    /* IPI/s per target CPU */
 const volatile u64 scx_hog_slice_ns = 2500 * 1000ULL; /* 2.5ms default */
+const volatile u32 scx_slice_shift = 0; /* adaptive slice ladder >>N (0=default) */
 /* L1 semantic tilts (acceptance-gated, all off by default). */
 const volatile bool scx_enable_commit_tilt = false;  /* S2 */
 const volatile bool scx_enable_holder_tilt = false;  /* S3 lock/latch */
@@ -338,16 +339,17 @@ static void enqueue_semantic(struct task_struct *p, u64 enq_flags,
  * machine keeps full slices and near-zero switch overhead. */
 static __always_inline u64 fast_slice(s32 cpu)
 {
+  u32 shift = scx_slice_shift > 4 ? 4 : scx_slice_shift;
   s32 nr = scx_bpf_dsq_nr_queued(CPU_DSQ_BASE + (u64)cpu);
   if (nr < 0)
     nr = 0;
   if (nr >= 8)
-    return SCX_SLICE_DFL >> 3;
+    return SCX_SLICE_DFL >> (3 + shift > 5 ? 5 : 3 + shift);
   if (nr >= 4)
-    return SCX_SLICE_DFL >> 2;
+    return SCX_SLICE_DFL >> (2 + shift > 5 ? 5 : 2 + shift);
   if (nr >= 2)
-    return SCX_SLICE_DFL >> 1;
-  return SCX_SLICE_DFL;
+    return SCX_SLICE_DFL >> (1 + shift > 5 ? 5 : 1 + shift);
+  return SCX_SLICE_DFL >> shift;
 }
 
 /* R1: per-target-CPU token bucket.  Refills to scx_kick_budget_per_sec

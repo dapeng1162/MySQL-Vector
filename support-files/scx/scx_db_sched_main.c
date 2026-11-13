@@ -57,6 +57,8 @@ static const char help_fmt[] =
 "  --hog-slice-us=N   Slice cap in microseconds for detected CPU-bound\n"
 "                     tasks, bounding the head-of-line wait a hog imposes\n"
 "                     on woken tasks (default 2500).\n"
+"  --slice-shift=N    Right-shift the adaptive slice ladder by N (0=default\n"
+"                     20/10/5/2.5ms, 1=10/5/2.5/1.25ms, ...).\n"
 "  --s2-commit        S2: bounded vtime tilt for COMMIT/ROLLBACK windows\n"
 "                     (borrow/repay accounting).\n"
 "  --s3-holder        S3: bounded vtime tilt for lock/latch holders with\n"
@@ -257,6 +259,7 @@ int main(int argc, char **argv) {
   long opt_wake_gran_us = 0;
   long opt_kick_budget = 0;
   long opt_hog_slice_us = 0;
+  long opt_slice_shift = 0;
   bool opt_s2_commit = false;
   bool opt_s3_holder = false;
   bool opt_s3_no_pi = false;
@@ -270,6 +273,7 @@ int main(int argc, char **argv) {
       {"wake-gran-us", required_argument, NULL, 'g'},
       {"kick-budget", required_argument, NULL, 'b'},
       {"hog-slice-us", required_argument, NULL, 'S'},
+      {"slice-shift", required_argument, NULL, 'X'},
       {"s2-commit", no_argument, NULL, '2'},
       {"s3-holder", no_argument, NULL, '3'},
       {"s3-no-pi", no_argument, NULL, 'P'},
@@ -328,6 +332,13 @@ restart:
           return 1;
         }
         break;
+      case 'X':
+        opt_slice_shift = atol(optarg);
+        if (opt_slice_shift < 0 || opt_slice_shift > 4) {
+          fprintf(stderr, "--slice-shift must be 0..4\n");
+          return 1;
+        }
+        break;
       case '2':
         opt_s2_commit = true;
         break;
@@ -355,6 +366,7 @@ restart:
     skel->rodata->scx_kick_budget_per_sec = (__u32)opt_kick_budget;
   if (opt_hog_slice_us > 0)
     skel->rodata->scx_hog_slice_ns = (__u64)opt_hog_slice_us * 1000ULL;
+  skel->rodata->scx_slice_shift = (__u32)opt_slice_shift;
   if (opt_s2_commit)
     skel->rodata->scx_enable_commit_tilt = true;
   if (opt_s3_holder)
