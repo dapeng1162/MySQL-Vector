@@ -271,6 +271,13 @@ void forget_thd(THD *thd) {
 // -----------------------------------------------------------------------
 
 bool latch_wait_begin(std::thread::id owner, Latch_kind kind) {
+  /* Skip everything unless a scheduler is consuming the edges: the
+   * userspace mirror and the counters are instrumentation for it, and
+   * the shard-mutex map update is the only non-trivial cost on this
+   * path.  Without this gate the no-scheduler case still paid the
+   * mirror (S0 measured -4% on rw t64). */
+  if (!connected()) return false;
+
   const int k = static_cast<int>(kind);
   s_latch_waits[k].fetch_add(1, std::memory_order_relaxed);
   if (owner == std::thread::id{}) return false;
@@ -292,6 +299,10 @@ bool latch_wait_begin(std::thread::id owner, Latch_kind kind) {
 }
 
 void latch_wait_end() {
+  /* Matches the connected() gate in latch_wait_begin(): a wait that
+   * never published must not erase (nor pay for) anything. */
+  if (!connected()) return;
+
   {
     const std::thread::id waiter = std::this_thread::get_id();
     const size_t i = s_latch_waiter_to_holder.idx(waiter);

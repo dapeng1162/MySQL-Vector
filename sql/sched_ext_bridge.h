@@ -42,9 +42,9 @@
     * The THD-level lock-wait graph (lock_wait_begin/end, is_lock_holder,
       forget_thd) and the latch wait-edge mirror (latch_wait_begin/end,
       latch_wait_holder, the Coroutine_latch_* counters) are pure
-      userspace state and are ALWAYS compiled: they drive the coroutine
-      handler's high-priority queue and the latch observability
-      regardless of any kernel scheduler.
+      userspace state and are ALWAYS compiled, but are only ACTIVE while
+      connected(): with no scheduler consuming the edges they are skipped
+      entirely, so the no-scheduler path is zero-cost.
 
     * The BPF-facing half is a compile-time no-op when built without
       HAVE_SCX_SCHEDULER (the default): the server builds, links, starts and
@@ -96,11 +96,11 @@ void thread_end();
 /**
   Latch (InnoDB internal mutex / rw-lock) wait edges, published by the
   waiter around its OS wait (TTASEventMutex::wait() and the rw-lock
-  sync-array waits).  Always compiled: every call maintains the
-  userspace waiter->holder mirror and the per-family wait/edge counters
-  (SHOW GLOBAL STATUS Coroutine_latch_*) even when the BPF half is a
-  no-op, so the instrumentation stays observable and testable without
-  a running sched_ext scheduler.
+  sync-array waits).  Compiled always, active only while connected():
+  every call then maintains the userspace waiter->holder mirror and
+  the per-family wait/edge counters (SHOW GLOBAL STATUS
+  Coroutine_latch_*); with no scheduler connected both the mirror and
+  the counters are skipped and the path is zero-cost.
 
   owner is the latch holder's std::thread::id; pass the default
   (invalid) id when the holder cannot be identified — the wait is
