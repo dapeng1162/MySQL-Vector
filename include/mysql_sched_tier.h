@@ -22,11 +22,12 @@
   The tiers map to the task_tier BPF map of the DB-aware sched_ext
   scheduler (support-files/scx/scx_db_sched.bpf.c):
 
-    TS     time-sensitive: strict-priority FIFO + preemption kick
-           (reactor thread, VIP workers, high-priority jobs)
+    TS     compatibility marker; smart_sched has no separate strict-priority
+           queue for this tier
     NORMAL default
-    BG     background: idle-capacity-only scheduling with a starvation
-           floor (purge, dict_stats, fts optimize, monitors, dumps)
+    BG     background weight 25/100 when semantic scheduling is enabled
+           (purge, dict_stats, fts optimize, monitors, dumps); it is not
+           restricted to idle CPU capacity
 
   The implementation is a no-op when the server was built without
   HAVE_SCX_SCHEDULER or no scheduler is connected.

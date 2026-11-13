@@ -156,7 +156,19 @@ rw t8-2048 曲线、TPC-C、点查开环 rate ladder、N1（base/noise ×
 
 点查在 50k/200k 开环档均跟上目标速率；200k 时两边 p95 均 0.14ms，
 但 R0 avg/max 为 0.11/2.46ms，V97 为 0.10/1.40ms，尾部信号不能忽略。
-完整 rate ladder、N1/N2/N4 与语义层收益以测试结果汇总为准，不在此预写结论。
+负向快速验收（完整数据见测试 campaign 的 `results/smart-20261113/`）：
+
+- N1：R0@noise50k 出现 event queue full；R1 虽能完成，但 p99/max 为
+  3.49/14.95ms，V97 为 0.56/2.19ms，未通过。
+- N2：R0 mixed TPS 6,134、V97 9,425（-34.9%）；p99 61.08ms vs 16.41ms，
+  未通过。
+- N4（Pareto h=0.2，单轮 20s）：R0 TPS 8,439、V97 8,098（+4.2%），
+  p99 40.37ms vs 42.61ms，是初步正信号，尚未多轮确认。
+- S2/S3/S4 的 N4 吞吐均未超过 R0。commit tilt 和 PI publish/apply 有命中，
+  但 holder tilt 为 0；不得声称 latch 优先已生效或 PI 有净收益。
+
+因此当前既没有达成 rw 持平，也没有达成 N1/N2 负向目标。完整 rate ladder
+仍需后续补测。
 
 ## 8. 风险与开放项
 
