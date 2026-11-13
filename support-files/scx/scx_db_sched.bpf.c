@@ -1,33 +1,25 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * scx_db_sched v7-rc1 (R0): minimal EEVDF base for MySQL / InnoDB.
+ * scx_db_sched (smart_sched): DB-aware sched_ext scheduler for MySQL 9.7.
  *
- * Design (see Docs/sched-v7-redesign.md).  v6.4 attribution experiments
- * (E1-E4 + C5n, rw256, redo 4G) showed the semantic machinery — global
- * vtime DSQ, unconditional commit/urgent kicks, vtime tilts, CPU-bound
- * cap — accounts for only ~3% of the -21.8% gap to CFS, the mysqld-side
- * publication for ~3%, and the scx base path itself for -16.7%.  v7
- * therefore starts from a minimal, faithful EEVDF base (R0) and re-adds
- * mechanisms one per stage behind runtime switches, each with its own
- * acceptance gate (R1: budgeted wakeup preemption, R2: commit tilt,
- * R3: latch tilt + PI).
- *
- * R0 scheduler shape:
- *   - One queue family: per-CPU vtime DSQs.  No global DSQ.  Every task,
- *     gated or not, takes the same single path: clamp vruntime against a
- *     global lag bound, adaptive slice, insert into the select_cpu()
- *     target's pool.
- *   - The DB bridge maps (sem_any &c.) stay pinned for ABI compatibility
- *     so the mysqld instrumentation cost is present in every
- *     measurement, but R0 only counts gate hits and ignores them — R2/R3
- *     re-attach meaning behind switches.
- *   - Adaptive slice (20ms -> 2.5ms by pool depth) plus a CPU-bound
- *     detector whose cap bounds the head-of-line wait a hog can impose
- *     when preemption is delayed (E1: removing it worsened the N1 tail).
- *   - Exact runtime accounting from the running()->stopping() on-CPU
- *     interval, immune to kick slice-zeroing (v6.2/v6.3 lesson).
- *   - R1 wakeup preemption (off by default): CFS-granularity lag filter
- *     plus a per-target-CPU token bucket bounding kick IPIs per second.
+ * Design (see Docs/smart-sched-design.md).  Built on the v7-rc1 minimal
+ * EEVDF base after the v6.4/v7-rc1 ablation results:
+ *   - L0 base (always on): one queue family, per-CPU vtime DSQs, lag
+ *     clamp, adaptive slice (pool-depth 20ms->2.5ms), a REAL CPU-bound
+ *     detector whose cap bounds the head-of-line wait a hog imposes
+ *     (the detector was dead code from v6.4 through v7-rc1 until the
+ *     off-CPU-gap decay fix).  Exact on-CPU interval accounting.
+ *   - L1 semantic tilts (switch-gated, off by default): bounded virtual
+ *     -deadline bonuses for COMMIT/ROLLBACK windows (S2), lock/latch
+ *     holders with waiters (S3), and priority-inheritance floors (S3).
+ *     All tilted tasks land in the SAME per-CPU pool with a vd offset —
+ *     never a separate queue (v6.4's global DSQ cost and its lock are
+ *     gone).  Borrowed CPU is repaid as debt by idling (cpu burst).
+ *   - L2 preemption: no kick by default (kick's IPI cost is linear in
+ *     rate and made up ~11pp of v6.4's rw deficit).  R1 budgeted wakeup
+ *     kick (granularity + per-CPU token bucket) for the noise tail;
+ *     S4 semantic kick only for tilted wakeups, spending IPIs where
+ *     semantic knowledge says they pay.
  *
  * Requires: Linux kernel with CONFIG_SCHED_CLASS_EXT (sched_ext).
  *
@@ -58,6 +50,25 @@ UEI_DEFINE(uei);
  * E1 (cap disabled) worsened the N1 noise tail 34.5ms -> 108ms. */
 #define CPUBOUND_BUDGET_NS (20 * 1000 * 1000ULL)
 
+/* L1 semantic tilts: bounded virtual-deadline bonuses (ns, vtime unit).
+ * All three buy the same thing — shorten the critical path: commit
+ * drains early, locks release early, latch holders leave the critical
+ * section.  Borrowed CPU is repaid as debt (cgroup cpu burst idea), so
+ * the tilt is free in steady state. */
+#define B_COMMIT        SCX_SLICE_DFL       /* commit/rollback window */
+#define B_HOLD          (SCX_SLICE_DFL >> 1) /* lock/latch holder */
+#define B_MAX           (4 * SCX_SLICE_DFL)  /* per-window borrow cap */
+#define D_MAX           (8 * SCX_SLICE_DFL)  /* outstanding debt cap */
+#define PI_DEPTH_MAX    3
+#define PI_STALE_NS     (1000 * 1000 * 1000ULL)
+
+/* DB-internal background threads (purge, dict stats, fts optimize):
+ * smaller weight => virtual deadline 4x later and vtime accumulates
+ * 4x faster.  This is database self-knowledge, not business QoS. */
+#define BG_WEIGHT       25
+#define NORMAL_WEIGHT   100
+#define TIER_BG         2
+
 /* -----------------------------------------------------------------------
  * Runtime switches (loader-settable, same binary A/B).
  *   R1: wakeup preemption with granularity filter + per-CPU kick budget.
@@ -67,6 +78,11 @@ const volatile bool scx_enable_wake_preempt = false; /* R1 */
 const volatile u64 scx_wake_gran_ns = 1000 * 1000ULL; /* CFS-order granularity */
 const volatile u32 scx_kick_budget_per_sec = 2048;    /* IPI/s per target CPU */
 const volatile u64 scx_hog_slice_ns = 2500 * 1000ULL; /* 2.5ms default */
+/* L1 semantic tilts (acceptance-gated, all off by default). */
+const volatile bool scx_enable_commit_tilt = false;  /* S2 */
+const volatile bool scx_enable_holder_tilt = false;  /* S3 lock/latch */
+const volatile bool scx_enable_pi = false;           /* S3 priority inherit */
+const volatile bool scx_enable_semantic_kick = false;/* S4 budgeted kick */
 
 /* Global minimum-vtime tracker (lag clamp reference). */
 static u64 vtime_now;
@@ -131,6 +147,22 @@ struct {
   __type(value, u8);
 } sem_any SEC(".maps");
 
+/* L1 priority-inheritance state: holder_boost[holder_tid] = the most
+ * urgent waiter's effective vd (floor), published by waiters through
+ * blocked_by edges.  Deleted on use or when stale. */
+struct boost_entry {
+  u64 floor;
+  u64 ts;
+  u32 depth;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 4096);
+  __type(key, u32);
+  __type(value, struct boost_entry);
+} holder_boost SEC(".maps");
+
 /* -----------------------------------------------------------------------
  * Per-task account: exact runtime charge + CPU-bound token bucket.
  * ----------------------------------------------------------------------- */
@@ -139,6 +171,8 @@ struct task_account {
   u64 start_ns;      /* on-CPU start timestamp, set in running() */
   u64 cpu_budget;    /* undecayed on-CPU credit (CPU-bound detector) */
   u64 last_stop_ns;  /* wall time of the last stop (decay reference) */
+  u64 borrowed;      /* CPU consumed inside L1 tilt windows */
+  u64 debt;          /* closed borrow, repaid by idle time */
 };
 
 struct {
@@ -162,12 +196,14 @@ struct {
 } kick_budget SEC(".maps");
 
 /* Per-CPU statistics (aggregate across CPUs to read):
- *   [0] inserts, [1] sem gate hits (ignored), [2] cpu-bound cap applied,
+ *   [0] inserts, [1] sem gate hits, [2] cpu-bound cap applied,
  *   [3] kicks sent, [4] kicks below granularity, [5] kicks over budget,
- *   [6] dispatch steals. */
+ *   [6] dispatch steals, [7] commit tilt, [8] holder tilt,
+ *   [9] PI floor publishes, [10] PI floor applies, [11] semantic kicks,
+ *   [12] BG tier enqueues. */
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __uint(max_entries, 8);
+  __uint(max_entries, 16);
   __type(key, u32);
   __type(value, u64);
 } stats SEC(".maps");
@@ -189,6 +225,109 @@ static struct task_account *account_of(u32 tid)
     st = bpf_map_lookup_elem(&task_account_map, &tid);
   }
   return st;
+}
+
+/* L1 helpers. */
+static inline s32 get_tier(u32 tid)
+{
+  s32 *t = bpf_map_lookup_elem(&task_tier, &tid);
+  return t ? *t : 1;  /* TIER_NORMAL */
+}
+
+static bool kick_budget_allow(s32 cpu, u64 now);
+
+/* Close an open borrow window: borrowed becomes debt (bounded). */
+static void close_borrow_window(struct task_account *st)
+{
+  if (!st->borrowed)
+    return;
+  st->debt += st->borrowed;
+  if (st->debt > D_MAX)
+    st->debt = D_MAX;
+  st->borrowed = 0;
+}
+
+/* L1 enqueue path, entered only when the bridge has published semantic
+ * state for this tid AND at least one L1 switch is on.  Everything lands
+ * in the SAME per-CPU vtime pool as the base path — the tilt is a vd
+ * offset, never a different queue (v6.4's global DSQ is gone). */
+static void enqueue_semantic(struct task_struct *p, u64 enq_flags,
+                             u32 tid, s32 cpu, u64 vr, u64 slice,
+                             struct task_account *st)
+{
+  u64 now = scx_bpf_now();
+  u32 weight = NORMAL_WEIGHT;
+  u64 vd;
+  bool tilted = false;
+
+  if (get_tier(tid) == TIER_BG) {
+    weight = BG_WEIGHT;
+    stat_inc(12);
+  }
+  vd = vr + SCX_SLICE_DFL * 100 / weight;
+
+  /* Commit window: bounded vd bonus so COMMIT/ROLLBACK drains early. */
+  if (scx_enable_commit_tilt) {
+    u8 *vip = bpf_map_lookup_elem(&commit_vip, &tid);
+    if (vip && *vip) {
+      stat_inc(7);
+      if (!st || st->borrowed < B_MAX)
+        vd = vd > B_COMMIT ? vd - B_COMMIT : 0;
+      tilted = true;
+    }
+  }
+
+  /* Lock/latch holder with waiters: bounded vd bonus so the critical
+   * section (and the lock release after it) finishes early.  A stale
+   * entry (lost update / leaked clear) is ignored via HOLDER_TTL_NS. */
+  if (scx_enable_holder_tilt) {
+    struct holder_entry *he = bpf_map_lookup_elem(&lock_holder, &tid);
+    if (he && he->count > 0 && now - he->ts_ns <= HOLDER_TTL_NS) {
+      stat_inc(8);
+      if (!st || st->borrowed < B_MAX)
+        vd = vd > B_HOLD ? vd - B_HOLD : 0;
+      tilted = true;
+    }
+  }
+
+  /* Priority inheritance: if I am a waiter, publish my effective vd as
+   * a floor for my holder; if a fresher floor was published for me,
+   * apply it.  Depth-capped by the bridge's short InnoDB wait chains. */
+  if (scx_enable_pi) {
+    u32 *holder = bpf_map_lookup_elem(&blocked_by, &tid);
+    if (holder && *holder) {
+      struct boost_entry ne = { .floor = vd, .ts = now, .depth = 0 };
+      bpf_map_update_elem(&holder_boost, holder, &ne, BPF_ANY);
+      stat_inc(9);
+    }
+    {
+      struct boost_entry *hb = bpf_map_lookup_elem(&holder_boost, &tid);
+      if (hb) {
+        if (now - hb->ts <= PI_STALE_NS && hb->floor < vd) {
+          vd = hb->floor;
+          tilted = true;
+          stat_inc(10);
+        }
+        bpf_map_delete_elem(&holder_boost, &tid);
+      }
+    }
+  }
+
+  /* Debt from previous tilt windows: repaid by idling (running()), the
+   * remainder defers this insert. */
+  if (st)
+    vd += st->debt;
+
+  scx_bpf_dsq_insert_vtime(p, CPU_DSQ_BASE + (u64)cpu, slice, vd, enq_flags);
+
+  /* S4 semantic kick: only a tilted wakeup is worth an IPI, and only
+   * within the per-CPU budget.  This is where semantic knowledge buys
+   * preemption efficiency the blind fast-path kick never had. */
+  if (scx_enable_semantic_kick && tilted &&
+      (enq_flags & SCX_ENQ_WAKEUP) && kick_budget_allow(cpu, now)) {
+    stat_inc(11);
+    scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+  }
 }
 
 /* Adaptive slice, shrinking with the per-CPU pool depth: 20ms when the
@@ -256,13 +395,36 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags)
   s32 cpu = scx_bpf_task_cpu(p);
   u64 vr, slice;
   struct task_account *st;
+  u8 *gate;
 
   stat_inc(0);
 
-  /* One semantic lookup per wakeup (the R2/R3 hook point).  Counted,
-   * ignored in R0. */
-  if (bpf_map_lookup_elem(&sem_any, &tid))
+  /* One semantic lookup per wakeup (the L1 hook point).  When the gate
+   * misses (no semantic state published for this tid) the task takes
+   * the plain base path below at zero extra cost. */
+  gate = bpf_map_lookup_elem(&sem_any, &tid);
+  if (gate) {
     stat_inc(1);
+    if (scx_enable_commit_tilt || scx_enable_holder_tilt ||
+        scx_enable_pi || scx_enable_semantic_kick) {
+      u32 tid2 = tid;
+      vr = p->scx.dsq_vtime;
+      if (vr + MAX_LAG < vtime_now)
+        vr = vtime_now - MAX_LAG;
+      slice = fast_slice(cpu);
+      st = account_of(tid2);
+      if (st) {
+        if (st->cpu_budget > CPUBOUND_BUDGET_NS &&
+            slice > scx_hog_slice_ns) {
+          slice = scx_hog_slice_ns;
+          stat_inc(2);
+        }
+        st->slice_ns = slice;
+      }
+      enqueue_semantic(p, enq_flags, tid2, cpu, vr, slice, st);
+      return;
+    }
+  }
 
   /* Lag-clamped vruntime: a task that slept keeps its credit, bounded. */
   vr = p->scx.dsq_vtime;
@@ -353,6 +515,9 @@ void BPF_STRUCT_OPS(db_sched_running, struct task_struct *p)
     if (st->last_stop_ns && now > st->last_stop_ns) {
       u64 gap = now - st->last_stop_ns;
       st->cpu_budget = st->cpu_budget > gap ? st->cpu_budget - gap : 0;
+      /* L1 debt is repaid by idling (cgroup cpu burst: borrowed CPU is
+       * returned by waiting, not by running). */
+      st->debt = st->debt > gap ? st->debt - gap : 0;
     }
   }
 }
@@ -375,13 +540,44 @@ void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable)
   if (st->start_ns && now > st->start_ns) {
     u64 rt = now - st->start_ns;
 
-    p->scx.dsq_vtime += rt;
     /* CPU-bound detector: accrue on-CPU time here; the off-CPU gap is
      * decayed in running(), so a continuously-running hog's budget
      * grows to the cap while a sleeper's stays near zero. */
     st->cpu_budget += rt;
     st->last_stop_ns = now;
     st->start_ns = 0;
+
+    /* L1 accounting: BG weight scales the vtime charge (4x slower
+     * accumulation), and runtime inside a tilt window is borrowed CPU
+     * to be repaid as debt once the window closes. */
+    if (scx_enable_commit_tilt || scx_enable_holder_tilt ||
+        scx_enable_pi || scx_enable_semantic_kick) {
+      if (bpf_map_lookup_elem(&sem_any, &tid)) {
+        u32 weight = get_tier(tid) == TIER_BG ? BG_WEIGHT : NORMAL_WEIGHT;
+        bool tilted = false;
+
+        p->scx.dsq_vtime += rt * 100 / weight;
+        if (scx_enable_commit_tilt) {
+          u8 *vip = bpf_map_lookup_elem(&commit_vip, &tid);
+          if (vip && *vip)
+            tilted = true;
+        }
+        if (scx_enable_holder_tilt) {
+          struct holder_entry *he = bpf_map_lookup_elem(&lock_holder, &tid);
+          if (he && he->count > 0 && now - he->ts_ns <= HOLDER_TTL_NS)
+            tilted = true;
+        }
+        if (tilted) {
+          st->borrowed += rt;
+          if (st->borrowed >= B_MAX)
+            close_borrow_window(st);
+        } else if (st->borrowed) {
+          close_borrow_window(st);
+        }
+        return;
+      }
+    }
+    p->scx.dsq_vtime += rt;
   } else if (st->slice_ns >= p->scx.slice) {
     p->scx.dsq_vtime += st->slice_ns - p->scx.slice;
   }
@@ -396,6 +592,7 @@ void BPF_STRUCT_OPS(db_sched_disable, struct task_struct *p)
 {
   u32 tid = p->pid;
   bpf_map_delete_elem(&task_account_map, &tid);
+  bpf_map_delete_elem(&holder_boost, &tid);
   /* The bridge refcounts sem_any, but a tid leaving the scheduler may
    * still carry a stale gate entry (tid reuse); scrub as the final
    * authority. */

@@ -57,6 +57,13 @@ static const char help_fmt[] =
 "  --hog-slice-us=N   Slice cap in microseconds for detected CPU-bound\n"
 "                     tasks, bounding the head-of-line wait a hog imposes\n"
 "                     on woken tasks (default 2500).\n"
+"  --s2-commit        S2: bounded vtime tilt for COMMIT/ROLLBACK windows\n"
+"                     (borrow/repay accounting).\n"
+"  --s3-holder        S3: bounded vtime tilt for lock/latch holders with\n"
+"                     waiters, plus priority-inheritance floors.\n"
+"  --s3-no-pi         With --s3-holder: disable the PI floor, tilt only.\n"
+"  --s4-kick          S4: budgeted wakeup kick for tilted tasks only\n"
+"                     (semantic preemption, --kick-budget applies).\n"
 "  --stats            Periodically print aggregated scheduler counters\n"
 "                     (every 10s) while attached.\n"
 "  --dump             After attaching, dump the current contents of the\n"
@@ -205,7 +212,10 @@ static void dump_maps_all(struct scx_db_sched *skel) {
 static const char *const stat_names[] = {
     "inserts",        "sem_gate_hits", "cpubound_cap",
     "kicks_sent",     "kick_gran_skip", "kick_budget_skip",
-    "dispatch_steals", NULL,
+    "dispatch_steals", "commit_tilt", "holder_tilt",
+    "pi_publish",     "pi_apply",      "semantic_kicks",
+    "bg_tier",        NULL,            NULL,
+    NULL,
 };
 
 static void print_stats_once(struct scx_db_sched *skel) {
@@ -247,6 +257,10 @@ int main(int argc, char **argv) {
   long opt_wake_gran_us = 0;
   long opt_kick_budget = 0;
   long opt_hog_slice_us = 0;
+  bool opt_s2_commit = false;
+  bool opt_s3_holder = false;
+  bool opt_s3_no_pi = false;
+  bool opt_s4_kick = false;
   static const struct option long_options[] = {
       {"dump", no_argument, NULL, 'd'},
       {"stats", no_argument, NULL, 's'},
@@ -256,6 +270,10 @@ int main(int argc, char **argv) {
       {"wake-gran-us", required_argument, NULL, 'g'},
       {"kick-budget", required_argument, NULL, 'b'},
       {"hog-slice-us", required_argument, NULL, 'S'},
+      {"s2-commit", no_argument, NULL, '2'},
+      {"s3-holder", no_argument, NULL, '3'},
+      {"s3-no-pi", no_argument, NULL, 'P'},
+      {"s4-kick", no_argument, NULL, '4'},
       {NULL, 0, NULL, 0},
   };
   int opt;
@@ -310,6 +328,18 @@ restart:
           return 1;
         }
         break;
+      case '2':
+        opt_s2_commit = true;
+        break;
+      case '3':
+        opt_s3_holder = true;
+        break;
+      case 'P':
+        opt_s3_no_pi = true;
+        break;
+      case '4':
+        opt_s4_kick = true;
+        break;
       default:
         fprintf(stderr, help_fmt, basename(argv[0]));
         return opt != 'h';
@@ -325,13 +355,25 @@ restart:
     skel->rodata->scx_kick_budget_per_sec = (__u32)opt_kick_budget;
   if (opt_hog_slice_us > 0)
     skel->rodata->scx_hog_slice_ns = (__u64)opt_hog_slice_us * 1000ULL;
+  if (opt_s2_commit)
+    skel->rodata->scx_enable_commit_tilt = true;
+  if (opt_s3_holder)
+    skel->rodata->scx_enable_holder_tilt = true;
+  if (opt_s3_holder && !opt_s3_no_pi)
+    skel->rodata->scx_enable_pi = true;
+  if (opt_s4_kick)
+    skel->rodata->scx_enable_semantic_kick = true;
 
   fprintf(stderr,
-          "scx_db_sched v7-rc1 (R0): wake_preempt=%s gran=%lluus budget=%u/s hog_slice=%lluus\n",
+          "scx_db_sched smart_sched: wake_preempt=%s gran=%lluus budget=%u/s hog_slice=%lluus commit_tilt=%d holder_tilt=%d pi=%d sem_kick=%d\n",
           opt_r1_kick ? "on" : "off",
           (unsigned long long)skel->rodata->scx_wake_gran_ns / 1000,
           skel->rodata->scx_kick_budget_per_sec,
-          (unsigned long long)skel->rodata->scx_hog_slice_ns / 1000);
+          (unsigned long long)skel->rodata->scx_hog_slice_ns / 1000,
+          (int)skel->rodata->scx_enable_commit_tilt,
+          (int)skel->rodata->scx_enable_holder_tilt,
+          (int)skel->rodata->scx_enable_pi,
+          (int)skel->rodata->scx_enable_semantic_kick);
 
 #ifdef SCX_SKEL_HAS_STRUCT_OPS
   SCX_OPS_LOAD(skel, db_sched_ops, scx_db_sched, uei);
