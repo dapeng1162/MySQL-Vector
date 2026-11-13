@@ -86,3 +86,8 @@ IF(WITH_ROUTER)
     GROUP_READ WORLD_READ
     )
 ENDIF()
+
+# ---------------------------------------------------------------------------
+# DB-aware sched_ext scheduler (scx_db_sched).
+# ---------------------------------------------------------------------------
+ADD_SUBDIRECTORY(scx)

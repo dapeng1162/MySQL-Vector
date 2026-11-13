@@ -52,6 +52,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "srv0start.h"
 #include "sync0rw.h"
 #include "univ.i"
+#include "mysql_sched_tier.h" /* mysql_sched_set_thread_tier */
 #include "ut0byte.h"
 
 enum status_severity { STATUS_VERBOSE, STATUS_INFO, STATUS_ERR };
@@ -674,6 +675,10 @@ void buf_load_abort() { buf_load_abort_flag = true; }
 event and when waked up either performs a dump or load and sleeps
 again. */
 void buf_dump_thread() {
+  /* Buffer pool dump/load is offline housekeeping: background tier
+   * (no-op without the sched_ext scheduler). */
+  mysql_sched_set_thread_tier(MYSQL_SCHED_TIER_BG);
+
   ut_ad(!srv_read_only_mode);
 
   buf_dump_status(STATUS_VERBOSE, "Dumping of buffer pool not started");

@@ -42,6 +42,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "os0thread-create.h"
 #include "que0que.h"
 #include "row0mysql.h"
+#include "sched_ext_bridge.h"  // sched_ext::lock_wait_end
 #include "srv0mon.h"
 #include "srv0start.h"
 
@@ -440,6 +441,11 @@ void lock_reset_wait_and_release_thread_if_suspended(lock_t *lock) {
   out if wait_lock become nullptr only temporarily (for B-tree reorg) or
   permanently (due to lock_reset_wait_and_release_thread_if_suspended()) */
   lock->trx->lock.blocking_trx.store(nullptr);
+
+  /* The wait is over: clear the wait edge we published to the sched_ext
+   * scheduler in lock_create_wait_for_edge().  No-op unless
+   * WITH_SCX_SCHEDULER is ON and the scheduler is running. */
+  sched_ext::lock_wait_end(lock->trx->mysql_thd);
 
   /* We only release locks for which someone is waiting, and we posses a latch
   on the shard in which the lock is stored, and the trx which decided to wait

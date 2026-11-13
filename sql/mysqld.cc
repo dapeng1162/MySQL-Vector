@@ -803,6 +803,7 @@ MySQL clients support the protocol:
 #include "sql/conn_handler/connection_handler_manager.h"  // Connection_handler_manager
 #include "sql/conn_handler/socket_connection.h"  // stmt_info_new_packet
 #include "sql/current_thd.h"                     // current_thd
+#include "sql/sched_ext_bridge.h"                // sched_ext::init/connected/counters
 #include "sql/dd/cache/dictionary_client.h"
 #include "sql/debug_sync.h"  // debug_sync_end
 #include "sql/derror.h"
@@ -9845,6 +9846,12 @@ int mysqld_main(int argc, char **argv)
 
   if (init_server_components()) unireg_abort(MYSQLD_ABORT_EXIT);
 
+  /* Probe once whether a sched_ext scheduler is running with its maps
+   * pinned.  No-op when WITH_SCX_SCHEDULER is off or the scheduler is
+   * not running; when the probe fails the server runs exactly as a
+   * stock 9.7 server. */
+  sched_ext::init();
+
   if (!server_id_supplied)
     LogErr(INFORMATION_LEVEL, ER_WARN_NO_SERVERID_SPECIFIED);
 
@@ -11317,6 +11324,53 @@ static int show_num_thread_created(THD *, SHOW_VAR *var, char *buff) {
   return 0;
 }
 
+// -------------------------------------------------------------------
+// DB-aware sched_ext bridge observability (see sql/sched_ext_bridge.cc)
+// -------------------------------------------------------------------
+static int show_sched_ext_connected(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  /* 1 when the DB-aware sched_ext bridge probed live, pinned BPF maps at
+     startup (requires WITH_SCX_SCHEDULER and a running scx_db_sched);
+     0 otherwise — including every default build. */
+  *reinterpret_cast<long *>(buff) = sched_ext::connected() ? 1 : 0;
+  return 0;
+}
+
+static int show_coroutine_latch_wait_mutex(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      sched_ext::latch_wait_count(sched_ext::Latch_kind::Mutex));
+  return 0;
+}
+
+static int show_coroutine_latch_wait_mutex_edge(THD *, SHOW_VAR *var,
+                                                 char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      sched_ext::latch_wait_edge_count(sched_ext::Latch_kind::Mutex));
+  return 0;
+}
+
+static int show_coroutine_latch_wait_rw(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      sched_ext::latch_wait_count(sched_ext::Latch_kind::RwLock));
+  return 0;
+}
+
+static int show_coroutine_latch_wait_rw_edge(THD *, SHOW_VAR *var,
+                                              char *buff) {
+  var->type = SHOW_LONG;
+  var->value = buff;
+  *reinterpret_cast<long *>(buff) = static_cast<long>(
+      sched_ext::latch_wait_edge_count(sched_ext::Latch_kind::RwLock));
+  return 0;
+}
+
 static int show_thread_id_count(THD *, SHOW_VAR *var, char *buff) {
   var->type = SHOW_LONG;
   var->value = buff;
@@ -12045,6 +12099,18 @@ SHOW_VAR status_vars[] = {
     {"Threads_connected", (char *)&Connection_handler_manager::connection_count,
      SHOW_INT, SHOW_SCOPE_GLOBAL},
     {"Threads_created", (char *)&show_num_thread_created, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Sched_ext_connected", (char *)&show_sched_ext_connected, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_latch_wait_mutex", (char *)&show_coroutine_latch_wait_mutex,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Coroutine_latch_wait_mutex_edge",
+     (char *)&show_coroutine_latch_wait_mutex_edge, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Coroutine_latch_wait_rw", (char *)&show_coroutine_latch_wait_rw,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Coroutine_latch_wait_rw_edge",
+     (char *)&show_coroutine_latch_wait_rw_edge, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
     {"Threads_running", (char *)&show_num_thread_running, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},

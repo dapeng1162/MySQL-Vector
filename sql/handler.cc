@@ -113,6 +113,7 @@
 #include "sql/sql_base.h"  // free_io_cache
 #include "sql/sql_bitmap.h"
 #include "sql/sql_class.h"
+#include "sql/sched_ext_bridge.h"
 #include "sql/sql_error.h"
 #include "sql/sql_lex.h"
 #include "sql/sql_parse.h"   // check_stack_overrun
@@ -1686,6 +1687,11 @@ std::pair<int, bool> commit_owned_gtids(THD *thd, bool all) {
 int ha_commit_trans(THD *thd, bool all, bool ignore_global_read_lock) {
   int error = 0;
   THD_STAGE_INFO(thd, stage_waiting_for_handler_commit);
+#ifdef HAVE_SCX_SCHEDULER
+  /* Mark this thread as inside COMMIT so the DB-aware scheduler can
+   * dispatch it as a commit-VIP task. */
+  sched_ext::commit_begin();
+#endif
   bool run_slave_post_commit = false;
   bool need_clear_owned_gtid = false;
   /*
@@ -1933,6 +1939,9 @@ end:
     });
   }
 
+#ifdef HAVE_SCX_SCHEDULER
+  sched_ext::commit_end();
+#endif
   return error;
 }
 
@@ -2124,6 +2133,11 @@ int ha_rollback_trans(THD *thd, bool all) {
   Transaction_ctx *trn_ctx = thd->get_transaction();
   const bool is_xa_rollback =
       trn_ctx->xid_state()->has_state(XID_STATE::XA_PREPARED);
+#ifdef HAVE_SCX_SCHEDULER
+  /* Mark this thread as inside ROLLBACK so the DB-aware scheduler can
+   * dispatch it as a commit-VIP task. */
+  sched_ext::commit_begin();
+#endif
 
   /*
     "real" is a nick name for a transaction for which a commit will
@@ -2203,6 +2217,9 @@ int ha_rollback_trans(THD *thd, bool all) {
       !thd->slave_thread && thd->killed != THD::KILL_CONNECTION)
     trn_ctx->push_unsafe_rollback_warnings(thd);
 
+#ifdef HAVE_SCX_SCHEDULER
+  sched_ext::commit_end();
+#endif
   return error;
 }
 

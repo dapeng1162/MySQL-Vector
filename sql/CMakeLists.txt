@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2006, 2026, Oracle and/or its affiliates.
+# Copyright (c) 2006, 2026, Oracle and/or its affiliates.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0,
@@ -787,6 +787,12 @@ ELSEIF(WIN32)
     resourcegroups/platform/thread_attrs_api_win.cc)
 ENDIF()
 
+# DB-aware sched_ext bridge. The THD-level lock-wait graph half is ALWAYS
+# compiled (pure userspace state, no libbpf dependency); the BPF map
+# publication half is only active when WITH_SCX_SCHEDULER=ON (see the
+# #ifdef HAVE_SCX_SCHEDULER blocks in sql/sched_ext_bridge.cc).
+LIST(APPEND SQL_SHARED_SOURCES sched_ext_bridge.cc)
+
 SET(SQL_SOURCE
   ${GEN_SOURCES}
   ${GEN_DIGEST_SOURCES}
@@ -963,6 +969,19 @@ ELSEIF(WITH_SHOW_PARSE_TREE_DEFAULT STREQUAL "default")
 ENDIF()
 
 TARGET_LINK_LIBRARIES(sql_main extra::unordered_dense)
+
+# ---------------------------------------------------------------------------
+# DB-aware sched_ext scheduler bridge (WITH_SCX_SCHEDULER=ON).
+# When enabled, the bridge (sql/sched_ext_bridge.cc) uses libbpf to talk to
+# the scx_db_sched BPF scheduler (support-files/scx/).  Default is OFF —
+# the bridge then compiles to static no-ops and mysqld has zero libbpf
+# dependency.
+# ---------------------------------------------------------------------------
+IF(WITH_SCX_SCHEDULER)
+  TARGET_COMPILE_DEFINITIONS(sql_main PRIVATE HAVE_SCX_SCHEDULER)
+  TARGET_LINK_LIBRARIES(sql_main bpf)
+  MESSAGE(STATUS "WITH_SCX_SCHEDULER=ON: DB-aware sched_ext bridge enabled")
+ENDIF()
 
 TARGET_LINK_LIBRARIES(sql_main ${MYSQLD_STATIC_PLUGIN_LIBS}
   mysql_server_component_services mysys library_mysys strings vio

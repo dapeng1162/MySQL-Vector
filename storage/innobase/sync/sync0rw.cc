@@ -47,6 +47,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "mem0mem.h"
 #include "os0event.h"
 #include "os0thread.h"
+#include "sql/sched_ext_bridge.h"  // latch wait-edge publication
 #include "srv0mon.h"
 #include "srv0srv.h"
 #include "sync0debug.h"
@@ -251,6 +252,30 @@ void rw_lock_free_func(rw_lock_t *lock) /*!< in/out: rw-lock */
   lock->~rw_lock_t();
 }
 
+/* ---------------------------------------------------------------- */
+/* DB-aware scheduler latch wait edges: rw-lock waiters publish the */
+/* latch holder to the sched_ext bridge around their sync-array OS  */
+/* waits, mirroring the InnoDB mutex path in ib0mutex.h.            */
+/* ---------------------------------------------------------------- */
+
+/**
+   Resolve the current X/SX holder of a rw-lock for wait-edge
+   publication, or the invalid thread id when the holder cannot be
+   identified.
+
+   writer_thread is only guaranteed non-stale while the recursive flag
+   is set (see rw_lock_t).  For pass != 0 (async IO passed latches) the
+   flag stays cleared and the id may be stale: such waits are published
+   without an edge.  The value is inherently racy (the holder may
+   release right after this read) — the bridge tolerates this because
+   an edge lives only until the waiter's latch_wait_end(). */
+static std::thread::id rw_lock_sched_holder(const rw_lock_t *lock) {
+  if (!lock->recursive.load(std::memory_order_acquire)) {
+    return std::thread::id{};
+  }
+  return lock->writer_thread.load(std::memory_order_relaxed);
+}
+
 rw_lock_t::~rw_lock_t() {
   os_rmb;
   ut_ad(rw_lock_validate(this));
@@ -337,7 +362,10 @@ lock_loop:
       DEBUG_SYNC_C("rw_s_lock_waiting");
     }
 #endif
+    sched_ext::latch_wait_begin(rw_lock_sched_holder(lock),
+                                sched_ext::Latch_kind::RwLock);
     sync_array_wait_event(sync_arr, cell);
+    sched_ext::latch_wait_end();
 
     i = 0;
 
@@ -409,7 +437,20 @@ static inline void rw_lock_x_lock_wait_func(rw_lock_t *lock,
       ut_d(rw_lock_add_debug_info(lock, pass, RW_LOCK_X_WAIT,
                                   {file_name, line}));
 
+      /* Waiting for readers to drain: readers == threshold - lock_word.
+      If exactly one reader remains we can recover its thread id from
+      the XOR accumulator and publish an edge to it; with multiple
+      readers there is no single holder to boost.  Racy by nature
+      (readers come and go): a stale recovered id is either not
+      resolvable by the bridge or lives only until our
+      latch_wait_end(). */
+      std::thread::id last_reader = std::thread::id{};
+      if (lock->lock_word == threshold - 1) {
+        last_reader = lock->reader_thread.recover_if_single();
+      }
+      sched_ext::latch_wait_begin(last_reader, sched_ext::Latch_kind::RwLock);
       sync_array_wait_event(sync_arr, cell);
+      sched_ext::latch_wait_end();
 
       ut_d(rw_lock_remove_debug_info(lock, pass, RW_LOCK_X_WAIT));
 
@@ -633,7 +674,10 @@ lock_loop:
 
   ++count_os_wait;
 
+  sched_ext::latch_wait_begin(rw_lock_sched_holder(lock),
+                              sched_ext::Latch_kind::RwLock);
   sync_array_wait_event(sync_arr, cell);
+  sched_ext::latch_wait_end();
 
   i = 0;
 
@@ -698,7 +742,10 @@ lock_loop:
 
   ++count_os_wait;
 
+  sched_ext::latch_wait_begin(rw_lock_sched_holder(lock),
+                              sched_ext::Latch_kind::RwLock);
   sync_array_wait_event(sync_arr, cell);
+  sched_ext::latch_wait_end();
 
   i = 0;
 

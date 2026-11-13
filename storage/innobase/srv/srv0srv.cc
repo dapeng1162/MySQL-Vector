@@ -86,6 +86,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "my_dbug.h"
 #include "my_psi_config.h"
 #include "mysql/components/library_mysys/my_system.h" /* my_num_vcpus */
+#include "mysql_sched_tier.h" /* mysql_sched_set_thread_tier */
 
 #endif /* !UNIV_HOTBACKUP */
 #include "srv0srv.h"
@@ -1759,6 +1760,11 @@ void srv_export_innodb_status(void) {
 
 /** A thread which prints the info output by various InnoDB monitors. */
 void srv_monitor_thread() {
+  /* Diagnostic monitor: pure background work, must never compete with
+   * foreground query threads for CPU (tier BG in the sched_ext scheduler;
+   * no-op otherwise). */
+  mysql_sched_set_thread_tier(MYSQL_SCHED_TIER_BG);
+
   uint16_t mutex_skipped{0};
   bool last_srv_print_monitor = srv_print_innodb_monitor;
 
@@ -1819,6 +1825,10 @@ void srv_monitor_thread() {
 /** A thread which prints warnings about semaphore waits which have lasted
 too long. These can be used to track bugs which cause hangs. */
 void srv_error_monitor_thread() {
+  /* Diagnostic monitor: pure background work (tier BG, no-op without
+   * the sched_ext scheduler). */
+  mysql_sched_set_thread_tier(MYSQL_SCHED_TIER_BG);
+
   /* number of successive fatal timeouts observed */
   ulint fatal_cnt = 0;
   lsn_t old_lsn;
@@ -2690,6 +2700,11 @@ static void srv_master_shutdown_loop() {
 void srv_master_thread() {
   DBUG_TRACE;
 
+  /* Mostly-idle housekeeping thread: background tier so it never
+   * preempts foreground work when it does run (no-op without the
+   * sched_ext scheduler). */
+  mysql_sched_set_thread_tier(MYSQL_SCHED_TIER_BG);
+
   srv_slot_t *slot;
 
   THD *thd = create_internal_thd();
@@ -2787,6 +2802,11 @@ static bool srv_task_execute(void) {
 
 /** Worker thread that reads tasks from the work queue and executes them. */
 void srv_worker_thread() {
+  /* Purge worker: background work, idle-capacity-only (tier BG; the
+   * scheduler's starvation floor bounds the worst-case dispatch delay,
+   * and history-list growth is monitored in the benchmarks). */
+  mysql_sched_set_thread_tier(MYSQL_SCHED_TIER_BG);
+
   srv_slot_t *slot;
 
   ut_ad(!srv_read_only_mode);
@@ -3030,6 +3050,11 @@ static void srv_purge_coordinator_suspend(
 
 /** Purge coordinator thread that schedules the purge tasks. */
 void srv_purge_coordinator_thread() {
+  /* Purge coordinator: background work, idle-capacity-only (tier BG;
+   * starvation-floored by the scheduler, history list monitored in the
+   * benchmarks). */
+  mysql_sched_set_thread_tier(MYSQL_SCHED_TIER_BG);
+
   srv_slot_t *slot;
 
   THD *thd = create_internal_thd();

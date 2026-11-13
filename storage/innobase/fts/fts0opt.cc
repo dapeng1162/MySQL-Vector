@@ -46,6 +46,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "fts0priv.h"
 #include "fts0types.h"
 #include "ha_prototypes.h"
+#include "mysql_sched_tier.h" /* mysql_sched_set_thread_tier */
 #include "os0thread-create.h"
 #include "que0types.h"
 #include "row0sel.h"
@@ -2870,6 +2871,11 @@ void fts_optimize_sync_table(table_id_t table_id) {
 
 /** Optimize all FTS tables. */
 static void fts_optimize_thread(ib_wqueue_t *wq) {
+  /* FTS index optimization is background work: background tier so it
+   * never delays foreground queries (no-op without the sched_ext
+   * scheduler). */
+  mysql_sched_set_thread_tier(MYSQL_SCHED_TIER_BG);
+
   mem_heap_t *heap;
   ib_vector_t *tables;
   ib_alloc_t *heap_alloc;
