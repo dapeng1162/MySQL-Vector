@@ -93,9 +93,9 @@ v6.4（coroutine-dev2 全局 DSQ + 100µs kick + 语义全家桶）rw t256
 
 ### L2 语义 kick（预算制，按需）
 
-只有当**池首任务被 CPU-bound 任务（hog/BG）阻挡**时才发 kick：
-语义知识把 IPI 花在最值的地方。粒度过滤（默认 1ms，可调 100µs）
-+ 每 CPU token bucket（默认 2048/s）。无唤醒/无阻挡不 kick。
+目标是只在**池首任务被 CPU-bound 任务（hog/BG）阻挡**时发 kick，
+配合粒度过滤和每 CPU token bucket（默认 2048/s）。当前代码只实现了
+tilted + WAKEUP + budget 的语义 kick，尚未实现完整阻挡判据，见第 8 节。
 
 ### 埋点成本控制
 
@@ -119,26 +119,58 @@ rw t8-2048 曲线、TPC-C、点查开环 rate ladder、N1（base/noise ×
 10k/50k）、N2（solo/mixed + BG 完成数）、N3（锁争用/HTAP 场景按
 论文矩阵补）。每档同日对照 V97 重测（日内漂移 ±4%）。
 
-## 6. 与旧路线的差异（为什么这次能成）
+## 6. 与旧路线的差异（设计与证据边界）
 
-1. **没有 coroutine 架构税**：不背 reactor/协程的额外切换与解析开销；
+1. **没有 coroutine 架构税**：不引入 reactor/协程的额外切换与解析路径；
    one-thread-per-connection + 调度器是最小变量。
 2. **kick 从本能变成预算**：默认关，只在语义判据成立时花 IPI。
-3. **cap 是真 cap**：死代码已修，hog 的加塞等待有界。
-4. **语义只买三种东西**：commit 早完成、锁早放行、latch 早离场——
-   都是"缩短关键路径"的通用优化，不需要业务标注。
-5. **每步可回退**：全部机制独立开关 + 独立计数器；任何机制连续
-   两个验收周期无正收益即删除。
+3. **cap 是真 cap**：off-CPU decay 修复后，hog 的加塞等待才受时间片约束。
+4. **语义只考虑三种关键路径**：commit、事务锁、latch；不引入业务优先级。
+5. **每步可回退**：机制有独立开关与计数器，但默认关闭不等于已经验证。
 
-## 7. 风险与开放项
+## 7. 已测结果（2026-11-13，HEAD 56c465014）
 
-1. scx 底座残余 ~6%（R0 vs C5n）来自 BPF 每次 enqueue/dispatch 固定
-   开销与 wake_affine 缺失；smart_sched 的 L0 先测同样的底座（无
-   coroutine 干扰后数字应更干净）。
-2. N1@50k / N2 的 CFS 原地抢占优势仍是最大结构差距；S4 的语义 kick
-   若不能覆盖，考虑条件式 attach（平时 CFS，威胁时 scx）。
-3. tid 复用与 gate stale：bridge disable() 清扫 + TTL 兜底，需
-   bpftrace 验证 task_account 命中率（v6.4 的 117ms 尾部疑似相关）。
-4. 9.7 的 InnoDB latch 等待边 peek_owner() 的持有者可解析率
-   （latch_wait_edge/wait 比率）影响 L1 latch 倾斜的覆盖面，首轮
-   计数器必须核验。
+16c DB + 8c loadgen，32 表 × 100k，redo 4G，文本协议；rw 和 TPC-C 都
+使用同日交错复测，不采用早期漂移数据。
+
+| 配置 | rw64 TPS（两轮均值） | TPC-C raw TpmC（两轮均值） |
+|---|---:|---:|
+| V97 | 11,610 | 151,309 |
+| S0（无 loader） | 11,632（+0.2%） | — |
+| R0（L0，无 kick） | 10,686（**-8.0%**） | 154,378（**+2.0%**） |
+
+因此：**S0 零成本通过，TPC-C 初步收益成立，但 S1 的 sysbench rw ≥-2%
+验收门未通过。** TPC-C 的 Payment 响应时间分布报告 `[NG]`，raw TpmC
+不是完整 TPC-C 合规成绩。
+
+以下 rw64 实验均未改善，已经否决或恢复：
+
+| 实验 | TPS | 处理 |
+|---|---:|---|
+| 原 R0 | 10,686 | 保留基线 |
+| `--slice-shift=1` | 10,296 | 否决 |
+| `--wake-affine` | 10,318 | 否决 |
+| R1（gran 100µs、budget 2048） | 10,136 | 否决 |
+| 同 CPU local DSQ + PREEMPT | 9,407（40s） | 恢复实验代码 |
+| 队首候选 + 实际运行 ≥1ms 后 kick | 9,843（40s） | 恢复实验代码 |
+
+点查在 50k/200k 开环档均跟上目标速率；200k 时两边 p95 均 0.14ms，
+但 R0 avg/max 为 0.11/2.46ms，V97 为 0.10/1.40ms，尾部信号不能忽略。
+完整 rate ladder、N1/N2/N4 与语义层收益以测试结果汇总为准，不在此预写结论。
+
+## 8. 风险与开放项
+
+1. BPF ops 合计约 1.75% CPU、bridge 差值约 0.7%，不足以解释 rw 的全部
+   8% 回退；唤醒等待是假设，不是已经定位的唯一根因。
+2. CFS 原地唤醒抢占仍是主要结构差异。条件式 attach（干净负载 CFS、
+   检测威胁后联合调度）只是候选架构，尚未实现，不可当作现成功能。
+3. **语义 PI 尚非完整多级继承**：当前只发布直接 waiter→holder floor；
+   `depth` 字段没有实现多级递推。borrow/repay 仍需长窗口公平性验收。
+4. 当前 S4 的实际条件是 tilted + WAKEUP + IPI budget，**并未实现**
+   “仅池首被 CPU-bound 任务阻挡”这一完整判据。设计目标与代码不得混称。
+5. 单线程连接在 SQL 解析前已经被 OS 唤醒；commit_begin 只覆盖提交窗口，
+   并不自动实现“COMMIT 请求入队前优先”。必须检查实际 tilt/kick 命中。
+6. latch wait 配对、多个 waiter 清理、THD 销毁后的边生命周期，以及正在
+   CPU 上运行的 holder 能否真正受益，都需要进一步代码审查与运行时验证。
+7. tid 复用与 gate stale 依赖 bridge disable 清扫 + TTL 兜底；需要继续
+   验证 map 命中与回收，避免错误倾斜和泄漏。
