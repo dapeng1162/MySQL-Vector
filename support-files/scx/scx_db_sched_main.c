@@ -59,6 +59,8 @@ static const char help_fmt[] =
 "                     on woken tasks (default 2500).\n"
 "  --slice-shift=N    Right-shift the adaptive slice ladder by N (0=default\n"
 "                     20/10/5/2.5ms, 1=10/5/2.5/1.25ms, ...).\n"
+"  --wake-affine      Place woken tasks on the waker's CPU (cache-hot\n"
+"                     handoff) when the waker's pool is not deeper.\n"
 "  --s2-commit        S2: bounded vtime tilt for COMMIT/ROLLBACK windows\n"
 "                     (borrow/repay accounting).\n"
 "  --s3-holder        S3: bounded vtime tilt for lock/latch holders with\n"
@@ -216,7 +218,7 @@ static const char *const stat_names[] = {
     "kicks_sent",     "kick_gran_skip", "kick_budget_skip",
     "dispatch_steals", "commit_tilt", "holder_tilt",
     "pi_publish",     "pi_apply",      "semantic_kicks",
-    "bg_tier",        NULL,            NULL,
+    "bg_tier",        "wake_affine",   NULL,
     NULL,
 };
 
@@ -260,6 +262,7 @@ int main(int argc, char **argv) {
   long opt_kick_budget = 0;
   long opt_hog_slice_us = 0;
   long opt_slice_shift = 0;
+  bool opt_wake_affine = false;
   bool opt_s2_commit = false;
   bool opt_s3_holder = false;
   bool opt_s3_no_pi = false;
@@ -274,6 +277,7 @@ int main(int argc, char **argv) {
       {"kick-budget", required_argument, NULL, 'b'},
       {"hog-slice-us", required_argument, NULL, 'S'},
       {"slice-shift", required_argument, NULL, 'X'},
+      {"wake-affine", no_argument, NULL, 'A'},
       {"s2-commit", no_argument, NULL, '2'},
       {"s3-holder", no_argument, NULL, '3'},
       {"s3-no-pi", no_argument, NULL, 'P'},
@@ -339,6 +343,9 @@ restart:
           return 1;
         }
         break;
+      case 'A':
+        opt_wake_affine = true;
+        break;
       case '2':
         opt_s2_commit = true;
         break;
@@ -367,6 +374,8 @@ restart:
   if (opt_hog_slice_us > 0)
     skel->rodata->scx_hog_slice_ns = (__u64)opt_hog_slice_us * 1000ULL;
   skel->rodata->scx_slice_shift = (__u32)opt_slice_shift;
+  if (opt_wake_affine)
+    skel->rodata->scx_enable_wake_affine = true;
   if (opt_s2_commit)
     skel->rodata->scx_enable_commit_tilt = true;
   if (opt_s3_holder)

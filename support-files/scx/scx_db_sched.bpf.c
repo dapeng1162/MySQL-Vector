@@ -79,6 +79,7 @@ const volatile u64 scx_wake_gran_ns = 1000 * 1000ULL; /* CFS-order granularity *
 const volatile u32 scx_kick_budget_per_sec = 2048;    /* IPI/s per target CPU */
 const volatile u64 scx_hog_slice_ns = 2500 * 1000ULL; /* 2.5ms default */
 const volatile u32 scx_slice_shift = 0; /* adaptive slice ladder >>N (0=default) */
+const volatile bool scx_enable_wake_affine = false; /* waker-CPU placement */
 /* L1 semantic tilts (acceptance-gated, all off by default). */
 const volatile bool scx_enable_commit_tilt = false;  /* S2 */
 const volatile bool scx_enable_holder_tilt = false;  /* S3 lock/latch */
@@ -385,6 +386,28 @@ s32 BPF_STRUCT_OPS(db_sched_select_cpu, struct task_struct *p,
                    s32 prev_cpu, u64 wake_flags)
 {
   bool is_idle = false;
+
+  /* Wake-affine placement: CFS's wake_affine puts the wakee on the
+   * WAKER's CPU (the waker just touched the wakee's lock/data, so the
+   * handoff is cache-hot).  scx_bpf_select_cpu_dfl only considers
+   * prev_cpu + idle CPUs and never the waker's CPU, which at DB wakeup
+   * rates means every handoff is cache-cold.  Guard with a shallow
+   * load-balance check: only move when the waker's pool is not deeper
+   * than prev_cpu's by more than one. */
+  if (scx_enable_wake_affine && (wake_flags & SCX_WAKE_TTWU)) {
+    s32 waker = bpf_get_smp_processor_id();
+
+    if (waker != prev_cpu &&
+        bpf_cpumask_test_cpu((u32)waker, p->cpus_ptr)) {
+      s32 wq = scx_bpf_dsq_nr_queued(CPU_DSQ_BASE + (u64)waker);
+      s32 pq = scx_bpf_dsq_nr_queued(CPU_DSQ_BASE + (u64)prev_cpu);
+
+      if (wq <= pq + 1) {
+        stat_inc(13);
+        return waker;
+      }
+    }
+  }
   return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 }
 
