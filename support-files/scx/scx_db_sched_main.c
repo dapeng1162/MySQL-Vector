@@ -27,7 +27,7 @@ static const char help_fmt[] =
 "Usage: %s [OPTIONS]\n"
 "\n"
 "  --semantic         Enable commit/holder semantic boosts (default off).\n"
-"  --hog-slice-us=N   Slice cap for CPU-bound tasks (default 2500).\n"
+"  --hog-slice-us=N   Slice cap for CPU-bound tasks (default 6000).\n"
 "  --stats            Print aggregated counters every 10s.\n"
 "  --dump             Dump the DB-aware maps after attaching.\n"
 "  -v                 Print libbpf debug messages.\n"
@@ -125,6 +125,19 @@ static int pin_maps(struct scx_db_sched *skel) {
     fprintf(stderr, "Failed to pin wait_edges: %s\n", strerror(errno));
     return -1;
   }
+
+  /* Pin the accounting maps too: they carry per-task vruntime/debt state and
+     are the primary forensic evidence when a stall is reported, and bpftool
+     cannot reliably locate unpinned maps by name on a busy system. */
+  snprintf(path, sizeof(path), SCX_MAP_PIN_PREFIX "task_account_map");
+  unlink(path);
+  if (bpf_map__pin(skel->maps.task_account_map, path) != 0)
+    fprintf(stderr, "Failed to pin task_account_map: %s\n", strerror(errno));
+
+  snprintf(path, sizeof(path), SCX_MAP_PIN_PREFIX "vtime_cpu");
+  unlink(path);
+  if (bpf_map__pin(skel->maps.vtime_cpu, path) != 0)
+    fprintf(stderr, "Failed to pin vtime_cpu: %s\n", strerror(errno));
 
   fprintf(stderr, "scx_db_sched: maps pinned under %s\n", SCX_MAP_DIR);
   return 0;
