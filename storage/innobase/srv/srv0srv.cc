@@ -86,7 +86,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "my_dbug.h"
 #include "my_psi_config.h"
 #include "mysql/components/library_mysys/my_system.h" /* my_num_vcpus */
-#include "mysql_sched_tier.h" /* mysql_sched_set_thread_tier */
+#include "mysql_sched.h" /* mysql_sched_register_thread */
 
 #endif /* !UNIV_HOTBACKUP */
 #include "srv0srv.h"
@@ -1763,7 +1763,7 @@ void srv_monitor_thread() {
   /* Diagnostic monitor: pure background work, must never compete with
    * foreground query threads for CPU (tier BG in the sched_ext scheduler;
    * no-op otherwise). */
-  mysql_sched_set_thread_tier(MYSQL_SCHED_TIER_BG);
+  mysql_sched_register_thread();
 
   uint16_t mutex_skipped{0};
   bool last_srv_print_monitor = srv_print_innodb_monitor;
@@ -1827,7 +1827,7 @@ too long. These can be used to track bugs which cause hangs. */
 void srv_error_monitor_thread() {
   /* Diagnostic monitor: pure background work (tier BG, no-op without
    * the sched_ext scheduler). */
-  mysql_sched_set_thread_tier(MYSQL_SCHED_TIER_BG);
+  mysql_sched_register_thread();
 
   /* number of successive fatal timeouts observed */
   ulint fatal_cnt = 0;
@@ -2703,7 +2703,7 @@ void srv_master_thread() {
   /* Mostly-idle housekeeping thread: background tier so it never
    * preempts foreground work when it does run (no-op without the
    * sched_ext scheduler). */
-  mysql_sched_set_thread_tier(MYSQL_SCHED_TIER_BG);
+  mysql_sched_register_thread();
 
   srv_slot_t *slot;
 
@@ -2805,7 +2805,7 @@ void srv_worker_thread() {
   /* Purge worker: background work, idle-capacity-only (tier BG; the
    * scheduler's starvation floor bounds the worst-case dispatch delay,
    * and history-list growth is monitored in the benchmarks). */
-  mysql_sched_set_thread_tier(MYSQL_SCHED_TIER_BG);
+  mysql_sched_register_thread();
 
   srv_slot_t *slot;
 
@@ -3053,7 +3053,7 @@ void srv_purge_coordinator_thread() {
   /* Purge coordinator: background work, idle-capacity-only (tier BG;
    * starvation-floored by the scheduler, history list monitored in the
    * benchmarks). */
-  mysql_sched_set_thread_tier(MYSQL_SCHED_TIER_BG);
+  mysql_sched_register_thread();
 
   srv_slot_t *slot;
 

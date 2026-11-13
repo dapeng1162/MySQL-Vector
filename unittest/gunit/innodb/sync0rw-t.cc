@@ -266,6 +266,7 @@ compiled, no sched_ext scheduler required), the per-family counters
 must have advanced, and after the holders release, the mirror must be
 empty again (wait ends are paired with waits). */
 TEST(sync0rw, rw_lock_latch_wait_edges) {
+  sched_ext::set_testing_mode(true);
   os_event_global_init();
   /* Enough sync-array slots for the five concurrent waiters below (the
   existing test above uses 4 slots for three waiters). */
@@ -404,6 +405,88 @@ TEST(sync0rw, rw_lock_latch_wait_edges) {
 
   sync_check_close();
   os_event_global_destroy();
+}
+
+/* Tests the THD-level transaction-lock mirror of the sched_ext bridge
+(lock0wait.cc publishes waiter/holder pairs from lock_wait_suspend_thread).
+The mirror treats THDs as opaque keys; the tid-level BPF half is gated on
+an attached scheduler and never runs in unit tests.
+
+Covered shapes:
+- one holder with two waiters, ended out of order;
+- a latch wait coexisting with lock waits (independent mirrors);
+- unpaired ends and ends of unknown waiters are no-ops;
+- forget_thd() for a waiter destroyed while still waiting releases its
+  hold on the holder, and forget_thd() of the holder drops its
+  bookkeeping without corrupting remaining waiter entries. */
+TEST(sync0rw, sched_ext_lock_wait_mirror) {
+  sched_ext::set_testing_mode(true);
+
+  char fake_thd[4][64];
+  THD *const holder = reinterpret_cast<THD *>(fake_thd[0]);
+  THD *const waiter_a = reinterpret_cast<THD *>(fake_thd[1]);
+  THD *const waiter_b = reinterpret_cast<THD *>(fake_thd[2]);
+  THD *const stranger = reinterpret_cast<THD *>(fake_thd[3]);
+
+  EXPECT_FALSE(sched_ext::any_lock_waits());
+  EXPECT_FALSE(sched_ext::is_lock_holder(holder));
+
+  /* Null arguments are no-ops. */
+  sched_ext::lock_wait_begin(nullptr, holder);
+  sched_ext::lock_wait_begin(waiter_a, nullptr);
+  sched_ext::lock_wait_end(nullptr);
+  sched_ext::forget_thd(nullptr);
+  EXPECT_FALSE(sched_ext::any_lock_waits());
+
+  /* One holder, two waiters. */
+  sched_ext::lock_wait_begin(waiter_a, holder);
+  sched_ext::lock_wait_begin(waiter_b, holder);
+  EXPECT_TRUE(sched_ext::any_lock_waits());
+  EXPECT_TRUE(sched_ext::is_lock_holder(holder));
+  EXPECT_FALSE(sched_ext::is_lock_holder(waiter_a));
+
+  /* A latch wait coexists with the lock waits in a separate mirror. */
+  const std::thread::id self = std::this_thread::get_id();
+  EXPECT_TRUE(sched_ext::latch_wait_begin(self, sched_ext::Latch_kind::Mutex));
+  EXPECT_EQ(sched_ext::latch_wait_holder(self), self);
+  sched_ext::latch_wait_end();
+  EXPECT_EQ(sched_ext::latch_wait_holder(self), std::thread::id{});
+  /* The latch round-trip must not have touched the lock mirror. */
+  EXPECT_TRUE(sched_ext::any_lock_waits());
+  EXPECT_TRUE(sched_ext::is_lock_holder(holder));
+
+  /* Waiters end out of order; the holder stays a holder until the last
+  end.  Unpaired ends and ends of unknown waiters are no-ops. */
+  sched_ext::lock_wait_end(waiter_b);
+  EXPECT_TRUE(sched_ext::any_lock_waits());
+  EXPECT_TRUE(sched_ext::is_lock_holder(holder));
+  sched_ext::lock_wait_end(waiter_b);
+  sched_ext::lock_wait_end(stranger);
+  EXPECT_TRUE(sched_ext::is_lock_holder(holder));
+
+  sched_ext::lock_wait_end(waiter_a);
+  EXPECT_FALSE(sched_ext::any_lock_waits());
+  EXPECT_FALSE(sched_ext::is_lock_holder(holder));
+
+  /* Waiters destroyed while still waiting: forget_thd() must release
+  their hold on the holder. */
+  sched_ext::lock_wait_begin(waiter_a, holder);
+  sched_ext::lock_wait_begin(waiter_b, holder);
+  sched_ext::forget_thd(waiter_b);
+  EXPECT_TRUE(sched_ext::any_lock_waits());
+  EXPECT_TRUE(sched_ext::is_lock_holder(holder));
+  sched_ext::forget_thd(waiter_a);
+  EXPECT_FALSE(sched_ext::any_lock_waits());
+  EXPECT_FALSE(sched_ext::is_lock_holder(holder));
+
+  /* Forgetting the holder drops its bookkeeping; the waiter entry can
+  still be ended afterwards without corrupting state. */
+  sched_ext::lock_wait_begin(waiter_a, holder);
+  sched_ext::forget_thd(holder);
+  EXPECT_FALSE(sched_ext::is_lock_holder(holder));
+  sched_ext::lock_wait_end(waiter_a);
+  EXPECT_FALSE(sched_ext::any_lock_waits());
+  EXPECT_FALSE(sched_ext::is_lock_holder(holder));
 }
 
 }  // namespace innodb_sync0rw_unittest

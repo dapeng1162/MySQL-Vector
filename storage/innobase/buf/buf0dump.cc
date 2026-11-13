@@ -52,7 +52,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "srv0start.h"
 #include "sync0rw.h"
 #include "univ.i"
-#include "mysql_sched_tier.h" /* mysql_sched_set_thread_tier */
+#include "mysql_sched.h" /* mysql_sched_register_thread */
 #include "ut0byte.h"
 
 enum status_severity { STATUS_VERBOSE, STATUS_INFO, STATUS_ERR };
@@ -677,7 +677,7 @@ again. */
 void buf_dump_thread() {
   /* Buffer pool dump/load is offline housekeeping: background tier
    * (no-op without the sched_ext scheduler). */
-  mysql_sched_set_thread_tier(MYSQL_SCHED_TIER_BG);
+  mysql_sched_register_thread();
 
   ut_ad(!srv_read_only_mode);
 

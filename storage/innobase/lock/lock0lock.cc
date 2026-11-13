@@ -54,7 +54,6 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "pars0pars.h"
 #include "row0mysql.h"
 #include "row0sel.h"
-#include "sched_ext_bridge.h"  // sched_ext::lock_wait_begin
 #include "srv0mon.h"
 #include "trx0purge.h"
 #include "trx0sys.h"
@@ -1421,12 +1420,6 @@ static void lock_create_wait_for_edge(const lock_t *waiting_lock,
   slot.*/
   waiter->lock.blocking_trx.store(blocker);
   lock_report_wait_for_edge_to_server(waiting_lock, blocking_lock);
-
-  /* Publish the wait edge to the DB-aware sched_ext scheduler so it can
-   * boost the lock holder (anti-LHP) and inherit priority from the waiter.
-   * No-op unless WITH_SCX_SCHEDULER is ON and the scheduler is running. */
-  sched_ext::lock_wait_begin(waiting_lock->trx->mysql_thd,
-                             blocking_lock->trx->mysql_thd);
 }
 
 /**

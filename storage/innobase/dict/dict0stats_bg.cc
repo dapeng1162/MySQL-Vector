@@ -46,7 +46,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "row0mysql.h"
 #include "sql/histograms/histogram.h"
 #include "srv0start.h"
-#include "mysql_sched_tier.h" /* mysql_sched_set_thread_tier */
+#include "mysql_sched.h" /* mysql_sched_register_thread */
 #include "ut0new.h"
 
 /** Minimum time interval between stats recalc for a given table */
@@ -384,7 +384,7 @@ void dict_stats_thread() {
   /* Background statistics recalculation: background tier so large
    * table scans here cannot delay foreground queries (no-op without
    * the sched_ext scheduler). */
-  mysql_sched_set_thread_tier(MYSQL_SCHED_TIER_BG);
+  mysql_sched_register_thread();
 
   ut_a(!srv_read_only_mode);
   THD *thd = create_internal_thd();
