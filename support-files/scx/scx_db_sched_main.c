@@ -7,14 +7,17 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <libgen.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #include <bpf/bpf.h>
 #include <scx/common.h>
@@ -30,10 +33,19 @@ static const char help_fmt[] =
 "  --hog-slice-us=N   Slice cap for CPU-bound tasks (default 6000).\n"
 "  --lag-carry-us=N   Max vtime credit kept across a sleep (default 5000).\n"
 "  --no-kick          Disable deadline-ordered wakeup preemption.\n"
+"  --watchdog-cmd=CMD End-to-end liveness probe run via /bin/sh (e.g.\n"
+"                     \"mysql --socket=... -u root -e 'SELECT 1'\").\n"
+"  --watchdog-interval-sec=N   Probe every N seconds (watchdog on when a\n"
+"                     probe command is also given).\n"
+"  --watchdog-timeout-sec=N    Kill a probe after N seconds (default 5).\n"
+"  --watchdog-max-fail=N       Detach after N consecutive failures (default 2).\n"
 "  --stats            Print aggregated counters every 10s.\n"
 "  --dump             Dump the DB-aware maps after attaching.\n"
 "  -v                 Print libbpf debug messages.\n"
-"  -h                 Display this help and exit.\n";
+"  -h                 Display this help and exit.\n"
+"\n"
+"On watchdog trigger the scheduler detaches (kernel native EEVDF is\n"
+"restored for all tasks) and the loader exits with status 3.\n";
 
 static bool verbose;
 static bool dump_maps;
@@ -44,6 +56,88 @@ static volatile int exit_req = 0;
 #define SCX_MAP_PIN_PREFIX SCX_MAP_DIR "/"
 
 static void sigint_handler(int signo) { exit_req = 1; }
+
+/* ------------------------------------------------------------------ */
+/* Detach watchdog.                                                    */
+/*                                                                     */
+/* The GUARDED contract is: if scheduling quality collapses under the  */
+/* BPF scheduler, fall back to native EEVDF. Scheduler crashes already  */
+/* self-detach (UEI_EXITED tears down the link). The watchdog covers    */
+/* the silent wedge case (e.g. the lost-wakeup stall seen at 300k qps: */
+/* loader alive, counters frozen, connections stuck) with an            */
+/* end-to-end liveness probe the operator supplies: if it fails or      */
+/* hangs for K consecutive probes, the main loop destroys the link.    */
+/* ------------------------------------------------------------------ */
+
+static const char *wd_cmd;
+static int wd_interval_sec;
+static int wd_timeout_sec = 5;
+static int wd_max_fail = 2;
+static volatile int watchdog_detach_req = 0;
+
+/* Run wd_cmd through /bin/sh; return 0 iff it exits 0 within the
+   timeout, else nonzero. The probe child is killed and reaped either
+   way, so a hung probe cannot leak processes. */
+static int watchdog_probe_once(void) {
+  pid_t pid;
+  int status = 0;
+  int waited_ms = 0;
+
+  pid = fork();
+  if (pid < 0) return -1;
+  if (pid == 0) {
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+      dup2(devnull, STDOUT_FILENO);
+      dup2(devnull, STDERR_FILENO);
+    }
+    execl("/bin/sh", "sh", "-c", wd_cmd, (char *)NULL);
+    _exit(127);
+  }
+
+  while (waited_ms < wd_timeout_sec * 1000) {
+    pid_t r = waitpid(pid, &status, WNOHANG);
+    if (r == pid) return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+    if (r < 0 && errno != EINTR) return -1;
+    usleep(100 * 1000);
+    waited_ms += 100;
+  }
+  kill(pid, SIGKILL);
+  waitpid(pid, &status, 0);
+  return -1;
+}
+
+static void *watchdog_thread(void *unused) {
+  int fails = 0;
+  (void)unused;
+
+  while (!exit_req && !watchdog_detach_req) {
+    int i;
+    for (i = 0; i < wd_interval_sec && !exit_req && !watchdog_detach_req;
+         i++)
+      sleep(1);
+    if (exit_req || watchdog_detach_req) break;
+
+    if (watchdog_probe_once() != 0) {
+      fails++;
+      fprintf(stderr,
+             "scx_db_sched watchdog: probe failed or timed out (%d/%d)\n",
+             fails, wd_max_fail);
+      if (fails >= wd_max_fail) {
+        fprintf(stderr,
+                "scx_db_sched watchdog: %d consecutive probe failures — "
+                "requesting detach to native EEVDF\n",
+                fails);
+        watchdog_detach_req = 1;
+        break;
+      }
+    } else {
+      if (fails) fprintf(stderr, "scx_db_sched watchdog: probe recovered\n");
+      fails = 0;
+    }
+  }
+  return NULL;
+}
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format,
                            va_list args) {
@@ -187,6 +281,9 @@ int main(int argc, char **argv) {
   long opt_hog_slice_us = 0;
   long opt_lag_carry_us = 0;
   bool opt_no_kick = false;
+  long opt_wd_interval = 0;
+  long opt_wd_timeout = 5;
+  long opt_wd_max_fail = 2;
   static const struct option long_options[] = {
       {"dump", no_argument, NULL, 'd'},
       {"stats", no_argument, NULL, 's'},
@@ -196,6 +293,10 @@ int main(int argc, char **argv) {
       {"hog-slice-us", required_argument, NULL, 'H'},
       {"lag-carry-us", required_argument, NULL, 'L'},
       {"no-kick", no_argument, NULL, 'K'},
+      {"watchdog-cmd", required_argument, NULL, 'w'},
+      {"watchdog-interval-sec", required_argument, NULL, 'W'},
+      {"watchdog-timeout-sec", required_argument, NULL, 'T'},
+      {"watchdog-max-fail", required_argument, NULL, 'F'},
       {NULL, 0, NULL, 0},
   };
   int opt;
@@ -224,6 +325,18 @@ int main(int argc, char **argv) {
         break;
       case 'v':
         verbose = true;
+        break;
+      case 'w':
+        wd_cmd = optarg;
+        break;
+      case 'W':
+        opt_wd_interval = atol(optarg);
+        break;
+      case 'T':
+        opt_wd_timeout = atol(optarg);
+        break;
+      case 'F':
+        opt_wd_max_fail = atol(optarg);
         break;
       case 'S':
         opt_semantic = true;
@@ -281,26 +394,60 @@ int main(int argc, char **argv) {
   link = SCX_OPS_ATTACH(skel, db_sched_ops, scx_db_sched);
   fprintf(stderr, "scx_db_sched: attached as the system scheduler.\n");
 
+  if (wd_cmd) {
+    if (opt_wd_interval <= 0) {
+      fprintf(stderr,
+              "--watchdog-cmd given without a positive "
+              "--watchdog-interval-sec; watchdog disabled\n");
+    } else if (opt_wd_timeout <= 0 || opt_wd_max_fail <= 0) {
+      fprintf(stderr,
+              "--watchdog-timeout-sec and --watchdog-max-fail must be "
+              "positive; watchdog disabled\n");
+    } else {
+      pthread_t wd_tid;
+      wd_interval_sec = (int)opt_wd_interval;
+      wd_timeout_sec = (int)opt_wd_timeout;
+      wd_max_fail = (int)opt_wd_max_fail;
+      if (pthread_create(&wd_tid, NULL, watchdog_thread, NULL) == 0) {
+        fprintf(stderr,
+                "scx_db_sched watchdog: probe every %ds, timeout %ds, "
+                "detach after %d consecutive failures\n",
+                wd_interval_sec, wd_timeout_sec, wd_max_fail);
+      } else {
+        fprintf(stderr, "scx_db_sched watchdog: pthread_create failed (%s); "
+                        "continuing without watchdog\n",
+                strerror(errno));
+      }
+    }
+  }
+
   if (dump_maps) {
     dump_task_sem(skel->maps.task_sem);
     dump_wait_edges(skel->maps.wait_edges);
   }
 
-  while (!exit_req && !UEI_EXITED(skel, uei)) {
-    if (print_stats) {
-      sleep(10);
+  int tick = 0;
+  while (!exit_req && !watchdog_detach_req && !UEI_EXITED(skel, uei)) {
+    sleep(1);
+    if (++tick >= 10 && print_stats) {
+      tick = 0;
       print_stats_once(skel);
-    } else if (dump_maps) {
-      sleep(5);
+    } else if (tick >= 5 && dump_maps) {
+      tick = 0;
       dump_task_sem(skel->maps.task_sem);
       dump_wait_edges(skel->maps.wait_edges);
-    } else {
-      sleep(1);
     }
   }
 
   bpf_link__destroy(link);
   ecode = UEI_REPORT(skel, uei);
   scx_db_sched__destroy(skel);
-  return 0;
+
+  if (watchdog_detach_req) {
+    fprintf(stderr,
+            "scx_db_sched: watchdog detached the scheduler — native EEVDF "
+            "restored for all tasks.\n");
+    return 3;
+  }
+  return ecode == 0 ? 0 : (ecode < 256 ? (int)ecode : 1);
 }
