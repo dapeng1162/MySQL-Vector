@@ -10,8 +10,12 @@
  *   - canonical base_vruntime is kept in task_account and restored before
  *     each run, so temporary semantic bonuses never pollute long-term
  *     fairness;
+ *   - lag carry across sleep (clamped to scx_lag_carry_ns behind the CPU
+ *     floor) plus deadline-ordered wakeup preemption via SCX_KICK_PREEMPT,
+ *     mirroring the two mechanisms EEVDF uses to protect interactive
+ *     workloads from CPU hogs;
  *   - semantic boosts are repaid as bounded debt;
- *   - no wakeup kick by default.
+ *   - wakeup kick is on by default (ablation: --no-kick).
  */
 
 #include <scx/common.bpf.h>
@@ -22,7 +26,6 @@ UEI_DEFINE(uei);
 
 #define CPU_DSQ_BASE 0x1000
 #define MAX_CPUS 512
-#define MAX_LAG (100 * 1000 * 1000ULL)
 #define CPUBOUND_BUDGET_NS (20 * 1000 * 1000ULL)
 
 #define B_COMMIT_NS (1000 * 1000ULL)
@@ -32,6 +35,18 @@ UEI_DEFINE(uei);
 #define SEM_TTL_NS (5 * 1000 * 1000 * 1000ULL)
 
 const volatile bool scx_enable_semantic = false;
+/* Wakeup preemption: on SCX_ENQ_WAKEUP, kick the target CPU when the
+   waker's virtual deadline is earlier than the running task's. This is
+   the EEVDF wakeup-preemption equivalent; without it a 6ms hog slice
+   gates every foreground wakeup (N1 p99 7.2ms, N2 p99 123ms on
+   2026-11-13). Ablation: --no-kick. */
+const volatile bool scx_enable_kick = true;
+/* Lag carried across a sleep, in virtual time: a woken task's base is
+   never clamped further back than cv - lag_carry. This is the credit
+   that makes interactive threads preempt CPU hogs after they wake.
+   5ms default: ~one hog slice, so a sleeper can jump at most one slice
+   ahead and must then pay its vruntime back like everyone else. */
+const volatile u64 scx_lag_carry_ns = 5000 * 1000ULL;
 /* 6ms: measured on 16-core c8i (2026-11-13) — 2.5ms shredded busy
    connection threads in closed-loop OLTP (-3.6% rw64), while 20ms (cap
    disabled) recovered only the same amount; the remaining gap is the
@@ -94,6 +109,15 @@ struct {
   __type(value, u64);
 } vtime_cpu SEC(".maps");
 
+/* Order key of the task currently running on each CPU (0 = none). The
+   wakeup path compares against it to decide preemption. */
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, MAX_CPUS);
+  __type(key, u32);
+  __type(value, u64);
+} cpu_cur_order SEC(".maps");
+
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
   __uint(max_entries, 16);
@@ -133,6 +157,30 @@ static void cpu_vtime_advance(s32 cpu, u64 val) {
   v = bpf_map_lookup_elem(&vtime_cpu, &key);
   if (!v) return;
   if (time_before(*v, val)) *v = val;
+}
+
+static u64 cur_order_of(s32 cpu) {
+  u64 *v;
+  u32 key = (u32)cpu;
+  if (cpu < 0 || cpu >= MAX_CPUS) return 0;
+  v = bpf_map_lookup_elem(&cpu_cur_order, &key);
+  return v ? *v : 0;
+}
+
+static void cur_order_set(s32 cpu, u64 val) {
+  u64 *v;
+  u32 key = (u32)cpu;
+  if (cpu < 0 || cpu >= MAX_CPUS) return;
+  v = bpf_map_lookup_elem(&cpu_cur_order, &key);
+  if (v) *v = val;
+}
+
+/* Canonical order key used for wakeup-preemption comparisons: the
+   virtual deadline of the next likely slice. Transient semantic bonuses
+   are deliberately excluded — preemption must not be driven by them. */
+static u64 order_key(const struct task_account *st, u32 weight) {
+  u64 slice_v = SCX_SLICE_DFL * 100ULL / (weight ? weight : 100);
+  return st->base_vruntime + slice_v + st->debt;
 }
 
 static u32 weight_of(struct task_struct *p) {
@@ -213,13 +261,28 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags) {
      intervening run would make a semantic bonus permanent. */
   if (st && st->base_vruntime != 0) base = st->base_vruntime;
 
-  if (base + MAX_LAG < cv) base = cv - MAX_LAG;
+  /* Lag carry: keep the sleeper's credit, clamped to lag_carry behind
+     the CPU floor, so an interactive thread waking behind a CPU hog
+     still has an earlier virtual deadline. */
+  if (base + scx_lag_carry_ns < cv) base = cv - scx_lag_carry_ns;
 
   if (st) {
     st->base_vruntime = base;
     if (st->cpu_budget > CPUBOUND_BUDGET_NS && slice > scx_hog_slice_ns) {
       slice = scx_hog_slice_ns;
       stat_inc(6);
+    }
+  }
+
+  /* Wakeup preemption (EEVDF-style): if this is a real wakeup and the
+     woken task's virtual deadline beats what is running on the target
+     CPU, kick that CPU now. Re-enqueues from preemption or slice expiry
+     do not carry SCX_ENQ_WAKEUP and never kick, which bounds storms. */
+  if (scx_enable_kick && st && (enq_flags & SCX_ENQ_WAKEUP)) {
+    u64 cur = cur_order_of(cpu);
+    if (cur != 0 && order_key(st, weight_of(p)) < cur) {
+      scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+      stat_inc(9);
     }
   }
 
@@ -262,6 +325,7 @@ void BPF_STRUCT_OPS(db_sched_running, struct task_struct *p) {
   if (!st) return;
   p->scx.dsq_vtime = st->base_vruntime;
   cpu_vtime_advance(cpu, st->base_vruntime);
+  cur_order_set(cpu, order_key(st, weight_of(p)));
   st->start_ns = now;
   if (st->boost_pending) {
     st->boosted = true;
@@ -301,6 +365,7 @@ void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable) {
   st->last_stop_ns = now;
   st->start_ns = 0;
   p->scx.dsq_vtime = st->base_vruntime;
+  cur_order_set(scx_bpf_task_cpu(p), 0);
 }
 
 void BPF_STRUCT_OPS(db_sched_enable, struct task_struct *p) {

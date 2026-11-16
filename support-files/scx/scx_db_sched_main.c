@@ -28,6 +28,8 @@ static const char help_fmt[] =
 "\n"
 "  --semantic         Enable commit/holder semantic boosts (default off).\n"
 "  --hog-slice-us=N   Slice cap for CPU-bound tasks (default 6000).\n"
+"  --lag-carry-us=N   Max vtime credit kept across a sleep (default 5000).\n"
+"  --no-kick          Disable deadline-ordered wakeup preemption.\n"
 "  --stats            Print aggregated counters every 10s.\n"
 "  --dump             Dump the DB-aware maps after attaching.\n"
 "  -v                 Print libbpf debug messages.\n"
@@ -139,6 +141,11 @@ static int pin_maps(struct scx_db_sched *skel) {
   if (bpf_map__pin(skel->maps.vtime_cpu, path) != 0)
     fprintf(stderr, "Failed to pin vtime_cpu: %s\n", strerror(errno));
 
+  snprintf(path, sizeof(path), SCX_MAP_PIN_PREFIX "cpu_cur_order");
+  unlink(path);
+  if (bpf_map__pin(skel->maps.cpu_cur_order, path) != 0)
+    fprintf(stderr, "Failed to pin cpu_cur_order: %s\n", strerror(errno));
+
   fprintf(stderr, "scx_db_sched: maps pinned under %s\n", SCX_MAP_DIR);
   return 0;
 }
@@ -146,7 +153,7 @@ static int pin_maps(struct scx_db_sched *skel) {
 static const char *const stat_names[] = {
     "inserts",       "semantic_hits", "commit_boost",  "holder_boost",
     "boosted_runs",  "debt_repay",    "cpubound_cap",  "dispatch_steals",
-    "direct_idle",   NULL,
+    "direct_idle",   "wakeup_kicks",  NULL,
 };
 
 static void print_stats_once(struct scx_db_sched *skel) {
@@ -178,6 +185,8 @@ int main(int argc, char **argv) {
   struct bpf_link *link;
   bool opt_semantic = false;
   long opt_hog_slice_us = 0;
+  long opt_lag_carry_us = 0;
+  bool opt_no_kick = false;
   static const struct option long_options[] = {
       {"dump", no_argument, NULL, 'd'},
       {"stats", no_argument, NULL, 's'},
@@ -185,6 +194,8 @@ int main(int argc, char **argv) {
       {"help", no_argument, NULL, 'h'},
       {"semantic", no_argument, NULL, 'S'},
       {"hog-slice-us", required_argument, NULL, 'H'},
+      {"lag-carry-us", required_argument, NULL, 'L'},
+      {"no-kick", no_argument, NULL, 'K'},
       {NULL, 0, NULL, 0},
   };
   int opt;
@@ -224,6 +235,16 @@ int main(int argc, char **argv) {
           return 1;
         }
         break;
+      case 'L':
+        opt_lag_carry_us = atol(optarg);
+        if (opt_lag_carry_us < 0) {
+          fprintf(stderr, "--lag-carry-us must be >= 0\n");
+          return 1;
+        }
+        break;
+      case 'K':
+        opt_no_kick = true;
+        break;
       default:
         fprintf(stderr, help_fmt, basename(argv[0]));
         return opt != 'h';
@@ -233,11 +254,17 @@ int main(int argc, char **argv) {
   if (opt_semantic) skel->rodata->scx_enable_semantic = true;
   if (opt_hog_slice_us > 0)
     skel->rodata->scx_hog_slice_ns = (u64)opt_hog_slice_us * 1000ULL;
+  if (opt_lag_carry_us >= 0)
+    skel->rodata->scx_lag_carry_ns = (u64)opt_lag_carry_us * 1000ULL;
+  if (opt_no_kick) skel->rodata->scx_enable_kick = false;
 
   fprintf(stderr,
-          "scx_db_sched v2: semantic=%s hog_slice=%lluus\n",
+          "scx_db_sched v2: semantic=%s hog_slice=%lluus lag_carry=%lluus "
+          "kick=%s\n",
           opt_semantic ? "on" : "off",
-          (unsigned long long)skel->rodata->scx_hog_slice_ns / 1000);
+          (unsigned long long)skel->rodata->scx_hog_slice_ns / 1000,
+          (unsigned long long)skel->rodata->scx_lag_carry_ns / 1000,
+          opt_no_kick ? "off" : "on");
 
 #ifdef SCX_SKEL_HAS_STRUCT_OPS
   SCX_OPS_LOAD(skel, db_sched_ops, scx_db_sched, uei);
