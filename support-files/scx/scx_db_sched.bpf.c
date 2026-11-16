@@ -303,13 +303,16 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags) {
 void BPF_STRUCT_OPS(db_sched_dispatch, s32 cpu, struct task_struct *prev) {
   u32 i, nr = nr_cpu_dsqs;
 
-  if (scx_bpf_dsq_move_to_local(CPU_DSQ_BASE + (u64)cpu, 0)) return;
+  /* Single-argument form: the running kernel's kfunc (7.0.0-38) is
+     scx_bpf_dsq_move_to_local(u64 dsq_id); the enq_flags variant exists
+     only in newer trees' compat headers, and we never pass flags here. */
+  if (scx_bpf_dsq_move_to_local(CPU_DSQ_BASE + (u64)cpu)) return;
 
   for (i = 1; i < MAX_CPUS; i++) {
     s32 victim;
     if (i >= nr) break;
     victim = (s32)((cpu + i) % nr);
-    if (scx_bpf_dsq_move_to_local(CPU_DSQ_BASE + (u64)victim, 0)) {
+    if (scx_bpf_dsq_move_to_local(CPU_DSQ_BASE + (u64)victim)) {
       stat_inc(7);
       return;
     }
