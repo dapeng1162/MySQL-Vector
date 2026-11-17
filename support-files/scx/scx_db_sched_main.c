@@ -39,6 +39,8 @@ static const char help_fmt[] =
 "                     (default 1000).\n"
 "  --hog-streak=N     Consecutive full slices before hog classification\n"
 "                     (default 2, 0 disables).\n"
+"  --base-slice-us=N  Base slice for the queue-depth tiers; 0 = the\n"
+"                     kernel's SCX_SLICE_DFL (default 0).\n"
 "  --no-kick          Disable deadline-ordered wakeup preemption.\n"
 "  --no-kick-gate     Admit every eligible wakeup kick (skip the\n"
 "                     hog/half-slice victim gate).\n"
@@ -294,6 +296,7 @@ int main(int argc, char **argv) {
   bool opt_no_vlag = false;
   long opt_wakeup_gran_us = -1;  /* -1: not specified, keep BPF rodata default */
   long opt_hog_streak = -1;       /* -1: not specified */
+  long opt_base_slice_us = -1;    /* -1: not specified (0 keeps kernel DFL) */
   long opt_wd_interval = 0;
   long opt_wd_timeout = 5;
   long opt_wd_max_fail = 2;
@@ -310,6 +313,7 @@ int main(int argc, char **argv) {
     {"no-vlag", no_argument, NULL, 'V'},
     {"wakeup-gran-us", required_argument, NULL, 'A'},
     {"hog-streak", required_argument, NULL, 'B'},
+    {"base-slice-us", required_argument, NULL, 'O'},
       {"watchdog-cmd", required_argument, NULL, 'w'},
       {"watchdog-interval-sec", required_argument, NULL, 'W'},
       {"watchdog-timeout-sec", required_argument, NULL, 'T'},
@@ -395,6 +399,13 @@ int main(int argc, char **argv) {
           return 1;
         }
         break;
+      case 'O':
+        opt_base_slice_us = atol(optarg);
+        if (opt_base_slice_us < 0) {
+          fprintf(stderr, "--base-slice-us must be >= 0\n");
+          return 1;
+        }
+        break;
       default:
         fprintf(stderr, help_fmt, basename(argv[0]));
         return opt != 'h';
@@ -412,13 +423,15 @@ int main(int argc, char **argv) {
   if (opt_wakeup_gran_us >= 0)
     skel->rodata->scx_wakeup_gran_ns = (u64)opt_wakeup_gran_us * 1000ULL;
   if (opt_hog_streak >= 0) skel->rodata->scx_hog_streak_n = (u32)opt_hog_streak;
+  if (opt_base_slice_us >= 0)
+    skel->rodata->scx_base_slice_ns = (u64)opt_base_slice_us * 1000ULL;
 
   /* SCX_SLICE_DFL is resolved from the running kernel's BTF at open time
      (scx enums); read it back from the skeleton rodata — there is no
      userspace macro for it. */
   fprintf(stderr,
           "scx_db_sched v2: semantic=%s hog_slice=%lluus lag_carry=%lluus "
-          "kick=%s gate=%s vlag=%s gran=%lluus streak=%u "
+          "kick=%s gate=%s vlag=%s gran=%lluus streak=%u base_slice=%lluus "
           "slice_dfl=%lluus(kernel)\n",
           opt_semantic ? "on" : "off",
           (unsigned long long)skel->rodata->scx_hog_slice_ns / 1000,
@@ -428,8 +441,10 @@ int main(int argc, char **argv) {
           opt_no_vlag ? "off" : "on",
           (unsigned long long)skel->rodata->scx_wakeup_gran_ns / 1000,
           skel->rodata->scx_hog_streak_n,
+          (unsigned long long)(skel->rodata->scx_base_slice_ns
+                                    ? skel->rodata->scx_base_slice_ns
+                                    : skel->rodata->__SCX_SLICE_DFL) / 1000,
           (unsigned long long)skel->rodata->__SCX_SLICE_DFL / 1000);
-
 #ifdef SCX_SKEL_HAS_STRUCT_OPS
   SCX_OPS_LOAD(skel, db_sched_ops, scx_db_sched, uei);
 #else

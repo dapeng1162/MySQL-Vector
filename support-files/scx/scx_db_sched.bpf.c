@@ -74,6 +74,12 @@ const volatile u64 scx_wakeup_gran_ns = 1000 * 1000ULL;
    (~5M cpubound_cap events with only 8 true hogs in the N2 matrix).
    0 disables hog classification. */
 const volatile u32 scx_hog_streak_n = 2;
+/* Base slice for the fast_slice tiers; 0 = the kernel's SCX_SLICE_DFL
+   (20ms on 7.0). Native EEVDF turns over every ~0.75ms
+   (sysctl_sched_base_slice); our 2.5-20ms cadence left each blocked-on-
+   latch waker waiting up to a full slice for the victim, doubling tail
+   latency at deep queues (2026-11-17 rw t128 p95 28.9ms vs V97 14.6ms). */
+const volatile u64 scx_base_slice_ns = 0;
 /* Upper bound on the frozen vlag applied at wake, in virtual time.
    50ms comfortably covers real runnable-time unfairness while bounding
    placement against per-CPU cv floor skew. */
@@ -265,13 +271,18 @@ static bool is_hog(const struct task_account *st) {
   return scx_hog_streak_n && st->hog_streak >= scx_hog_streak_n;
 }
 
+static __always_inline u64 base_slice(void) {
+  return scx_base_slice_ns ? scx_base_slice_ns : SCX_SLICE_DFL;
+}
+
 static __always_inline u64 fast_slice(s32 cpu) {
   s32 nr = scx_bpf_dsq_nr_queued(CPU_DSQ_BASE + (u64)cpu);
+  u64 base = base_slice();
   if (nr < 0) nr = 0;
-  if (nr >= 8) return SCX_SLICE_DFL >> 3;
-  if (nr >= 4) return SCX_SLICE_DFL >> 2;
-  if (nr >= 2) return SCX_SLICE_DFL >> 1;
-  return SCX_SLICE_DFL;
+  if (nr >= 8) return base >> 3;
+  if (nr >= 4) return base >> 2;
+  if (nr >= 2) return base >> 1;
+  return base;
 }
 
 static u64 semantic_bonus(u32 tid, u64 now) {
