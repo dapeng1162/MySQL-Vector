@@ -76,10 +76,6 @@ const volatile u64 scx_wakeup_gran_ns = 1000 * 1000ULL;
    (~5M cpubound_cap events with only 8 true hogs in the N2 matrix).
    0 disables hog classification. */
 const volatile u32 scx_hog_streak_n = 2;
-/* A sleeper whose accumulated vtime gap exceeds this is considered
-   long-idle: its hog streak decays at wake (a batch task that starts
-   sleeping must not keep hog admission forever). */
-const volatile u64 scx_hog_reset_ns = 100 * 1000 * 1000ULL;
 /* Base slice for the fast_slice tiers; 0 = the kernel's SCX_SLICE_DFL
    (20ms on 7.0). Default 1000us, native EEVDF's ~0.75ms
    (sysctl_sched_base_slice) class: our 2.5-20ms cadence left each
@@ -127,7 +123,6 @@ struct task_account {
   bool boost_pending;
   bool boosted;
   bool vlag_valid;
-  bool last_full_run;
 };
 
 struct {
@@ -360,9 +355,6 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags) {
   if (st && st->base_vruntime != 0) base = st->base_vruntime;
 
   if (st && (enq_flags & SCX_ENQ_WAKEUP)) {
-    /* Long-idle decay of the hog streak (before the credit clamp
-       overwrites the pre-sleep base). */
-    if (cv > st->base_vruntime + scx_hog_reset_ns) st->hog_streak = 0;
     if (scx_frozen_vlag && st->vlag_valid) {
       /* Pure-EEVDF ablation: re-place at cv - frozen vlag only. */
       s64 lag = st->vlag_v;
@@ -464,12 +456,12 @@ void BPF_STRUCT_OPS(db_sched_running, struct task_struct *p) {
     u64 gate_ns = p->scx.slice / 2;
     if (scx_wakeup_gran_ns && gate_ns > scx_wakeup_gran_ns)
       gate_ns = scx_wakeup_gran_ns;
-    /* Victim admission: the running task's LAST completed run burned its
-       full slice (currently CPU-bound) or it is a streak-classified hog.
-       A kicked CPU hog's previous run always ended by slice expiry — the
-       flag cannot flicker from being preempted; an OLTP worker's last
-       run always ended by blocking — the flag is not sticky either. */
-    victim_set(cpu, st->last_full_run || is_hog(st), now + gate_ns);
+    /* Victim admission: streak-classified hogs only. Sustained non-blocking
+       burners (stress-ng, SHA2 loops) are preemptible immediately; bursty
+       background workers (purge) and OLTP workers reset their streak on
+       blocking and are protected from credit-armed wakers — matching
+       native EEVDF, which never wakeup-preempts a running CPU task. */
+    victim_set(cpu, is_hog(st), now + gate_ns);
   }
 }
 
@@ -505,17 +497,17 @@ void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable) {
     stat_inc(5);
   }
 
-  /* Streak hog classifier: a run that burned >= 90% of its granted slice
-     extends the streak; short runs (preemption or blocking) never reset
-     it — a hog preempted mid-slice by wakeup kicks kept losing its
-     verdict (N1 victim-gate flicker, p99 1.04ms on 2026-11-17). Stale
-     streaks decay at wake after a long idle gap (enqueue path). The cap
-     (6ms) is driven by the streak; the kick gate uses last_full_run. */
+  /* Streak hog classifier: full-slice runs extend the streak; a run that
+     ends by BLOCKING mid-slice resets it, a run ended by preemption does
+     not (a hog kicked at 0.3ms must not lose its verdict — N1 flicker,
+     2026-11-17). This separates pure-CPU loops (stress-ng; a 900ms
+     BENCHMARK burn never blocks) from bursty background workers (purge
+     blocks on latches mid-burst) and OLTP workers (block per query).
+     The streak drives both the 6ms cap and kick-gate admission. */
   if (st->granted_ns && rt >= st->granted_ns * 9 / 10) {
     st->hog_streak++;
-    st->last_full_run = true;
-  } else {
-    st->last_full_run = false;
+  } else if (!runnable) {
+    st->hog_streak = 0;
   }
 
   /* Freeze the runnable-time lag when the task sleeps (unfairness
