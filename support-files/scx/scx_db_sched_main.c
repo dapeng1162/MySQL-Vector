@@ -279,7 +279,7 @@ int main(int argc, char **argv) {
   struct bpf_link *link;
   bool opt_semantic = false;
   long opt_hog_slice_us = 0;
-  long opt_lag_carry_us = 0;
+  long opt_lag_carry_us = -1;  /* -1: not specified, keep BPF rodata default */
   bool opt_no_kick = false;
   long opt_wd_interval = 0;
   long opt_wd_timeout = 5;
