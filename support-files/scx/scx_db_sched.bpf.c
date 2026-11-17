@@ -247,10 +247,12 @@ static void victim_clear(s32 cpu) {
 }
 
 /* Canonical order key used for wakeup-preemption comparisons: the
-   virtual deadline of the next likely slice. Transient semantic bonuses
-   are deliberately excluded — preemption must not be driven by them. */
-static u64 order_key(const struct task_account *st, u32 weight) {
-  u64 slice_v = SCX_SLICE_DFL * 100ULL / (weight ? weight : 100);
+   virtual deadline of the next slice at the SAME slice scale the task
+   will actually be enqueued with (slice_ns is the fast_slice in effect).
+   Transient semantic bonuses are deliberately excluded — preemption
+   must not be driven by them. */
+static u64 order_key(const struct task_account *st, u32 weight, u64 slice_ns) {
+  u64 slice_v = slice_ns * 100 / (weight ? weight : 100);
   return st->base_vruntime + slice_v + st->debt;
 }
 
@@ -370,7 +372,7 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags) {
      do not carry SCX_ENQ_WAKEUP and never kick, which bounds storms. */
   if (scx_enable_kick && st && (enq_flags & SCX_ENQ_WAKEUP)) {
     u64 cur = cur_order_of(cpu);
-    if (cur != 0 && order_key(st, weight_of(p)) < cur) {
+    if (cur != 0 && order_key(st, weight_of(p), slice) < cur) {
       const struct cpu_victim *v = victim_of(cpu);
       bool admit = true;
       if (scx_kick_gate) {
@@ -428,7 +430,7 @@ void BPF_STRUCT_OPS(db_sched_running, struct task_struct *p) {
   if (!st) return;
   p->scx.dsq_vtime = st->base_vruntime;
   cpu_vtime_advance(cpu, st->base_vruntime);
-  cur_order_set(cpu, order_key(st, weight_of(p)));
+  cur_order_set(cpu, order_key(st, weight_of(p), p->scx.slice));
   st->start_ns = now;
   st->granted_ns = p->scx.slice;
   if (st->boost_pending) {
