@@ -32,6 +32,13 @@ static const char help_fmt[] =
 "  --semantic         Enable commit/holder semantic boosts (default off).\n"
 "  --hog-slice-us=N   Slice cap for CPU-bound tasks (default 6000).\n"
 "  --lag-carry-us=N   Max vtime credit kept across a sleep (default 50000).\n"
+"  --no-vlag          Legacy lag semantics: freeze vruntime across sleep\n"
+"                     with the lag-carry clamp instead of EEVDF vlag.\n"
+"  --wakeup-gran-us=N Wakeup-kick admission granularity vs non-hog\n"
+"                     victims: min(slice/2, N). 0 = pure half-slice\n"
+"                     (default 1000).\n"
+"  --hog-streak=N     Consecutive full slices before hog classification\n"
+"                     (default 2, 0 disables).\n"
 "  --no-kick          Disable deadline-ordered wakeup preemption.\n"
 "  --no-kick-gate     Admit every eligible wakeup kick (skip the\n"
 "                     hog/half-slice victim gate).\n"
@@ -284,6 +291,9 @@ int main(int argc, char **argv) {
   long opt_lag_carry_us = -1;  /* -1: not specified, keep BPF rodata default */
   bool opt_no_kick = false;
   bool opt_no_kick_gate = false;
+  bool opt_no_vlag = false;
+  long opt_wakeup_gran_us = -1;  /* -1: not specified, keep BPF rodata default */
+  long opt_hog_streak = -1;       /* -1: not specified */
   long opt_wd_interval = 0;
   long opt_wd_timeout = 5;
   long opt_wd_max_fail = 2;
@@ -297,6 +307,9 @@ int main(int argc, char **argv) {
       {"lag-carry-us", required_argument, NULL, 'L'},
       {"no-kick", no_argument, NULL, 'K'},
     {"no-kick-gate", no_argument, NULL, 'G'},
+    {"no-vlag", no_argument, NULL, 'V'},
+    {"wakeup-gran-us", required_argument, NULL, 'A'},
+    {"hog-streak", required_argument, NULL, 'B'},
       {"watchdog-cmd", required_argument, NULL, 'w'},
       {"watchdog-interval-sec", required_argument, NULL, 'W'},
       {"watchdog-timeout-sec", required_argument, NULL, 'T'},
@@ -365,6 +378,23 @@ int main(int argc, char **argv) {
       case 'G':
         opt_no_kick_gate = true;
         break;
+      case 'V':
+        opt_no_vlag = true;
+        break;
+      case 'A':
+        opt_wakeup_gran_us = atol(optarg);
+        if (opt_wakeup_gran_us < 0) {
+          fprintf(stderr, "--wakeup-gran-us must be >= 0\n");
+          return 1;
+        }
+        break;
+      case 'B':
+        opt_hog_streak = atol(optarg);
+        if (opt_hog_streak < 0) {
+          fprintf(stderr, "--hog-streak must be >= 0\n");
+          return 1;
+        }
+        break;
       default:
         fprintf(stderr, help_fmt, basename(argv[0]));
         return opt != 'h';
@@ -378,15 +408,23 @@ int main(int argc, char **argv) {
     skel->rodata->scx_lag_carry_ns = (u64)opt_lag_carry_us * 1000ULL;
   if (opt_no_kick) skel->rodata->scx_enable_kick = false;
   if (opt_no_kick_gate) skel->rodata->scx_kick_gate = false;
+  if (opt_no_vlag) skel->rodata->scx_enable_vlag = false;
+  if (opt_wakeup_gran_us >= 0)
+    skel->rodata->scx_wakeup_gran_ns = (u64)opt_wakeup_gran_us * 1000ULL;
+  if (opt_hog_streak >= 0) skel->rodata->scx_hog_streak_n = (u32)opt_hog_streak;
 
   fprintf(stderr,
           "scx_db_sched v2: semantic=%s hog_slice=%lluus lag_carry=%lluus "
-          "kick=%s gate=%s\n",
+          "kick=%s gate=%s vlag=%s gran=%lluus streak=%u slice_dfl=%lluus\n",
           opt_semantic ? "on" : "off",
           (unsigned long long)skel->rodata->scx_hog_slice_ns / 1000,
           (unsigned long long)skel->rodata->scx_lag_carry_ns / 1000,
           opt_no_kick ? "off" : "on",
-          opt_no_kick_gate ? "off" : "on");
+          opt_no_kick_gate ? "off" : "on",
+          opt_no_vlag ? "off" : "on",
+          (unsigned long long)skel->rodata->scx_wakeup_gran_ns / 1000,
+          skel->rodata->scx_hog_streak_n,
+          (unsigned long long)SCX_SLICE_DFL / 1000);
 
 #ifdef SCX_SKEL_HAS_STRUCT_OPS
   SCX_OPS_LOAD(skel, db_sched_ops, scx_db_sched, uei);
