@@ -413,9 +413,13 @@ int main(int argc, char **argv) {
     skel->rodata->scx_wakeup_gran_ns = (u64)opt_wakeup_gran_us * 1000ULL;
   if (opt_hog_streak >= 0) skel->rodata->scx_hog_streak_n = (u32)opt_hog_streak;
 
+  /* SCX_SLICE_DFL is resolved from the running kernel's BTF at open time
+     (scx enums); read it back from the skeleton rodata — there is no
+     userspace macro for it. */
   fprintf(stderr,
           "scx_db_sched v2: semantic=%s hog_slice=%lluus lag_carry=%lluus "
-          "kick=%s gate=%s vlag=%s gran=%lluus streak=%u slice_dfl=%lluus\n",
+          "kick=%s gate=%s vlag=%s gran=%lluus streak=%u "
+          "slice_dfl=%lluus(kernel)\n",
           opt_semantic ? "on" : "off",
           (unsigned long long)skel->rodata->scx_hog_slice_ns / 1000,
           (unsigned long long)skel->rodata->scx_lag_carry_ns / 1000,
@@ -424,7 +428,7 @@ int main(int argc, char **argv) {
           opt_no_vlag ? "off" : "on",
           (unsigned long long)skel->rodata->scx_wakeup_gran_ns / 1000,
           skel->rodata->scx_hog_streak_n,
-          (unsigned long long)SCX_SLICE_DFL / 1000);
+          (unsigned long long)skel->rodata->__SCX_SLICE_DFL / 1000);
 
 #ifdef SCX_SKEL_HAS_STRUCT_OPS
   SCX_OPS_LOAD(skel, db_sched_ops, scx_db_sched, uei);
