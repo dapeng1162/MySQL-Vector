@@ -43,10 +43,13 @@ const volatile bool scx_enable_semantic = false;
 const volatile bool scx_enable_kick = true;
 /* Lag carried across a sleep, in virtual time: a woken task's base is
    never clamped further back than cv - lag_carry. This is the credit
-   that makes interactive threads preempt CPU hogs after they wake.
-   5ms default: ~one hog slice, so a sleeper can jump at most one slice
-   ahead and must then pay its vruntime back like everyone else. */
-const volatile u64 scx_lag_carry_ns = 5000 * 1000ULL;
+   that lets an interactive thread preempt a CPU hog right after it
+   wakes (it also gates the wakeup kick: with too little credit the
+   waker's deadline does not beat the hog's, and the kick never fires).
+   5ms (the first guess) left N1 p99 at 18.95ms under 16 stress-ng
+   hogs; 50ms measured 0.20ms on 2026-11-17 — identical to native EEVDF
+   (V97 0.19ms), with ~400k kicks/40s actually landing on the hogs. */
+const volatile u64 scx_lag_carry_ns = 50000 * 1000ULL;
 /* 6ms: measured on 16-core c8i (2026-11-13) — 2.5ms shredded busy
    connection threads in closed-loop OLTP (-3.6% rw64), while 20ms (cap
    disabled) recovered only the same amount; the remaining gap is the

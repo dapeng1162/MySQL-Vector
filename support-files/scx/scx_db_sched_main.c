@@ -31,7 +31,7 @@ static const char help_fmt[] =
 "\n"
 "  --semantic         Enable commit/holder semantic boosts (default off).\n"
 "  --hog-slice-us=N   Slice cap for CPU-bound tasks (default 6000).\n"
-"  --lag-carry-us=N   Max vtime credit kept across a sleep (default 5000).\n"
+"  --lag-carry-us=N   Max vtime credit kept across a sleep (default 50000).\n"
 "  --no-kick          Disable deadline-ordered wakeup preemption.\n"
 "  --watchdog-cmd=CMD End-to-end liveness probe run via /bin/sh (e.g.\n"
 "                     \"mysql --socket=... -u root -e 'SELECT 1'\").\n"
