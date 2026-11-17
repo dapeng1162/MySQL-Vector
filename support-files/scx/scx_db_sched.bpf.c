@@ -458,6 +458,15 @@ void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable) {
   u64 rt = now - st->start_ns;
   st->base_vruntime += rt * 100 / weight;
 
+  /* Advance the CPU vtime floor with executed service: cv must track the
+     maximum vruntime actually reached, like EEVDF's avg_vruntime advances
+     with load. Advancing only at running() (to the base at start) let cv
+     freeze at its historical max once wakeups place every sleeper below
+     it — ordering then degenerated to insertion order and deadline
+     comparisons became noise (23M gated kicks with no selectivity in the
+     2026-11-17 D7 rw run). */
+  cpu_vtime_advance(scx_bpf_task_cpu(p), st->base_vruntime);
+
   if (st->boosted) {
     st->debt += rt;
     if (st->debt > D_MAX_NS) st->debt = D_MAX_NS;
