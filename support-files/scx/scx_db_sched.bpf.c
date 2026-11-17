@@ -10,10 +10,12 @@
  *   - canonical base_vruntime is kept in task_account and restored before
  *     each run, so temporary semantic bonuses never pollute long-term
  *     fairness;
- *   - EEVDF-style vlag accounting: the lag (unfairness suffered while
- *     runnable, i.e. cv - base) is frozen when a task sleeps and re-applied
- *     at wake (base = cv_now - vlag), so sleep duration is forgiven while
- *     runnable-time entitlement is honored; scx_lag_carry_ns bounds vlag;
+ *   - wakeup credit: sleep time counts as entitlement, clamped to
+ *     scx_lag_carry_ns behind the CPU vtime floor (the floor itself
+ *     advances with executed service, D7.1), so interactive sleepers
+ *     preempt CPU hogs while deep-queue ordering stays
+ *     least-served-first; the pure-EEVDF frozen-vlag variant is an
+ *     ablation knob;
  *   - deadline-ordered wakeup preemption via SCX_KICK_PREEMPT, admitted
  *     against detected CPU hogs (streak classifier) or victims past the
  *     wakeup granularity, mirroring how EEVDF protects interactive
@@ -52,15 +54,15 @@ const volatile bool scx_enable_kick = true;
    2026-11-17). Hogs are still admitted immediately, which is what the
    N1 noise scenario needs. Ablation: --no-kick-gate. */
 const volatile bool scx_kick_gate = true;
-/* True EEVDF vlag semantics (D7): freeze the runnable-time lag at sleep,
-   forgive the sleep duration at wake (base = cv - vlag). The legacy
-   approximation (--no-vlag) instead froze the sleeper's vruntime for the
-   whole sleep and clamped it lag_carry behind the CPU floor — under OLTP
-   wake storms that turned the accumulated sleep time into phantom credit,
-   so vruntime stopped tracking delivered service and the vtime ordering
-   degenerated toward insertion order (the D5/D6-era -5% clean-load and
-   3x mixed-tail deficit). */
-const volatile bool scx_enable_vlag = true;
+/* Wakeup credit semantics (D7.2): sleep time counts as entitlement,
+   bounded to lag_carry — the interactive-protection mechanism that real
+   EEVDF approximates with its short base slice. The pure-EEVDF variant
+   (--frozen-vlag) only keeps the runnable-time lag frozen at sleep and
+   forgives the sleep: long-sleeping interactive threads then carry no
+   credit, lose the deadline comparison against CPU hogs, and wait for
+   natural slice expiry (N1 p99 1.04ms vs 0.21ms with credit, 2026-11-17).
+   Kept as an ablation knob, off by default. */
+const volatile bool scx_frozen_vlag = false;
 /* Wakeup-kick admission granularity: a non-hog victim becomes preemptible
    after min(slice/2, gran) of runtime. The old pure half-slice rule waited
    up to 10ms under the 20ms SCX_SLICE_DFL slice (rw t32, the shallowest
@@ -350,22 +352,20 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags) {
   if (st && st->base_vruntime != 0) base = st->base_vruntime;
 
   if (st && (enq_flags & SCX_ENQ_WAKEUP)) {
-    if (scx_enable_vlag && st->vlag_valid) {
-      /* EEVDF wakeup placement: forgive the sleep, keep only the lag
-         frozen when the task went to sleep (unfairness suffered while
-         runnable). Freezing the whole sleep as phantom credit (the
-         legacy clamp) let vruntime drift arbitrarily far behind cv, so
-         ordering stopped tracking delivered service. */
+    if (scx_frozen_vlag && st->vlag_valid) {
+      /* Pure-EEVDF ablation: re-place at cv - frozen vlag only. */
       s64 lag = st->vlag_v;
       st->vlag_valid = false;
       if (lag >= 0)
         base = (u64)lag < cv ? cv - (u64)lag : 0;
       else
         base = cv + (u64)(-lag);
-    } else if (!scx_enable_vlag) {
-      /* Legacy --no-vlag semantics: the sleeper keeps its frozen base,
-         bounded lag_carry behind the CPU floor. */
-      if (base + scx_lag_carry_ns < cv) base = cv - scx_lag_carry_ns;
+    } else if (base + scx_lag_carry_ns < cv) {
+      /* Default: sleep time counts as wakeup credit, bounded lag_carry
+         behind the CPU floor. Combined with the cv floor advancing at
+         stopping() (D7.1), deep-queue ordering becomes
+         least-served-first instead of the D5.2 frozen-floor ties. */
+      base = cv - scx_lag_carry_ns;
     }
   }
 
@@ -498,20 +498,16 @@ void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable) {
   else
     st->hog_streak = 0;
 
-  /* Freeze the EEVDF vlag when the task sleeps: the credit kept is the
-     unfairness suffered while runnable (cv - base), never the sleep
-     duration itself. Applied at the next SCX_ENQ_WAKEUP enqueue. */
+  /* Freeze the runnable-time lag when the task sleeps (unfairness
+     suffered while runnable, cv - base). Consumed only by the
+     --frozen-vlag ablation path at the next wakeup. */
   if (!runnable) {
-    if (scx_enable_vlag) {
-      s64 cv = (s64)cpu_vtime(scx_bpf_task_cpu(p));
-      s64 lag = cv - (s64)st->base_vruntime;
-      if (lag > (s64)scx_lag_carry_ns) lag = (s64)scx_lag_carry_ns;
-      if (lag < -(s64)scx_lag_carry_ns) lag = -(s64)scx_lag_carry_ns;
-      st->vlag_v = lag;
-      st->vlag_valid = true;
-    } else {
-      st->vlag_valid = false;
-    }
+    s64 cv = (s64)cpu_vtime(scx_bpf_task_cpu(p));
+    s64 lag = cv - (s64)st->base_vruntime;
+    if (lag > (s64)scx_lag_carry_ns) lag = (s64)scx_lag_carry_ns;
+    if (lag < -(s64)scx_lag_carry_ns) lag = -(s64)scx_lag_carry_ns;
+    st->vlag_v = lag;
+    st->vlag_valid = true;
   }
 
   st->start_ns = 0;

@@ -32,8 +32,8 @@ static const char help_fmt[] =
 "  --semantic         Enable commit/holder semantic boosts (default off).\n"
 "  --hog-slice-us=N   Slice cap for CPU-bound tasks (default 6000).\n"
 "  --lag-carry-us=N   Max vtime credit kept across a sleep (default 50000).\n"
-"  --no-vlag          Legacy lag semantics: freeze vruntime across sleep\n"
-"                     with the lag-carry clamp instead of EEVDF vlag.\n"
+"  --frozen-vlag      Pure-EEVDF ablation: only the runnable-time lag\n"
+"                     frozen at sleep counts as credit (sleep is forgiven).\n"
 "  --wakeup-gran-us=N Wakeup-kick admission granularity vs non-hog\n"
 "                     victims: min(slice/2, N). 0 = pure half-slice\n"
 "                     (default 1000).\n"
@@ -293,7 +293,7 @@ int main(int argc, char **argv) {
   long opt_lag_carry_us = -1;  /* -1: not specified, keep BPF rodata default */
   bool opt_no_kick = false;
   bool opt_no_kick_gate = false;
-  bool opt_no_vlag = false;
+  bool opt_frozen_vlag = false;
   long opt_wakeup_gran_us = -1;  /* -1: not specified, keep BPF rodata default */
   long opt_hog_streak = -1;       /* -1: not specified */
   long opt_base_slice_us = -1;    /* -1: not specified (0 keeps kernel DFL) */
@@ -310,7 +310,7 @@ int main(int argc, char **argv) {
       {"lag-carry-us", required_argument, NULL, 'L'},
       {"no-kick", no_argument, NULL, 'K'},
     {"no-kick-gate", no_argument, NULL, 'G'},
-    {"no-vlag", no_argument, NULL, 'V'},
+    {"frozen-vlag", no_argument, NULL, 'V'},
     {"wakeup-gran-us", required_argument, NULL, 'A'},
     {"hog-streak", required_argument, NULL, 'B'},
     {"base-slice-us", required_argument, NULL, 'O'},
@@ -383,7 +383,7 @@ int main(int argc, char **argv) {
         opt_no_kick_gate = true;
         break;
       case 'V':
-        opt_no_vlag = true;
+        opt_frozen_vlag = true;
         break;
       case 'A':
         opt_wakeup_gran_us = atol(optarg);
@@ -419,7 +419,7 @@ int main(int argc, char **argv) {
     skel->rodata->scx_lag_carry_ns = (u64)opt_lag_carry_us * 1000ULL;
   if (opt_no_kick) skel->rodata->scx_enable_kick = false;
   if (opt_no_kick_gate) skel->rodata->scx_kick_gate = false;
-  if (opt_no_vlag) skel->rodata->scx_enable_vlag = false;
+  if (opt_frozen_vlag) skel->rodata->scx_frozen_vlag = true;
   if (opt_wakeup_gran_us >= 0)
     skel->rodata->scx_wakeup_gran_ns = (u64)opt_wakeup_gran_us * 1000ULL;
   if (opt_hog_streak >= 0) skel->rodata->scx_hog_streak_n = (u32)opt_hog_streak;
@@ -438,7 +438,7 @@ int main(int argc, char **argv) {
           (unsigned long long)skel->rodata->scx_lag_carry_ns / 1000,
           opt_no_kick ? "off" : "on",
           opt_no_kick_gate ? "off" : "on",
-          opt_no_vlag ? "off" : "on",
+          opt_frozen_vlag ? "on" : "off",
           (unsigned long long)skel->rodata->scx_wakeup_gran_ns / 1000,
           skel->rodata->scx_hog_streak_n,
           (unsigned long long)(skel->rodata->scx_base_slice_ns
