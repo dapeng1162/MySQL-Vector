@@ -81,11 +81,14 @@ const volatile u32 scx_hog_streak_n = 2;
    sleeping must not keep hog admission forever). */
 const volatile u64 scx_hog_reset_ns = 100 * 1000 * 1000ULL;
 /* Base slice for the fast_slice tiers; 0 = the kernel's SCX_SLICE_DFL
-   (20ms on 7.0). Native EEVDF turns over every ~0.75ms
-   (sysctl_sched_base_slice); our 2.5-20ms cadence left each blocked-on-
-   latch waker waiting up to a full slice for the victim, doubling tail
-   latency at deep queues (2026-11-17 rw t128 p95 28.9ms vs V97 14.6ms). */
-const volatile u64 scx_base_slice_ns = 0;
+   (20ms on 7.0). Default 1000us, native EEVDF's ~0.75ms
+   (sysctl_sched_base_slice) class: our 2.5-20ms cadence left each
+   blocked-on-latch waker waiting up to a full slice for its victim,
+   doubling tail latency at deep queues (2026-11-17 rw t128 p95 28.9ms vs
+   V97 14.6ms). Measured trade-off: bs1000 wins N1 (noise p99 0.19/0.18ms
+   vs 0.40/0.54 at kernel DFL) and every tail percentile, costs ~3.5%
+   deep-queue tps (rw t64 11,461 vs 11,919) — resilience first. */
+const volatile u64 scx_base_slice_ns = 1000 * 1000ULL;
 /* Upper bound on the frozen vlag applied at wake, in virtual time.
    50ms comfortably covers real runnable-time unfairness while bounding
    placement against per-CPU cv floor skew. */
