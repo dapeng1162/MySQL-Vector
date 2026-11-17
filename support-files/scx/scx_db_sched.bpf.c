@@ -41,6 +41,14 @@ const volatile bool scx_enable_semantic = false;
    gates every foreground wakeup (N1 p99 7.2ms, N2 p99 123ms on
    2026-11-13). Ablation: --no-kick. */
 const volatile bool scx_enable_kick = true;
+/* Kick admission gate: a wakeup kick may preempt the running task only
+   when the victim is a detected CPU hog or has already consumed half of
+   its granted slice. Ungated kicks fire on every eligible wakeup — under
+   clean OLTP load the victims are mysqld workers and the preemption
+   churn costs throughput (lag50 ungated r1 measured ~-7% vs lag0 on
+   2026-11-17). Hogs are still admitted immediately, which is what the
+   N1 noise scenario needs. Ablation: --no-kick-gate. */
+const volatile bool scx_kick_gate = true;
 /* Lag carried across a sleep, in virtual time: a woken task's base is
    never clamped further back than cv - lag_carry. This is the credit
    that lets an interactive thread preempt a CPU hog right after it
@@ -121,6 +129,22 @@ struct {
   __type(value, u64);
 } cpu_cur_order SEC(".maps");
 
+/* Admission state for the wakeup kick, snapshotted in running(): the
+   wall-clock point at which the running task has consumed half of its
+   granted slice (0 = no victim) and whether it entered the run as a
+   detected CPU hog. */
+struct cpu_victim {
+  u64 half_ns;
+  u64 hog;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, MAX_CPUS);
+  __type(key, u32);
+  __type(value, struct cpu_victim);
+} cpu_cur_victim SEC(".maps");
+
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
   __uint(max_entries, 16);
@@ -176,6 +200,28 @@ static void cur_order_set(s32 cpu, u64 val) {
   if (cpu < 0 || cpu >= MAX_CPUS) return;
   v = bpf_map_lookup_elem(&cpu_cur_order, &key);
   if (v) *v = val;
+}
+
+static struct cpu_victim *victim_of(s32 cpu) {
+  u32 key = (u32)cpu;
+  if (cpu < 0 || cpu >= MAX_CPUS) return NULL;
+  return bpf_map_lookup_elem(&cpu_cur_victim, &key);
+}
+
+static void victim_set(s32 cpu, u64 hog, u64 half_ns) {
+  struct cpu_victim *v = victim_of(cpu);
+  if (v) {
+    v->hog = hog;
+    v->half_ns = half_ns;
+  }
+}
+
+static void victim_clear(s32 cpu) {
+  struct cpu_victim *v = victim_of(cpu);
+  if (v) {
+    v->hog = 0;
+    v->half_ns = 0;
+  }
 }
 
 /* Canonical order key used for wakeup-preemption comparisons: the
@@ -284,8 +330,18 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags) {
   if (scx_enable_kick && st && (enq_flags & SCX_ENQ_WAKEUP)) {
     u64 cur = cur_order_of(cpu);
     if (cur != 0 && order_key(st, weight_of(p)) < cur) {
-      scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
-      stat_inc(9);
+      const struct cpu_victim *v = victim_of(cpu);
+      bool admit = true;
+      if (scx_kick_gate) {
+        u64 now = scx_bpf_now();
+        admit = v && (v->hog || (v->half_ns && now > v->half_ns));
+      }
+      if (admit) {
+        scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+        stat_inc(9);
+      } else {
+        stat_inc(10);
+      }
     }
   }
 
@@ -342,6 +398,8 @@ void BPF_STRUCT_OPS(db_sched_running, struct task_struct *p) {
     u64 gap = now - st->last_stop_ns;
     st->cpu_budget = st->cpu_budget > gap ? st->cpu_budget - gap : 0;
   }
+  victim_set(cpu, st->cpu_budget > CPUBOUND_BUDGET_NS,
+             now + p->scx.slice / 2);
 }
 
 void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable) {
@@ -372,6 +430,7 @@ void BPF_STRUCT_OPS(db_sched_stopping, struct task_struct *p, bool runnable) {
   st->start_ns = 0;
   p->scx.dsq_vtime = st->base_vruntime;
   cur_order_set(scx_bpf_task_cpu(p), 0);
+  victim_clear(scx_bpf_task_cpu(p));
 }
 
 void BPF_STRUCT_OPS(db_sched_enable, struct task_struct *p) {

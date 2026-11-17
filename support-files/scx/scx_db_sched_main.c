@@ -33,6 +33,8 @@ static const char help_fmt[] =
 "  --hog-slice-us=N   Slice cap for CPU-bound tasks (default 6000).\n"
 "  --lag-carry-us=N   Max vtime credit kept across a sleep (default 50000).\n"
 "  --no-kick          Disable deadline-ordered wakeup preemption.\n"
+"  --no-kick-gate     Admit every eligible wakeup kick (skip the\n"
+"                     hog/half-slice victim gate).\n"
 "  --watchdog-cmd=CMD End-to-end liveness probe run via /bin/sh (e.g.\n"
 "                     \"mysql --socket=... -u root -e 'SELECT 1'\").\n"
 "  --watchdog-interval-sec=N   Probe every N seconds (watchdog on when a\n"
@@ -247,7 +249,7 @@ static int pin_maps(struct scx_db_sched *skel) {
 static const char *const stat_names[] = {
     "inserts",       "semantic_hits", "commit_boost",  "holder_boost",
     "boosted_runs",  "debt_repay",    "cpubound_cap",  "dispatch_steals",
-    "direct_idle",   "wakeup_kicks",  NULL,
+    "direct_idle",   "wakeup_kicks",  "kick_gated",   NULL,
 };
 
 static void print_stats_once(struct scx_db_sched *skel) {
@@ -281,6 +283,7 @@ int main(int argc, char **argv) {
   long opt_hog_slice_us = 0;
   long opt_lag_carry_us = -1;  /* -1: not specified, keep BPF rodata default */
   bool opt_no_kick = false;
+  bool opt_no_kick_gate = false;
   long opt_wd_interval = 0;
   long opt_wd_timeout = 5;
   long opt_wd_max_fail = 2;
@@ -293,6 +296,7 @@ int main(int argc, char **argv) {
       {"hog-slice-us", required_argument, NULL, 'H'},
       {"lag-carry-us", required_argument, NULL, 'L'},
       {"no-kick", no_argument, NULL, 'K'},
+    {"no-kick-gate", no_argument, NULL, 'G'},
       {"watchdog-cmd", required_argument, NULL, 'w'},
       {"watchdog-interval-sec", required_argument, NULL, 'W'},
       {"watchdog-timeout-sec", required_argument, NULL, 'T'},
@@ -358,6 +362,9 @@ int main(int argc, char **argv) {
       case 'K':
         opt_no_kick = true;
         break;
+      case 'G':
+        opt_no_kick_gate = true;
+        break;
       default:
         fprintf(stderr, help_fmt, basename(argv[0]));
         return opt != 'h';
@@ -370,14 +377,16 @@ int main(int argc, char **argv) {
   if (opt_lag_carry_us >= 0)
     skel->rodata->scx_lag_carry_ns = (u64)opt_lag_carry_us * 1000ULL;
   if (opt_no_kick) skel->rodata->scx_enable_kick = false;
+  if (opt_no_kick_gate) skel->rodata->scx_kick_gate = false;
 
   fprintf(stderr,
           "scx_db_sched v2: semantic=%s hog_slice=%lluus lag_carry=%lluus "
-          "kick=%s\n",
+          "kick=%s gate=%s\n",
           opt_semantic ? "on" : "off",
           (unsigned long long)skel->rodata->scx_hog_slice_ns / 1000,
           (unsigned long long)skel->rodata->scx_lag_carry_ns / 1000,
-          opt_no_kick ? "off" : "on");
+          opt_no_kick ? "off" : "on",
+          opt_no_kick_gate ? "off" : "on");
 
 #ifdef SCX_SKEL_HAS_STRUCT_OPS
   SCX_OPS_LOAD(skel, db_sched_ops, scx_db_sched, uei);
