@@ -372,6 +372,21 @@ void BPF_STRUCT_OPS(db_sched_enqueue, struct task_struct *p, u64 enq_flags) {
     }
   }
 
+  /* CPU vtime floor, applied at EVERY enqueue (not just wakeups):
+     everyone except proven CPU hogs is floored at cv - lag_carry.
+     Wake-only flooring (D7.0-D7.5) created an underclass: continuously
+     runnable background threads (InnoDB purge) re-enqueue with their
+     advanced base while every waker arrives with cv-lag_carry credit,
+     so purge ranked behind all wakers forever and starved (N2 solo
+     history list 118k->381k on 2026-11-17; V97 stays at ~2k). With the
+     floor, bursty background threads keep a seat at the top of the
+     order; the D5.2 campaign's healthy purge relied on the same floor.
+     Streak hogs are exempt: their advanced base is exactly what lets
+     interactive wakers outrank them in the DSQ and pass the kick
+     deadline check. */
+  if (st && !is_hog(st) && base + scx_lag_carry_ns < cv)
+    base = cv - scx_lag_carry_ns;
+
   if (st) {
     st->base_vruntime = base;
     if (is_hog(st) && slice > scx_hog_slice_ns) {
